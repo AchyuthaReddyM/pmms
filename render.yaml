@@ -1,31 +1,29 @@
-# Render.com infrastructure-as-code for PMMS
+# Render.com infrastructure-as-code for PMMS — FREE TIER (ephemeral)
 # Docs: https://render.com/docs/blueprint-spec
 #
-# What this provisions:
-#   - One Node.js web service running the PMMS app
-#   - One 1 GB persistent disk mounted at /var/data so the SQLite DB survives
-#     redeploys, restarts and disk maintenance.
+# Current mode: FREE — no persistent disk.
+#   - $0/month
+#   - The SQLite database lives inside the container's filesystem.
+#   - The DB is RE-SEEDED FROM SCRATCH whenever Render rebuilds, restarts, or
+#     wakes the service from sleep (the free plan idles after ~15 min of
+#     inactivity). Any plants/equipment/PMs you created in the UI will be lost.
+#   - Good for demos and trial runs. NOT suitable for keeping real records.
 #
-# Cost notes:
-#   - Persistent disks require a paid service plan (Starter $7/mo at the time of
-#     writing) plus the disk fee (~$0.25 / GB / month). 1 GB is more than enough
-#     for thousands of PM activities and audit entries.
-#   - To start FREE (no disk, DB wipes on every redeploy/sleep), comment out
-#     the `disk:` block and change `plan:` to `free`. The app still runs, but
-#     plant/equipment/PM data won't persist across restarts.
+# To upgrade to PERSISTENT data later:
+#   1. Change `plan: free` -> `plan: starter` (~$7/mo)
+#   2. Set the DB_PATH env var to `/var/data/pmms.db`
+#   3. Uncomment the `disk:` block at the bottom (~$0.25/mo for 1 GB)
 #
 # After connecting this repo to Render:
-#   - Set the ADMIN_PASSWORD env var in the dashboard (or rotate it after first
-#     login). Do NOT leave it at the default `admin123` in production.
-#   - First boot will auto-seed the database with demo masters, users, PMs and
-#     audit entries.
+#   - Set the ADMIN_PASSWORD env var in the dashboard. Do NOT leave it at the
+#     default `admin123` if the app will be publicly reachable.
 
 services:
   - type: web
     name: pmms
     runtime: node
     region: singapore   # closest to India; change to oregon / frankfurt / ohio if needed
-    plan: starter       # required for persistent disk. Use 'free' if you skip the disk.
+    plan: free          # change to 'starter' to enable persistent disk below
     branch: main
     buildCommand: npm install
     startCommand: node server.js
@@ -34,13 +32,19 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: DB_PATH
-        value: /var/data/pmms.db
+      # DB_PATH intentionally NOT set in free mode -> defaults to ./pmms.db
+      # inside the (ephemeral) container. When you switch to the paid plan,
+      # uncomment the next two lines AND uncomment the `disk:` block below.
+      # - key: DB_PATH
+      #   value: /var/data/pmms.db
       - key: ADMIN_PASSWORD
         sync: false      # set this value in the Render dashboard (kept out of git)
       - key: SESSION_TTL_HOURS
         value: "8"
-    disk:
-      name: pmms-data
-      mountPath: /var/data
-      sizeGB: 1
+
+    # Persistent disk — REQUIRES plan: starter or higher.
+    # Uncomment and switch plans when you want data to persist.
+    # disk:
+    #   name: pmms-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
