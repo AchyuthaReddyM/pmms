@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PMMS — Ways Automation</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
+<link rel="icon" type="image/svg+xml" href="/logo-icon.svg" />
+<link rel="shortcut icon" href="/favicon-32.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png" />
+<meta name="theme-color" content="#3D2817" />
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+
+<!-- =========================== LOGIN =========================== -->
+<div id="loginModal" class="modal-back">
+  <div class="modal">
+    <div style="display:flex; align-items:center; gap:12px; margin-bottom: 14px;">
+      <div style="width:52px;height:52px;border-radius:11px;background:var(--cream-100);display:flex;align-items:center;justify-content:center;border:1px solid var(--border); padding:6px;">
+        <img class="wa-logo" src="/logo.png" alt="Ways Automation"
+             onerror="this.onerror=null; this.src='/logo-icon.svg';" />
+      </div>
+      <div>
+        <h2>Sign in to PMMS</h2>
+        <p style="margin:0;">Ways Automation · Preventive Maintenance</p>
+      </div>
+    </div>
+    <form id="loginForm" autocomplete="off">
+      <div class="form-row" style="grid-template-columns: 1fr; gap: 6px; border:0; padding: 6px 0;">
+        <label>User ID</label>
+        <input id="loginUser" type="text" value="admin" required />
+      </div>
+      <div class="form-row" style="grid-template-columns: 1fr; gap: 6px; border:0; padding: 6px 0;">
+        <label>Password</label>
+        <input id="loginPass" type="password" value="admin123" required />
+      </div>
+      <div id="loginError" style="color: var(--red); font-size: 12px; min-height: 16px; margin: 6px 0;"></div>
+      <button type="submit" class="btn primary" style="width:100%; justify-content:center; margin-top: 6px;">Sign in</button>
+    </form>
+    <p style="margin-top: 18px; font-size: 11px; color: var(--muted); text-align:center;">
+      Demo credentials: <code>admin / admin123</code>, <code>siyer / approver123</code>, <code>pkumar / tech123</code><br/>
+      21 CFR Part 11 compliant · Activity audited
+    </p>
+  </div>
+</div>
+
+<!-- =========================== APP =========================== -->
+<div id="appShell" class="app hidden">
+
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark" style="padding:5px;">
+        <img class="wa-logo" src="/logo.png" alt="Ways Automation"
+             onerror="this.onerror=null; this.src='/logo-icon.svg';" />
+      </div>
+      <div class="brand-text">
+        <div class="name">WAYS AUTOMATION</div>
+        <div class="tag">Always at your Service</div>
+      </div>
+    </div>
+
+    <nav class="nav">
+      <div class="nav-section">Overview</div>
+      <a class="active" data-page="dashboard"><span class="ico">📊</span> Dashboard</a>
+      <a data-page="services"><span class="ico">🧩</span> Modules</a>
+
+      <div class="nav-section">Configuration</div>
+      <a data-page="masters"><span class="ico">🏭</span> Masters</a>
+      <a data-page="users"><span class="ico">👥</span> User Management</a>
+      <a data-page="pmconfig"><span class="ico">⚙️</span> PM Configuration</a>
+      <a data-page="checklist"><span class="ico">📋</span> Checklists</a>
+
+      <div class="nav-section">Operations</div>
+      <a data-page="execution"><span class="ico">🛠️</span> PM Execution</a>
+      <a data-page="calendar"><span class="ico">🗓️</span> Calendar</a>
+      <a data-page="breakdown"><span class="ico">🚨</span> Breakdown</a>
+
+      <div class="nav-section">Insights</div>
+      <a data-page="reports"><span class="ico">📑</span> Reports</a>
+      <a data-page="audit"><span class="ico">📜</span> Audit Trail</a>
+      <a data-page="compliance"><span class="ico">🔒</span> Compliance</a>
+
+      <div class="nav-section">About</div>
+      <a data-page="about"><span class="ico">🦅</span> Why Ways Automation</a>
+    </nav>
+
+    <div class="side-foot">
+      v1.0 · PMMS<br/>
+      GMP · 21 CFR Part 11
+    </div>
+  </aside>
+
+  <section class="main">
+    <div class="topbar">
+      <div class="crumbs">PMMS &nbsp;/&nbsp; <strong id="crumb">Dashboard</strong></div>
+      <div class="search">
+        <span>🔍</span>
+        <input id="globalSearch" type="text" placeholder="Search equipment, PM ID, BD ID…" />
+      </div>
+      <div class="userchip">
+        <div class="avatar" id="userAvatar">--</div>
+        <div>
+          <div style="font-weight:600;" id="topUserName">—</div>
+          <div style="color:var(--muted); font-size:11px;" id="topUserRole">—</div>
+        </div>
+        <button class="logout" title="Sign out" onclick="logout()">⎋</button>
+      </div>
+    </div>
+
+    <div class="content">
+      <!-- =========== DASHBOARD =========== -->
+      <div class="page active" id="page-dashboard">
+        <div class="hero">
+          <div class="hero-logo" style="padding:10px;">
+            <img class="wa-logo" src="/logo.png" alt="Ways Automation"
+                 onerror="this.onerror=null; this.src='/logo-icon.svg';" />
+          </div>
+          <div style="flex:1; min-width: 260px;">
+            <span class="hero-tag">PMMS · PHARMA</span>
+            <h2>Preventive Maintenance & Breakdown Management</h2>
+            <p>Plan, schedule, execute, and document every maintenance activity across your manufacturing plant — with complete traceability and regulatory compliance.</p>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn primary" onclick="goto('execution')">▶ PM Queue</button>
+            <button class="btn dark"    onclick="goto('calendar')">🗓 Calendar</button>
+          </div>
+        </div>
+
+        <div class="grid cols-4" id="kpiRow">
+          <!-- KPI cards rendered by JS -->
+        </div>
+
+        <div class="grid cols-2" style="margin-top:16px;">
+          <div class="card">
+            <div class="card-head"><h3>PM Compliance by Department</h3></div>
+            <table class="tbl">
+              <thead><tr><th>Department</th><th>Planned</th><th>Done</th><th>%</th><th></th></tr></thead>
+              <tbody id="deptComplianceBody"><tr class="empty-row"><td colspan="5">Loading…</td></tr></tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <div class="card-head"><h3>Recent Activity (Audit Trail)</h3><button class="btn ghost sm" onclick="goto('audit')">View all</button></div>
+            <ul class="audit" id="recentAuditList"></ul>
+          </div>
+        </div>
+
+        <div class="grid cols-2" style="margin-top:16px;">
+          <div class="card">
+            <div class="card-head"><h3>Upcoming PM</h3></div>
+            <table class="tbl">
+              <thead><tr><th>PM ID</th><th>Equipment</th><th>Schedule</th><th>Status</th></tr></thead>
+              <tbody id="upcomingPmBody"></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Open Breakdowns</h3><button class="btn ghost sm" onclick="goto('breakdown')">Open module →</button></div>
+            <table class="tbl">
+              <thead><tr><th>BD ID</th><th>Equipment</th><th>Severity</th><th>Status</th></tr></thead>
+              <tbody id="openBdBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- =========== MODULES =========== -->
+      <div class="page" id="page-services">
+        <div class="page-head"><div><h1>PMMS Modules</h1><p>Every capability covered by the Preventive Maintenance & Breakdown Management System.</p></div></div>
+        <div class="grid cols-3">
+          <div class="card"><div class="why-ico">🏭</div><h3>Master Creation</h3><p>Plant, Block, Formulation, Location, Area, Equipment Registration with QR/barcode, version control & audit trail.</p></div>
+          <div class="card"><div class="why-ico">👥</div><h3>User Groups & Access</h3><p>Role-based access, department-wise visibility, electronic signatures, password & security policies.</p></div>
+          <div class="card"><div class="why-ico">⚙️</div><h3>PM Configuration</h3><p>Frequency Master (daily → yearly), PM Category, Checklist Groups, tolerance windows.</p></div>
+          <div class="card"><div class="why-ico">📋</div><h3>Dynamic Checklists</h3><p>Configurable checklist fields with conditional logic, attachments & e-signatures.</p></div>
+          <div class="card"><div class="why-ico">✓</div><h3>Approval Workflow</h3><p>Department-wise approval matrix, escalation alerts, schedule + tolerance verification.</p></div>
+          <div class="card"><div class="why-ico">🗓️</div><h3>Calendar Monitoring</h3><p>Monthly calendar view with color-coded status, real-time updates, department filters.</p></div>
+          <div class="card"><div class="why-ico">🛠️</div><h3>PM Execution</h3><p>Technician assignment, in-progress tracking, completion, overdue & expired status indicators.</p></div>
+          <div class="card"><div class="why-ico">🚨</div><h3>Breakdown Management</h3><p>Log breakdowns, root cause, escalation, MTTR/MTBF analytics.</p></div>
+          <div class="card"><div class="why-ico">📑</div><h3>Reports & Dashboards</h3><p>PM compliance %, overdue %, pending, completed status, KPI monitoring.</p></div>
+          <div class="card"><div class="why-ico">🔒</div><h3>Compliance</h3><p>21 CFR Part 11, e-sigs, audit trail, version control, GMP-ready.</p></div>
+          <div class="card"><div class="why-ico">📦</div><h3>Spares & Stores</h3><p>Warehouse linkage for spare parts and consumables.</p></div>
+          <div class="card"><div class="why-ico">📲</div><h3>QR / Barcode</h3><p>Scan-to-execute on the shop floor — every equipment has a digital identity.</p></div>
+        </div>
+      </div>
+
+      <!-- =========== MASTERS =========== -->
+      <div class="page" id="page-masters">
+        <div class="page-head">
+          <div><h1>Master Creation</h1><p>Sequential master creation to establish the complete plant hierarchy and equipment database.</p></div>
+          <div class="actions">
+            <button class="btn primary" id="masterAddBtn" onclick="openMasterAddModal()">+ New</button>
+          </div>
+        </div>
+        <div class="tabs" id="masterTabs">
+          <button class="active" data-mt="plants">Plants</button>
+          <button data-mt="blocks">Blocks</button>
+          <button data-mt="formulations">Formulations</button>
+          <button data-mt="locations">Locations</button>
+          <button data-mt="areas">Areas</button>
+          <button data-mt="equipment">Equipment</button>
+        </div>
+        <div class="card">
+          <table class="tbl">
+            <thead id="mastersHead"></thead>
+            <tbody id="mastersBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- =========== USERS =========== -->
+      <div class="page" id="page-users">
+        <div class="page-head">
+          <div><h1>User Groups & Access Management</h1><p>Role-based user management controlling access, approval, execution, and monitoring activities.</p></div>
+          <div class="actions"><button class="btn primary" onclick="openUserAddModal()">+ Add User</button></div>
+        </div>
+        <div class="card">
+          <table class="tbl">
+            <thead><tr><th>User ID</th><th>Name</th><th>Role</th><th>Department</th><th>Status</th><th>Last Login</th><th></th></tr></thead>
+            <tbody id="usersBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- =========== PM CONFIGURATION =========== -->
+      <div class="page" id="page-pmconfig">
+        <div class="page-head"><div><h1>PM Master Configuration</h1><p>Frequencies, categories and checklist groups that drive PM scheduling.</p></div></div>
+        <div class="grid cols-3">
+          <div class="card"><h3>Frequency Master</h3><table class="tbl"><tbody id="freqBody"></tbody></table></div>
+          <div class="card"><h3>PM Categories</h3><div id="catBody" class="row-gap" style="gap:6px;"></div></div>
+          <div class="card"><h3>Checklist Groups</h3><table class="tbl"><tbody id="groupBody"></tbody></table></div>
+        </div>
+
+        <div class="card" style="margin-top:16px;">
+          <h3>Create PM Schedule</h3>
+          <form id="newPmForm">
+            <div class="form-row"><label>Equipment</label><select id="pmEquipment" required></select></div>
+            <div class="form-row"><label>Checklist</label><select id="pmChecklist"></select></div>
+            <div class="form-row"><label>Frequency</label><select id="pmFrequency" required></select></div>
+            <div class="form-row"><label>Category</label><select id="pmCategory"></select></div>
+            <div class="form-row"><label>Schedule Date</label><input id="pmDate" type="date" required /></div>
+            <div class="form-row"><label>Department</label><input id="pmDept" type="text" placeholder="e.g., Engineering - Mechanical" /></div>
+            <div class="form-row"><label>Technician</label><select id="pmTech"><option value="">— Unassigned —</option></select></div>
+            <div class="form-row"><label>Reviewer</label><select id="pmReviewer"></select></div>
+            <div class="form-row"><label>Approver</label><select id="pmApprover"></select></div>
+            <div class="form-actions">
+              <button type="submit" class="btn primary">Create PM</button>
+              <button type="reset" class="btn ghost">Reset</button>
+            </div>
+          </form>
+        </div>
+      </div>
+
+      <!-- =========== CHECKLISTS =========== -->
+      <div class="page" id="page-checklist">
+        <div class="page-head"><div><h1>Checklists</h1><p>Configurable PM checklists with versioning and field types.</p></div></div>
+        <div class="grid cols-2">
+          <div class="card">
+            <div class="card-head"><h3>Available Checklists</h3></div>
+            <table class="tbl">
+              <thead><tr><th>ID</th><th>Name</th><th>Version</th><th>Status</th><th></th></tr></thead>
+              <tbody id="checklistsBody"></tbody>
+            </table>
+          </div>
+          <div class="card" id="checklistPreviewCard">
+            <div class="card-head"><h3 id="checklistPreviewTitle">Select a checklist to preview</h3></div>
+            <ul class="checklist" id="checklistPreviewBody"></ul>
+          </div>
+        </div>
+      </div>
+
+      <!-- =========== PM EXECUTION =========== -->
+      <div class="page" id="page-execution">
+        <div class="page-head">
+          <div><h1>PM Execution Queue</h1><p>Approve, assign, execute, and close preventive maintenance activities with full traceability.</p></div>
+          <div class="actions">
+            <select id="pmFilter" onchange="loadPmList()">
+              <option value="">All Statuses</option>
+              <option>Pending</option><option>Approved</option><option>Assigned</option>
+              <option>In Progress</option><option>Completed</option><option>Overdue</option><option>Expired</option>
+            </select>
+            <button class="btn primary" onclick="goto('pmconfig')">+ Create PM</button>
+          </div>
+        </div>
+        <div class="card">
+          <table class="tbl">
+            <thead><tr><th>PM ID</th><th>Equipment</th><th>Type</th><th>Freq</th><th>Schedule</th><th>Technician</th><th>Status</th><th></th></tr></thead>
+            <tbody id="pmListBody"></tbody>
+          </table>
+        </div>
+
+        <div class="section-title">PM Status Indicators</div>
+        <div class="grid cols-4">
+          <div class="card"><span class="pill brown">Pending</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Not yet approved</p></div>
+          <div class="card"><span class="pill green">Approved</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Ready for execution</p></div>
+          <div class="card"><span class="pill amber">Assigned</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Technician allocated</p></div>
+          <div class="card"><span class="pill blue">In Progress</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Technician executing</p></div>
+          <div class="card"><span class="pill gray">Completed</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Closed with signatures</p></div>
+          <div class="card"><span class="pill red">Overdue</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Past due date</p></div>
+          <div class="card"><span class="pill red">Expired</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Past tolerance</p></div>
+          <div class="card"><span class="pill blue">Escalated</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Alert to dept. head</p></div>
+        </div>
+      </div>
+
+      <!-- =========== CALENDAR =========== -->
+      <div class="page" id="page-calendar">
+        <div class="page-head">
+          <div><h1 id="calTitle">PM Calendar</h1><p>Monthly view with real-time, color-coded status.</p></div>
+          <div class="actions">
+            <button class="btn ghost" onclick="calNavigate(-1)">◀</button>
+            <button class="btn ghost" id="calLabel">—</button>
+            <button class="btn ghost" onclick="calNavigate(1)">▶</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="cal" style="margin-bottom:8px;">
+            <div class="dow">Sun</div><div class="dow">Mon</div><div class="dow">Tue</div><div class="dow">Wed</div><div class="dow">Thu</div><div class="dow">Fri</div><div class="dow">Sat</div>
+          </div>
+          <div class="cal" id="calBody"></div>
+          <hr class="sep">
+          <div class="row-gap" style="font-size:12px;">
+            <span class="pill green">● Completed</span>
+            <span class="pill blue">● In Progress</span>
+            <span class="pill amber">● Scheduled</span>
+            <span class="pill red">● Overdue / Expired</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- =========== BREAKDOWN =========== -->
+      <div class="page" id="page-breakdown">
+        <div class="page-head">
+          <div><h1>Breakdown Management</h1><p>Capture unplanned equipment failures with full lifecycle tracking and MTTR/MTBF analytics.</p></div>
+          <div class="actions"><button class="btn primary" onclick="openBreakdownModal()">+ Log Breakdown</button></div>
+        </div>
+        <div class="grid cols-4" id="bdKpiRow" style="margin-bottom:16px;"></div>
+        <div class="card">
+          <table class="tbl">
+            <thead><tr><th>BD ID</th><th>Equipment</th><th>Reported</th><th>By</th><th>Severity</th><th>Status</th><th></th></tr></thead>
+            <tbody id="breakdownsBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- =========== REPORTS =========== -->
+      <div class="page" id="page-reports">
+        <div class="page-head"><div><h1>Reports</h1><p>Comprehensive reports for monitoring maintenance performance and compliance.</p></div></div>
+        <div class="grid cols-3">
+          <div class="card"><div class="why-ico">📈</div><h3>PM Compliance</h3><p>Planned vs completed across plants and departments.</p><div style="margin-top:10px;"><button class="btn ghost sm" onclick="goto('dashboard')">Open</button></div></div>
+          <div class="card"><div class="why-ico">⏰</div><h3>Overdue & Expired</h3><p>PMs that crossed schedule or tolerance window.</p><div style="margin-top:10px;"><button class="btn ghost sm" onclick="openOverdueReport()">Open</button></div></div>
+          <div class="card"><div class="why-ico">🛠️</div><h3>Equipment History</h3><p>Complete maintenance + breakdown history per equipment.</p><div style="margin-top:10px;"><button class="btn ghost sm" onclick="openEqHistoryReport()">Open</button></div></div>
+          <div class="card"><div class="why-ico">🚨</div><h3>Breakdown Analysis</h3><p>Frequency, downtime, MTTR/MTBF.</p><div style="margin-top:10px;"><button class="btn ghost sm" onclick="goto('breakdown')">Open</button></div></div>
+          <div class="card"><div class="why-ico">📜</div><h3>Audit Trail</h3><p>User-wise, equipment-wise activity log.</p><div style="margin-top:10px;"><button class="btn ghost sm" onclick="goto('audit')">Open</button></div></div>
+          <div class="card"><div class="why-ico">📦</div><h3>Spares Consumption</h3><p>Spare parts used per PM/breakdown.</p><div style="margin-top:10px;"><button class="btn ghost sm" disabled>Coming Soon</button></div></div>
+        </div>
+        <div id="reportPanel" style="margin-top:16px;"></div>
+      </div>
+
+      <!-- =========== AUDIT =========== -->
+      <div class="page" id="page-audit">
+        <div class="page-head">
+          <div><h1>Audit Trail</h1><p>Immutable record of every action in the system.</p></div>
+          <div class="actions"><button class="btn ghost" onclick="loadAudit(500)">Load 500</button></div>
+        </div>
+        <div class="card">
+          <table class="tbl">
+            <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>ID</th><th>Details</th></tr></thead>
+            <tbody id="auditBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- =========== COMPLIANCE =========== -->
+      <div class="page" id="page-compliance">
+        <div class="page-head"><div><h1>Compliance & Data Integrity</h1><p>Built for GMP and 21 CFR Part 11 requirements.</p></div></div>
+        <div class="grid cols-2">
+          <div class="card">
+            <h3>Core Controls</h3>
+            <ul style="margin:0; padding-left:18px; color: var(--muted); font-size:13px; line-height:1.9;">
+              <li><strong>Electronic Signatures</strong> on every approval</li>
+              <li><strong>Audit Trail</strong> — complete, immutable activity traceability</li>
+              <li><strong>Version Control</strong> on documents and checklists</li>
+              <li><strong>Data Integrity (ALCOA+)</strong> — prevents unauthorized changes</li>
+              <li><strong>Secure Backup</strong> for protection and recovery</li>
+              <li><strong>Role-Based Security</strong> — controlled system access</li>
+              <li><strong>Regulatory Compliance</strong> — GMP and 21 CFR Part 11 ready</li>
+            </ul>
+          </div>
+          <div class="card">
+            <h3>Live Status</h3>
+            <div id="complianceStatus" style="display:flex; flex-direction:column; gap:14px;"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- =========== ABOUT =========== -->
+      <div class="page" id="page-about">
+        <div class="hero">
+          <div class="hero-logo" style="padding:10px;">
+            <img class="wa-logo" src="/logo.png" alt="Ways Automation"
+                 onerror="this.onerror=null; this.src='/logo-icon.svg';" />
+          </div>
+          <div style="flex:1; min-width:260px;">
+            <span class="hero-tag">ABOUT</span>
+            <h2>Ways Automation — Always at your Service</h2>
+            <p>We build pharma-grade automation systems that meet the highest regulatory bars. PMMS is one of our flagship products, deployed in formulation and API plants across India.</p>
+          </div>
+        </div>
+        <div class="section-title">Why Ways Automation</div>
+        <div class="why-grid">
+          <div class="why-card"><div class="why-ico">🏛️</div><h3>Regulatory-grade by default</h3><p>Built around GMP, 21 CFR Part 11 and ALCOA+ from day one.</p></div>
+          <div class="why-card"><div class="why-ico">🧠</div><h3>Designed with engineers</h3><p>Every workflow has been pressure-tested on the shop floor.</p></div>
+          <div class="why-card"><div class="why-ico">🔌</div><h3>Plant-aware</h3><p>Plant → Block → Formulation → Location → Area → Equipment hierarchy.</p></div>
+          <div class="why-card"><div class="why-ico">📲</div><h3>Mobile + Scan</h3><p>QR/Barcode-driven execution from any handheld.</p></div>
+          <div class="why-card"><div class="why-ico">🛡️</div><h3>Audit-ready</h3><p>Every click captured. Every signature cryptographic.</p></div>
+          <div class="why-card"><div class="why-ico">🤝</div><h3>Always at your Service</h3><p>From master setup to validation — we're on call.</p></div>
+        </div>
+        <div class="section-title">Contact</div>
+        <div class="card">
+          <div style="display:flex; gap:30px; flex-wrap: wrap; font-size:13px;">
+            <div><div style="color:var(--muted); font-size:11px; text-transform:uppercase;">Email</div><strong>contact@ways-automation.com</strong></div>
+            <div><div style="color:var(--muted); font-size:11px; text-transform:uppercase;">Web</div><strong>ways-automation.com</strong></div>
+            <div><div style="color:var(--muted); font-size:11px; text-transform:uppercase;">Specialization</div><strong>Pharma · Manufacturing Automation</strong></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">
+      © 2026 Ways Automation · PMMS v1.0 · GMP · 21 CFR Part 11
+    </div>
+  </section>
+</div>
+
+<!-- ============= GENERIC MODAL HOST ============= -->
+<div id="modalHost"></div>
+
+<!-- Toast container -->
+<div id="toastBox"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

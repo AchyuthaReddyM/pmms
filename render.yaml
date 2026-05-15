@@ -1,0 +1,46 @@
+# Render.com infrastructure-as-code for PMMS
+# Docs: https://render.com/docs/blueprint-spec
+#
+# What this provisions:
+#   - One Node.js web service running the PMMS app
+#   - One 1 GB persistent disk mounted at /var/data so the SQLite DB survives
+#     redeploys, restarts and disk maintenance.
+#
+# Cost notes:
+#   - Persistent disks require a paid service plan (Starter $7/mo at the time of
+#     writing) plus the disk fee (~$0.25 / GB / month). 1 GB is more than enough
+#     for thousands of PM activities and audit entries.
+#   - To start FREE (no disk, DB wipes on every redeploy/sleep), comment out
+#     the `disk:` block and change `plan:` to `free`. The app still runs, but
+#     plant/equipment/PM data won't persist across restarts.
+#
+# After connecting this repo to Render:
+#   - Set the ADMIN_PASSWORD env var in the dashboard (or rotate it after first
+#     login). Do NOT leave it at the default `admin123` in production.
+#   - First boot will auto-seed the database with demo masters, users, PMs and
+#     audit entries.
+
+services:
+  - type: web
+    name: pmms
+    runtime: node
+    region: singapore   # closest to India; change to oregon / frankfurt / ohio if needed
+    plan: starter       # required for persistent disk. Use 'free' if you skip the disk.
+    branch: main
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DB_PATH
+        value: /var/data/pmms.db
+      - key: ADMIN_PASSWORD
+        sync: false      # set this value in the Render dashboard (kept out of git)
+      - key: SESSION_TTL_HOURS
+        value: "8"
+    disk:
+      name: pmms-data
+      mountPath: /var/data
+      sizeGB: 1

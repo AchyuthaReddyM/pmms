@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PMMS — Start the server | Ways Automation</title>
+<link rel="icon" type="image/png" sizes="32x32" href="public/favicon-32.png" />
+<link rel="icon" type="image/png" sizes="16x16" href="public/favicon-16.png" />
+<link rel="icon" type="image/svg+xml" href="public/logo-icon.svg" />
+<link rel="shortcut icon" href="public/favicon-32.png" />
+<link rel="apple-touch-icon" sizes="180x180" href="public/apple-touch-icon.png" />
+<meta name="theme-color" content="#3D2817" />
+<style>
+  :root { --brown:#3D2817; --gold:#C9A227; --cream:#FAF6EE; --muted:#7A6B53; --border:#E8DFC9; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:0; background: var(--cream); color:#2A2118; font-family: 'Segoe UI', system-ui, sans-serif; min-height:100vh; display:flex; align-items:center; justify-content:center; padding: 24px; }
+  .card { background:#fff; border:1px solid var(--border); border-radius: 16px; padding: 32px; max-width: 640px; box-shadow: 0 10px 40px rgba(45,30,15,0.08); }
+  .brand { display:flex; align-items:center; gap: 14px; margin-bottom: 20px; }
+  .brand-mark { width: 56px; height: 56px; border-radius: 12px; background: var(--cream); display:flex; align-items:center; justify-content:center; }
+  h1 { margin: 0 0 4px; color: var(--brown); font-size: 22px; }
+  .tag { color: var(--gold); font-size: 12px; font-weight: 700; letter-spacing: 0.5px; }
+  .step { padding: 12px 0; border-bottom: 1px dashed var(--border); display:flex; gap: 12px; align-items: flex-start; }
+  .step:last-child { border-bottom:0; }
+  .step .num { width: 28px; height: 28px; border-radius:50%; background: var(--brown); color: var(--gold); font-weight:700; display:flex; align-items:center; justify-content:center; font-size: 13px; flex-shrink:0; }
+  code { background: var(--cream); padding: 2px 8px; border-radius: 5px; font-size: 13px; color: var(--brown); }
+  .cmd { background: #1d1209; color: #f0dd9c; padding: 12px 14px; border-radius: 8px; font-family: 'Consolas', 'Menlo', monospace; font-size: 13px; margin: 6px 0; }
+  a { color: var(--brown); }
+  .footer { color: var(--muted); font-size: 12px; margin-top: 18px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">
+      <div class="brand-mark" style="padding:4px;">
+        <img src="public/logo.png" alt="Ways Automation"
+             style="width:100%; height:100%; object-fit:contain;"
+             onerror="this.onerror=null; this.src='public/logo-icon.svg';" />
+      </div>
+      <div>
+        <div class="tag">WAYS AUTOMATION · PMMS</div>
+        <h1>This is a full-stack application — start the server to use it</h1>
+      </div>
+    </div>
+
+    <p style="color: var(--muted); margin-top: 0;">
+      The PMMS app is now a Node.js + SQLite web application. Opening this static HTML file directly does not load the app — you need to launch the server first.
+    </p>
+
+    <div class="step">
+      <div class="num">1</div>
+      <div>
+        <strong>Install Node.js</strong> (one-time) from
+        <a href="https://nodejs.org" target="_blank">nodejs.org</a> — version 18 or newer.
+      </div>
+    </div>
+    <div class="step">
+      <div class="num">2</div>
+      <div>
+        <strong>Open a terminal in this folder</strong> and install dependencies:
+        <div class="cmd">npm install</div>
+      </div>
+    </div>
+    <div class="step">
+      <div class="num">3</div>
+      <div>
+        <strong>Start the server</strong>:
+        <div class="cmd">npm start</div>
+        Or just double-click <code>start.bat</code> on Windows.
+      </div>
+    </div>
+    <div class="step">
+      <div class="num">4</div>
+      <div>
+        <strong>Open the app</strong>:
+        <a href="http://localhost:3000" target="_blank">http://localhost:3000</a><br/>
+        Default login: <code>admin</code> / <code>admin123</code>
+      </div>
+    </div>
+
+    <div class="footer">
+      Full instructions and API reference are in <code>README.md</code>.<br/>
+      © 2026 Ways Automation · PMMS v1.0
+    </div>
+  </div>
+</body>
+</html>
