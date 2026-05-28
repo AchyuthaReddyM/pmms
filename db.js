@@ -20,14 +20,8 @@ function verifyPassword(plain, stored) {
   return crypto.timingSafeEqual(actual, expected);
 }
 
-// DB_PATH can be overridden via env (e.g., Render mounts a disk at /var/data).
-// Falls back to local file for development.
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'pmms.db');
-// Ensure parent directory exists (Render disk mount point already exists,
-// but this helps for arbitrary DB_PATH values).
-try {
-  require('fs').mkdirSync(path.dirname(DB_PATH), { recursive: true });
-} catch (e) { /* ignore */ }
+try { require('fs').mkdirSync(path.dirname(DB_PATH), { recursive: true }); } catch (e) { /* ignore */ }
 console.log(`[db] using SQLite at ${DB_PATH}`);
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -36,13 +30,46 @@ db.pragma('foreign_keys = ON');
 // ---------- Schema ----------
 function createSchema() {
   db.exec(`
+    -- Departments master (configurable by admin)
+    CREATE TABLE IF NOT EXISTS departments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'Active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Activities (permissions) — admin-extensible
+    CREATE TABLE IF NOT EXISTS activities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT UNIQUE NOT NULL,
+      label TEXT NOT NULL,
+      category TEXT,
+      is_system INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Roles — each role belongs to one department and has a permissions array
+    CREATE TABLE IF NOT EXISTS roles (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      department_id INTEGER NOT NULL REFERENCES departments(id),
+      description TEXT,
+      permissions_json TEXT NOT NULL DEFAULT '[]',
+      is_system INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'Active',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
       email TEXT,
       password_hash TEXT NOT NULL,
-      role TEXT NOT NULL,
+      role_id INTEGER REFERENCES roles(id),
+      department_id INTEGER REFERENCES departments(id),
+      role TEXT,
       department TEXT,
       status TEXT NOT NULL DEFAULT 'Active',
       last_login TEXT,
@@ -113,31 +140,94 @@ function createSchema() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- PM frequency master (editable by manage_pm_frequencies)
     CREATE TABLE IF NOT EXISTS frequencies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL,
       days INTEGER NOT NULL,
-      tolerance_days INTEGER NOT NULL
+      tolerance_days INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'Active'
     );
 
+    -- PM category master (editable by manage_pm_categories)
     CREATE TABLE IF NOT EXISTS pm_categories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE NOT NULL
+      name TEXT UNIQUE NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'Active'
     );
 
     CREATE TABLE IF NOT EXISTS checklist_groups (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL,
+      department_id INTEGER REFERENCES departments(id),
       department TEXT
     );
 
+    -- Checklists — keep legacy fields_json for backwards compat,
+    -- but new structured checklists live in checklist_sections + checklist_questions.
     CREATE TABLE IF NOT EXISTS checklists (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
+      description TEXT,
       group_id INTEGER REFERENCES checklist_groups(id),
+      category_id INTEGER REFERENCES pm_categories(id),
       version TEXT NOT NULL DEFAULT 'v1.0',
       status TEXT NOT NULL DEFAULT 'Active',
-      fields_json TEXT NOT NULL,
+      fields_json TEXT,
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- New structured checklist: sections (a.k.a. "checkpoint groups")
+    CREATE TABLE IF NOT EXISTS checklist_sections (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      checklist_id INTEGER NOT NULL REFERENCES checklists(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      description TEXT,
+      position INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Questions / checkpoints under a section
+    CREATE TABLE IF NOT EXISTS checklist_questions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      section_id INTEGER NOT NULL REFERENCES checklist_sections(id) ON DELETE CASCADE,
+      label TEXT NOT NULL,
+      qtype TEXT NOT NULL,
+      options_json TEXT,
+      required INTEGER NOT NULL DEFAULT 0,
+      min_value REAL,
+      max_value REAL,
+      unit TEXT,
+      position INTEGER NOT NULL DEFAULT 0
+    );
+
+    -- Checklist assignment: manager assigns a checklist to a user
+    CREATE TABLE IF NOT EXISTS checklist_assignments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      assignment_id TEXT UNIQUE NOT NULL,
+      checklist_id INTEGER NOT NULL REFERENCES checklists(id),
+      assignee_id INTEGER NOT NULL REFERENCES users(id),
+      frequency_id INTEGER REFERENCES frequencies(id),
+      due_date TEXT,
+      status TEXT NOT NULL DEFAULT 'Pending',
+      response_data TEXT,
+      notes TEXT,
+      assigned_by INTEGER REFERENCES users(id),
+      assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
+      started_at TEXT,
+      completed_at TEXT
+    );
+
+    -- In-app notifications
+    CREATE TABLE IF NOT EXISTS notifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL REFERENCES users(id),
+      title TEXT NOT NULL,
+      message TEXT,
+      kind TEXT NOT NULL DEFAULT 'info',
+      link TEXT,
+      is_read INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -196,38 +286,125 @@ function createSchema() {
     CREATE INDEX IF NOT EXISTS idx_pm_eq       ON pm_schedules(equipment_id);
     CREATE INDEX IF NOT EXISTS idx_bd_status   ON breakdowns(status);
     CREATE INDEX IF NOT EXISTS idx_audit_ts    ON audit_log(ts);
+    CREATE INDEX IF NOT EXISTS idx_notif_user  ON notifications(user_id, is_read);
+    CREATE INDEX IF NOT EXISTS idx_assn_user   ON checklist_assignments(assignee_id, status);
   `);
 }
+
+// ---------- Built-in activities ----------
+const BUILTIN_ACTIVITIES = [
+  // User Management
+  ['view_users',             'View Users',                'User Management'],
+  ['manage_users',           'Create / Edit Users',       'User Management'],
+  // Roles & Departments
+  ['manage_departments',     'Manage Departments',        'Access Control'],
+  ['manage_roles',           'Manage Roles',              'Access Control'],
+  ['manage_activities',      'Manage Activities',         'Access Control'],
+  // PM Config
+  ['manage_pm_frequencies',  'Manage PM Frequencies',     'PM Configuration'],
+  ['manage_pm_categories',   'Manage PM Categories',      'PM Configuration'],
+  ['manage_checklists',      'Create / Edit Checklists',  'PM Configuration'],
+  // Plants / Equipment
+  ['manage_plants',          'Manage Plants & Blocks',    'Masters'],
+  ['view_equipment',         'View Equipment',            'Masters'],
+  ['manage_equipment',       'Add / Edit Equipment',      'Masters'],
+  // PM lifecycle
+  ['view_pm',                'View PM Schedules',         'PM Lifecycle'],
+  ['create_pm',              'Create PM Schedule',        'PM Lifecycle'],
+  ['approve_pm',             'Approve PM',                'PM Lifecycle'],
+  ['assign_pm',              'Assign PM to Technician',   'PM Lifecycle'],
+  ['execute_pm',             'Execute PM',                'PM Lifecycle'],
+  ['review_pm',              'Review Completed PM',       'PM Lifecycle'],
+  // Checklist assignments
+  ['assign_checklist',       'Assign Checklist to User',  'Checklists'],
+  ['execute_checklist',      'Execute Assigned Checklist','Checklists'],
+  // Breakdowns
+  ['view_breakdowns',        'View Breakdowns',           'Breakdowns'],
+  ['report_breakdown',       'Report Breakdown',          'Breakdowns'],
+  ['resolve_breakdown',      'Resolve Breakdown',         'Breakdowns'],
+  // Reports
+  ['view_reports',           'View Reports',              'Reports'],
+  ['view_audit',             'View Audit Trail',          'Reports'],
+];
 
 // ---------- Seed ----------
 function seed() {
   const hasUsers = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
   if (hasUsers > 0) return; // already seeded
 
-  const insertUser = db.prepare(`
-    INSERT INTO users (user_id, name, email, password_hash, role, department, status)
-    VALUES (?, ?, ?, ?, ?, ?, 'Active')
-  `);
-  const mkHash = (pw) => hashPassword(pw);
+  // 1. Activities (system)
+  const insAct = db.prepare('INSERT INTO activities(code,label,category,is_system) VALUES (?,?,?,1)');
+  for (const a of BUILTIN_ACTIVITIES) insAct.run(...a);
+  const allCodes = BUILTIN_ACTIVITIES.map(a => a[0]);
 
-  // Admin password can be set via ADMIN_PASSWORD env var; falls back to 'admin123'.
-  // In production set ADMIN_PASSWORD in Render's environment.
+  // 2. Departments
+  const depts = [
+    ['IT',                       'Information Technology'],
+    ['Engineering',              'Engineering department (umbrella)'],
+    ['Engineering - Mechanical', 'Mechanical maintenance team'],
+    ['Engineering - Electrical', 'Electrical maintenance team'],
+    ['HVAC',                     'Heating, Ventilation & Air Conditioning'],
+    ['QA',                       'Quality Assurance'],
+    ['Production',               'Production / Manufacturing'],
+    ['Warehouse',                'Warehouse & Stores'],
+  ];
+  const insDept = db.prepare('INSERT INTO departments(name,description) VALUES (?,?)');
+  for (const d of depts) insDept.run(...d);
+  const deptId = (name) => db.prepare('SELECT id FROM departments WHERE name=?').get(name).id;
+
+  // 3. Roles — each tied to one department, with permission set.
+  // Names match the legacy role strings so existing requireRole() checks still work.
+  const techActs   = ['view_pm','execute_pm','view_equipment','report_breakdown','execute_checklist'];
+  const reviewerActs = ['view_pm','review_pm','view_equipment','view_reports','view_audit','execute_checklist'];
+  const approverActs = ['view_pm','create_pm','approve_pm','assign_pm','view_equipment','manage_equipment','view_reports','view_breakdowns','resolve_breakdown','manage_checklists','assign_checklist','execute_checklist'];
+  const prodActs   = ['view_pm','view_equipment','report_breakdown','view_breakdowns','execute_checklist'];
+  const qaActs     = ['view_pm','approve_pm','review_pm','view_reports','view_audit','execute_checklist'];
+  const whActs     = ['view_equipment','view_pm','execute_checklist'];
+
+  const roles = [
+    ['System Administrator', deptId('IT'),                       'Full access to every activity in the system', allCodes,    1],
+    ['Approver',             deptId('Engineering'),              'Reviews and approves PM schedules',           approverActs, 1],
+    ['Reviewer',             deptId('QA'),                       'Reviews completed PMs for compliance',         reviewerActs, 1],
+    ['Technician',           deptId('Engineering - Mechanical'), 'Executes PMs on assigned equipment',           techActs,    1],
+    ['Engineering',          deptId('Engineering'),              'Engineering manager — create/edit equipment & PMs', approverActs.concat(['create_pm','manage_plants']), 1],
+    ['Production',           deptId('Production'),               'Production staff — reports breakdowns',        prodActs,    1],
+    ['QA',                   deptId('QA'),                       'QA personnel',                                 qaActs,      1],
+    ['Warehouse',            deptId('Warehouse'),                'Stores / inventory',                           whActs,      1],
+  ];
+  const insRole = db.prepare('INSERT INTO roles(name,department_id,description,permissions_json,is_system) VALUES (?,?,?,?,?)');
+  for (const r of roles) {
+    insRole.run(r[0], r[1], r[2], JSON.stringify([...new Set(r[3])]), r[4]);
+  }
+  const roleByName = (n) => db.prepare('SELECT id, department_id, name FROM roles WHERE name=?').get(n);
+
+  // 4. Users — assign role_id + department_id
   const adminPw = process.env.ADMIN_PASSWORD || 'admin123';
   if (adminPw === 'admin123') {
     console.warn('[db] WARNING: seeding admin with default password "admin123" — set ADMIN_PASSWORD env var for production');
   }
+  const mkHash = (pw) => hashPassword(pw);
+  const insertUser = db.prepare(`
+    INSERT INTO users (user_id, name, email, password_hash, role_id, department_id, role, department, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active')
+  `);
+  // [user_id, name, email, password, role_name, override_department_name?]
   const users = [
-    ['admin',     'Achyutha Reddy', 'achyutha2006@gmail.com', mkHash(adminPw),         'System Administrator', 'IT'],
-    ['siyer',     'S. Iyer',        'siyer@ways.local',       mkHash('approver123'),  'Approver',             'Engineering'],
-    ['rmehta',    'R. Mehta',       'rmehta@ways.local',      mkHash('reviewer123'),  'Reviewer',             'QA'],
-    ['pkumar',    'P. Kumar',       'pkumar@ways.local',      mkHash('tech123'),      'Technician',           'Engineering - Mechanical'],
-    ['krao',      'K. Rao',         'krao@ways.local',        mkHash('tech123'),      'Technician',           'Engineering - Electrical'],
-    ['snaidu',    'S. Naidu',       'snaidu@ways.local',      mkHash('tech123'),      'Technician',           'HVAC'],
-    ['mverma',    'M. Verma',       'mverma@ways.local',      mkHash('prod123'),      'Production',           'Production'],
-    ['qaapprove', 'Q. Anand',       'qa@ways.local',          mkHash('qa123'),        'QA',                   'QA'],
-    ['stores',    'Stores Officer', 'stores@ways.local',      mkHash('store123'),     'Warehouse',            'Warehouse'],
+    ['admin',     'Achyutha Reddy', 'achyutha2006@gmail.com', adminPw,          'System Administrator', null],
+    ['siyer',     'S. Iyer',        'siyer@ways.local',       'approver123',    'Approver',             null],
+    ['rmehta',    'R. Mehta',       'rmehta@ways.local',      'reviewer123',    'Reviewer',             null],
+    ['pkumar',    'P. Kumar',       'pkumar@ways.local',      'tech123',        'Technician',           'Engineering - Mechanical'],
+    ['krao',      'K. Rao',         'krao@ways.local',        'tech123',        'Technician',           'Engineering - Electrical'],
+    ['snaidu',    'S. Naidu',       'snaidu@ways.local',      'tech123',        'Technician',           'HVAC'],
+    ['mverma',    'M. Verma',       'mverma@ways.local',      'prod123',        'Production',           null],
+    ['qaapprove', 'Q. Anand',       'qa@ways.local',          'qa123',          'QA',                   null],
+    ['stores',    'Stores Officer', 'stores@ways.local',      'store123',       'Warehouse',            null],
   ];
-  for (const u of users) insertUser.run(...u);
+  for (const u of users) {
+    const r = roleByName(u[4]);
+    const dId = u[5] ? deptId(u[5]) : r.department_id;
+    const dName = u[5] || db.prepare('SELECT name FROM departments WHERE id=?').get(dId).name;
+    insertUser.run(u[0], u[1], u[2], mkHash(u[3]), r.id, dId, r.name, dName);
+  }
 
   const ins = (sql) => db.prepare(sql);
 
@@ -285,19 +462,28 @@ function seed() {
   ];
   for (const f of freqs) ins('INSERT INTO frequencies(name,days,tolerance_days) VALUES (?,?,?)').run(...f);
 
-  const cats = ['Mechanical','Electrical','Instrumentation','Utility','HVAC','Calibration','Lubrication','Safety'];
-  for (const c of cats) ins('INSERT INTO pm_categories(name) VALUES (?)').run(c);
+  const cats = [
+    ['Mechanical',     'Mechanical maintenance activities'],
+    ['Electrical',     'Electrical inspections and tests'],
+    ['Instrumentation','Instrument calibration & checks'],
+    ['Utility',        'Utility systems (steam, compressed air, etc.)'],
+    ['HVAC',           'Heating, ventilation & air conditioning'],
+    ['Calibration',    'Periodic instrument calibration'],
+    ['Lubrication',    'Lubrication schedule'],
+    ['Safety',         'Safety and statutory checks'],
+  ];
+  for (const c of cats) ins('INSERT INTO pm_categories(name,description) VALUES (?,?)').run(...c);
 
   const groups = [
-    ['Granulation Equipment','Engineering - Mechanical'],
-    ['Compression Machines','Engineering - Mechanical'],
-    ['Coating Equipment','Engineering - Mechanical'],
-    ['HVAC / Utilities','HVAC'],
-    ['Capsule Filling','Engineering - Mechanical'],
+    ['Granulation Equipment',  deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],
+    ['Compression Machines',   deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],
+    ['Coating Equipment',      deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],
+    ['HVAC / Utilities',       deptId('HVAC'),                     'HVAC'],
+    ['Capsule Filling',        deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],
   ];
-  for (const g of groups) ins('INSERT INTO checklist_groups(name,department) VALUES (?,?)').run(...g);
+  for (const g of groups) ins('INSERT INTO checklist_groups(name,department_id,department) VALUES (?,?,?)').run(...g);
 
-  // A starter checklist
+  // Legacy fields_json checklists (still supported)
   const fbdChecklist = JSON.stringify([
     { id: 'q1', type: 'dropdown', label: 'Verify equipment is shut down and tagged out', options:['OK','Not OK'], required:true },
     { id: 'q2', type: 'dropdown', label: 'Inspect filter bag condition', options:['OK','Replace'], required:true },
@@ -324,6 +510,36 @@ function seed() {
   ]);
   ins('INSERT INTO checklists(name,group_id,version,fields_json) VALUES (?,?,?,?)').run('AHU Quarterly HVAC',4,'v1.4',ahuChecklist);
 
+  // ---- Structured (new) checklist sample: AHU Monthly Inspection ----
+  const adminId = db.prepare("SELECT id FROM users WHERE user_id='admin'").get().id;
+  const ahuCatId = db.prepare("SELECT id FROM pm_categories WHERE name='HVAC'").get().id;
+  const clRes = ins('INSERT INTO checklists(name,description,group_id,category_id,version,status,created_by) VALUES (?,?,?,?,?,?,?)')
+    .run('AHU Monthly Inspection (v2)', 'Structured monthly AHU inspection with grouped checkpoints.', 4, ahuCatId, 'v2.0', 'Active', adminId);
+  const ahuCl = clRes.lastInsertRowid;
+
+  const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
+  const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,position) VALUES (?,?,?,?,?,?,?,?,?)`);
+
+  const sec1 = insSec.run(ahuCl, 'Pre-Inspection Safety', 'Lock-out, tag-out and PPE verification', 1).lastInsertRowid;
+  insQ.run(sec1, 'Equipment isolated and locked out',     'yesno',    null, 1, null, null, null, 1);
+  insQ.run(sec1, 'PPE worn (gloves, goggles)',            'checkbox', null, 1, null, null, null, 2);
+  insQ.run(sec1, 'Permit-to-work number',                 'text',     null, 1, null, null, null, 3);
+
+  const sec2 = insSec.run(ahuCl, 'Filters & Coils', 'Visual + measurement checks on filters', 2).lastInsertRowid;
+  insQ.run(sec2, 'Pre-filter condition',                  'dropdown', JSON.stringify(['OK','Dirty','Replace']), 1, null, null, null, 1);
+  insQ.run(sec2, 'HEPA filter condition',                 'dropdown', JSON.stringify(['OK','Replace']),         1, null, null, null, 2);
+  insQ.run(sec2, 'Differential pressure across filter',   'number',   null, 1, 0, 500, 'Pa', 3);
+  insQ.run(sec2, 'Cooling coil cleanliness',              'dropdown', JSON.stringify(['Clean','Acceptable','Dirty']), 1, null, null, null, 4);
+
+  const sec3 = insSec.run(ahuCl, 'Blower & Motor', 'Mechanical + electrical health of blower assembly', 3).lastInsertRowid;
+  insQ.run(sec3, 'Belt tension OK',                       'yesno',    null, 1, null, null, null, 1);
+  insQ.run(sec3, 'Motor current draw',                    'number',   null, 1, 0, 100, 'A', 2);
+  insQ.run(sec3, 'Bearing temperature',                   'number',   null, 1, 0, 120, '°C', 3);
+  insQ.run(sec3, 'Unusual noise / vibration?',            'yesno',    null, 1, null, null, null, 4);
+
+  const sec4 = insSec.run(ahuCl, 'Sign-off', 'Technician notes and signatures', 4).lastInsertRowid;
+  insQ.run(sec4, 'Remarks / observations',                'text',     null, 0, null, null, null, 1);
+
   // PM Schedules — mix of statuses for a populated dashboard
   const u = (uid) => db.prepare('SELECT id FROM users WHERE user_id=?').get(uid).id;
   const cl = (name) => db.prepare('SELECT id FROM checklists WHERE name=?').get(name).id;
@@ -341,11 +557,22 @@ function seed() {
   insSched.run('PM-2589','EQ-TBP-02', cl('FBD Monthly Mechanical'),'Quarterly','Calibration', fmt(addDays(today, -6)),'Engineering - Mechanical', u('pkumar'), u('rmehta'), u('siyer'), 'Overdue',  u('admin'));
   insSched.run('PM-2570','EQ-AHU-08', cl('AHU Quarterly HVAC'),    'Monthly','HVAC',       fmt(addDays(today, -22)),'HVAC',                     null,         u('rmehta'), u('siyer'), 'Expired',  u('admin'));
 
-  // A completed PM with execution data
   const completedData = JSON.stringify({ q1:'OK', q2:'OK', q3:55, q4:true, q5:'LUB-2026-04-001', q6:'Routine PM completed without issues' });
   insSched.run('PM-2575','EQ-CAP-01', cl('FBD Monthly Mechanical'),'Monthly','Mechanical', fmt(addDays(today, -16)),'Engineering - Mechanical', u('snaidu'), u('rmehta'), u('siyer'), 'Completed', u('admin'));
   db.prepare(`UPDATE pm_schedules SET execution_data=?, started_at=?, completed_at=?, technician_sig=?, reviewer_sig=?, approver_sig=? WHERE pm_id='PM-2575'`)
     .run(completedData, fmt(addDays(today, -16))+' 09:15:00', fmt(addDays(today,-16))+' 11:20:00','S. Naidu','R. Mehta','S. Iyer');
+
+  // Sample checklist assignment with notification
+  const assn1 = ins('INSERT INTO checklist_assignments(assignment_id,checklist_id,assignee_id,frequency_id,due_date,status,assigned_by) VALUES (?,?,?,?,?,?,?)')
+    .run('CA-001', ahuCl, u('snaidu'),
+         db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
+         fmt(addDays(today, 3)), 'Pending', u('admin'));
+  ins('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
+    .run(u('snaidu'),
+         'New checklist assigned',
+         'AHU Monthly Inspection (v2) is due ' + fmt(addDays(today,3)) + '.',
+         'assignment',
+         '/assignments/CA-001');
 
   // Breakdowns
   const insBd = ins('INSERT INTO breakdowns(bd_id,equipment_id,reported_by,severity,status,description) VALUES (?,?,?,?,?,?)');
@@ -366,11 +593,14 @@ function seed() {
 
 function initAndSeed(force=false) {
   if (force) {
-    // wipe tables (in dependency-safe order)
     db.exec(`
       DROP TABLE IF EXISTS audit_log;
       DROP TABLE IF EXISTS breakdowns;
       DROP TABLE IF EXISTS pm_schedules;
+      DROP TABLE IF EXISTS notifications;
+      DROP TABLE IF EXISTS checklist_assignments;
+      DROP TABLE IF EXISTS checklist_questions;
+      DROP TABLE IF EXISTS checklist_sections;
       DROP TABLE IF EXISTS checklists;
       DROP TABLE IF EXISTS checklist_groups;
       DROP TABLE IF EXISTS pm_categories;
@@ -383,13 +613,15 @@ function initAndSeed(force=false) {
       DROP TABLE IF EXISTS plants;
       DROP TABLE IF EXISTS sessions;
       DROP TABLE IF EXISTS users;
+      DROP TABLE IF EXISTS roles;
+      DROP TABLE IF EXISTS activities;
+      DROP TABLE IF EXISTS departments;
     `);
   }
   createSchema();
   seed();
 }
 
-// Initialize on require
 initAndSeed(false);
 
 module.exports = { db, initAndSeed, hashPassword, verifyPassword };

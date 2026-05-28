@@ -49,11 +49,23 @@ function authFromReq(req) {
   const token = req.headers['x-session-token'] || req.cookies?.token;
   if (!token) return null;
   const row = db.prepare(`
-    SELECT s.token, s.expires_at, u.id, u.user_id, u.name, u.role, u.department, u.email
+    SELECT s.token, s.expires_at,
+           u.id, u.user_id, u.name, u.email, u.status,
+           u.role_id, u.department_id,
+           COALESCE(r.name, u.role) AS role,
+           COALESCE(d.name, u.department) AS department,
+           r.permissions_json AS permissions_json
     FROM sessions s JOIN users u ON u.id = s.user_id
+    LEFT JOIN roles r ON r.id = u.role_id
+    LEFT JOIN departments d ON d.id = u.department_id
     WHERE s.token = ? AND s.expires_at > datetime('now')
   `).get(token);
-  return row || null;
+  if (!row) return null;
+  try { row.permissions = JSON.parse(row.permissions_json || '[]'); }
+  catch (e) { row.permissions = []; }
+  // System Administrator role has implicit "*" — all activities. We mark it.
+  row.is_admin = (row.role === 'System Administrator');
+  return row;
 }
 
 function requireAuth(req, res, next) {
@@ -73,13 +85,42 @@ function requireRole(...roles) {
   };
 }
 
+// Permission-based middleware — preferred over requireRole for new code.
+function requireActivity(...codes) {
+  return (req, res, next) => {
+    if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+    if (req.user.is_admin) return next(); // sysadmin gets everything
+    const perms = req.user.permissions || [];
+    const ok = codes.some(c => perms.includes(c));
+    if (!ok) return res.status(403).json({ error: `Forbidden — requires activity: ${codes.join(' or ')}` });
+    next();
+  };
+}
+
+function userHasActivity(user, code) {
+  if (!user) return false;
+  if (user.is_admin) return true;
+  return (user.permissions || []).includes(code);
+}
+
+function notify(userId, title, message, kind = 'info', link = null) {
+  db.prepare('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
+    .run(userId, title, message || '', kind, link);
+}
+
 // =============================================================
 // AUTH
 // =============================================================
 app.post('/api/auth/login', (req, res) => {
   const { user_id, password } = req.body || {};
   if (!user_id || !password) return res.status(400).json({ error: 'user_id and password required' });
-  const u = db.prepare('SELECT * FROM users WHERE user_id = ?').get(user_id);
+  const u = db.prepare(`
+    SELECT u.*, r.name AS role_name, r.permissions_json, d.name AS dept_name
+    FROM users u
+    LEFT JOIN roles r ON r.id = u.role_id
+    LEFT JOIN departments d ON d.id = u.department_id
+    WHERE u.user_id = ?
+  `).get(user_id);
   if (!u) return res.status(401).json({ error: 'Invalid credentials' });
   if (u.status !== 'Active') return res.status(403).json({ error: 'User is locked or inactive' });
   if (!verifyPassword(password, u.password_hash)) return res.status(401).json({ error: 'Invalid credentials' });
@@ -89,11 +130,22 @@ app.post('/api/auth/login', (req, res) => {
   db.prepare('INSERT INTO sessions(token,user_id,expires_at) VALUES (?,?,?)').run(token, u.id, expires);
   db.prepare("UPDATE users SET last_login = datetime('now') WHERE id = ?").run(u.id);
 
-  audit({ id: u.id, name: u.name }, 'LOGIN', 'User', u.user_id, `Role: ${u.role}`);
+  let permissions = [];
+  try { permissions = JSON.parse(u.permissions_json || '[]'); } catch (e) {}
+  const roleName = u.role_name || u.role;
+  const deptName = u.dept_name || u.department;
+
+  audit({ id: u.id, name: u.name }, 'LOGIN', 'User', u.user_id, `Role: ${roleName}`);
 
   res.json({
     token,
-    user: { id: u.id, user_id: u.user_id, name: u.name, email: u.email, role: u.role, department: u.department }
+    user: {
+      id: u.id, user_id: u.user_id, name: u.name, email: u.email,
+      role: roleName, department: deptName,
+      role_id: u.role_id, department_id: u.department_id,
+      permissions,
+      is_admin: roleName === 'System Administrator'
+    }
   });
 });
 
@@ -108,7 +160,11 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({
     user: {
       id: req.user.id, user_id: req.user.user_id, name: req.user.name,
-      email: req.user.email, role: req.user.role, department: req.user.department
+      email: req.user.email,
+      role: req.user.role, department: req.user.department,
+      role_id: req.user.role_id, department_id: req.user.department_id,
+      permissions: req.user.permissions,
+      is_admin: req.user.is_admin
     }
   });
 });
@@ -234,19 +290,74 @@ app.put('/api/equipment/:equipment_id', requireAuth, requireRole('System Adminis
 // USERS
 // =============================================================
 app.get('/api/users', requireAuth, (req, res) => {
-  res.json(db.prepare('SELECT id, user_id, name, email, role, department, status, last_login FROM users ORDER BY id').all());
+  res.json(db.prepare(`
+    SELECT u.id, u.user_id, u.name, u.email,
+           u.role_id, u.department_id,
+           COALESCE(r.name, u.role)        AS role,
+           COALESCE(d.name, u.department)  AS department,
+           u.status, u.last_login
+    FROM users u
+    LEFT JOIN roles r ON r.id = u.role_id
+    LEFT JOIN departments d ON d.id = u.department_id
+    ORDER BY u.id
+  `).all());
 });
-app.post('/api/users', requireAuth, requireRole('System Administrator'), (req, res) => {
-  const { user_id, name, email, password, role, department } = req.body;
-  if (!user_id || !name || !password || !role) return res.status(400).json({ error: 'user_id, name, password, role required' });
+
+app.post('/api/users', requireAuth, requireActivity('manage_users'), (req, res) => {
+  const { user_id, name, email, password, role_id, department_id } = req.body || {};
+  if (!user_id || !name || !password || !role_id) {
+    return res.status(400).json({ error: 'user_id, name, password and role_id required' });
+  }
+  const role = db.prepare('SELECT id, name, department_id FROM roles WHERE id=? AND status=\'Active\'').get(role_id);
+  if (!role) return res.status(400).json({ error: 'Unknown role_id' });
+  const finalDeptId = department_id || role.department_id;
+  const dept = db.prepare('SELECT id, name FROM departments WHERE id=?').get(finalDeptId);
+  if (!dept) return res.status(400).json({ error: 'Unknown department_id' });
   const exists = db.prepare('SELECT 1 FROM users WHERE user_id=?').get(user_id);
   if (exists) return res.status(409).json({ error: 'user_id already exists' });
+
   const hash = hashPassword(password);
-  const r = db.prepare('INSERT INTO users(user_id,name,email,password_hash,role,department) VALUES (?,?,?,?,?,?)').run(user_id, name, email||'', hash, role, department||'');
-  audit(req.user, 'CREATE', 'User', user_id, `Created user with role ${role}`);
-  res.json({ id: r.lastInsertRowid, user_id, name, role, department });
+  const r = db.prepare(`INSERT INTO users(user_id,name,email,password_hash,role_id,department_id,role,department)
+                        VALUES (?,?,?,?,?,?,?,?)`)
+    .run(user_id, name, email||'', hash, role.id, dept.id, role.name, dept.name);
+  audit(req.user, 'CREATE', 'User', user_id, `Role ${role.name} / Dept ${dept.name}`);
+  res.json({ id: r.lastInsertRowid, user_id, name, role: role.name, department: dept.name });
 });
-app.put('/api/users/:user_id/status', requireAuth, requireRole('System Administrator'), (req, res) => {
+
+app.put('/api/users/:user_id', requireAuth, requireActivity('manage_users'), (req, res) => {
+  const { name, email, role_id, department_id, password } = req.body || {};
+  const u = db.prepare('SELECT * FROM users WHERE user_id=?').get(req.params.user_id);
+  if (!u) return res.status(404).json({ error: 'Not found' });
+
+  let role = null, dept = null;
+  if (role_id) {
+    role = db.prepare('SELECT id,name,department_id FROM roles WHERE id=?').get(role_id);
+    if (!role) return res.status(400).json({ error: 'Unknown role_id' });
+  }
+  if (department_id || role) {
+    const dId = department_id || (role && role.department_id);
+    dept = db.prepare('SELECT id,name FROM departments WHERE id=?').get(dId);
+    if (!dept) return res.status(400).json({ error: 'Unknown department_id' });
+  }
+
+  db.prepare(`UPDATE users SET
+      name = COALESCE(?,name),
+      email = COALESCE(?,email),
+      role_id = COALESCE(?,role_id),
+      department_id = COALESCE(?,department_id),
+      role = COALESCE(?,role),
+      department = COALESCE(?,department),
+      password_hash = COALESCE(?,password_hash)
+    WHERE user_id=?`)
+    .run(name, email, role?.id || null, dept?.id || null,
+         role?.name || null, dept?.name || null,
+         password ? hashPassword(password) : null,
+         req.params.user_id);
+  audit(req.user, 'UPDATE', 'User', req.params.user_id, 'User profile updated');
+  res.json({ ok: true });
+});
+
+app.put('/api/users/:user_id/status', requireAuth, requireActivity('manage_users'), (req, res) => {
   const { status } = req.body;
   if (!['Active','Locked','Inactive'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
   db.prepare('UPDATE users SET status=? WHERE user_id=?').run(status, req.params.user_id);
@@ -507,6 +618,493 @@ app.get('/api/calendar', requireAuth, (req, res) => {
     `).all();
   }
   res.json(rows);
+});
+
+// =============================================================
+// DEPARTMENTS — admin-managed
+// =============================================================
+app.get('/api/departments', requireAuth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM departments ORDER BY name').all());
+});
+
+app.post('/api/departments', requireAuth, requireActivity('manage_departments'), (req, res) => {
+  const { name, description } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const exists = db.prepare('SELECT 1 FROM departments WHERE name=?').get(name);
+  if (exists) return res.status(409).json({ error: 'Department already exists' });
+  const r = db.prepare('INSERT INTO departments(name,description) VALUES (?,?)').run(name, description || '');
+  audit(req.user, 'CREATE', 'Department', r.lastInsertRowid, `Created "${name}"`);
+  res.json(db.prepare('SELECT * FROM departments WHERE id=?').get(r.lastInsertRowid));
+});
+
+app.put('/api/departments/:id', requireAuth, requireActivity('manage_departments'), (req, res) => {
+  const { name, description, status } = req.body || {};
+  const r = db.prepare(`UPDATE departments SET
+      name = COALESCE(?,name),
+      description = COALESCE(?,description),
+      status = COALESCE(?,status)
+    WHERE id=?`).run(name, description, status, req.params.id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  audit(req.user, 'UPDATE', 'Department', req.params.id, 'Department modified');
+  res.json(db.prepare('SELECT * FROM departments WHERE id=?').get(req.params.id));
+});
+
+app.delete('/api/departments/:id', requireAuth, requireActivity('manage_departments'), (req, res) => {
+  const inUse = db.prepare('SELECT COUNT(*) n FROM users WHERE department_id=?').get(req.params.id).n
+              + db.prepare('SELECT COUNT(*) n FROM roles WHERE department_id=?').get(req.params.id).n;
+  if (inUse > 0) return res.status(409).json({ error: `Cannot delete — ${inUse} user(s)/role(s) still reference this department. Reassign them first.` });
+  const r = db.prepare('DELETE FROM departments WHERE id=?').run(req.params.id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  audit(req.user, 'DELETE', 'Department', req.params.id, 'Department deleted');
+  res.json({ ok: true });
+});
+
+// =============================================================
+// ACTIVITIES — permissions catalog (admin-extensible)
+// =============================================================
+app.get('/api/activities', requireAuth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM activities ORDER BY category, label').all());
+});
+
+app.post('/api/activities', requireAuth, requireActivity('manage_activities'), (req, res) => {
+  const { code, label, category } = req.body || {};
+  if (!code || !label) return res.status(400).json({ error: 'code and label required' });
+  if (!/^[a-z][a-z0-9_]*$/.test(code)) return res.status(400).json({ error: 'code must be lowercase letters / digits / underscore, starting with a letter' });
+  const exists = db.prepare('SELECT 1 FROM activities WHERE code=?').get(code);
+  if (exists) return res.status(409).json({ error: 'activity code already exists' });
+  const r = db.prepare('INSERT INTO activities(code,label,category,is_system) VALUES (?,?,?,0)').run(code, label, category || 'Custom');
+  audit(req.user, 'CREATE', 'Activity', r.lastInsertRowid, `Created activity "${code}"`);
+  res.json(db.prepare('SELECT * FROM activities WHERE id=?').get(r.lastInsertRowid));
+});
+
+app.put('/api/activities/:id', requireAuth, requireActivity('manage_activities'), (req, res) => {
+  const { label, category } = req.body || {};
+  const a = db.prepare('SELECT * FROM activities WHERE id=?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE activities SET label=COALESCE(?,label), category=COALESCE(?,category) WHERE id=?')
+    .run(label, category, req.params.id);
+  audit(req.user, 'UPDATE', 'Activity', req.params.id, 'Activity modified');
+  res.json(db.prepare('SELECT * FROM activities WHERE id=?').get(req.params.id));
+});
+
+app.delete('/api/activities/:id', requireAuth, requireActivity('manage_activities'), (req, res) => {
+  const a = db.prepare('SELECT * FROM activities WHERE id=?').get(req.params.id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.is_system) return res.status(409).json({ error: 'Cannot delete built-in activity' });
+  // Check no role uses this activity code
+  const rolesUsing = db.prepare('SELECT name, permissions_json FROM roles').all()
+    .filter(r => { try { return JSON.parse(r.permissions_json || '[]').includes(a.code); } catch (e) { return false; } });
+  if (rolesUsing.length > 0) {
+    return res.status(409).json({ error: `Cannot delete — ${rolesUsing.length} role(s) still grant this activity (${rolesUsing.map(r=>r.name).join(', ')}). Remove it from those roles first.` });
+  }
+  db.prepare('DELETE FROM activities WHERE id=?').run(req.params.id);
+  audit(req.user, 'DELETE', 'Activity', req.params.id, `Deleted activity "${a.code}"`);
+  res.json({ ok: true });
+});
+
+// =============================================================
+// ROLES — admin-managed, each linked to one department, with a permissions list
+// =============================================================
+app.get('/api/roles', requireAuth, (req, res) => {
+  const rows = db.prepare(`
+    SELECT r.*, d.name AS department_name,
+           (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id) AS user_count
+    FROM roles r LEFT JOIN departments d ON d.id = r.department_id
+    ORDER BY r.name
+  `).all();
+  rows.forEach(r => { try { r.permissions = JSON.parse(r.permissions_json || '[]'); } catch(e) { r.permissions = []; } delete r.permissions_json; });
+  res.json(rows);
+});
+
+app.get('/api/roles/:id', requireAuth, (req, res) => {
+  const r = db.prepare(`
+    SELECT r.*, d.name AS department_name
+    FROM roles r LEFT JOIN departments d ON d.id = r.department_id
+    WHERE r.id = ?`).get(req.params.id);
+  if (!r) return res.status(404).json({ error: 'Not found' });
+  try { r.permissions = JSON.parse(r.permissions_json || '[]'); } catch(e) { r.permissions = []; }
+  delete r.permissions_json;
+  res.json(r);
+});
+
+app.post('/api/roles', requireAuth, requireActivity('manage_roles'), (req, res) => {
+  const { name, department_id, description, permissions } = req.body || {};
+  if (!name || !department_id) return res.status(400).json({ error: 'name and department_id required' });
+  const dept = db.prepare('SELECT 1 FROM departments WHERE id=?').get(department_id);
+  if (!dept) return res.status(400).json({ error: 'Unknown department_id' });
+  const exists = db.prepare('SELECT 1 FROM roles WHERE name=?').get(name);
+  if (exists) return res.status(409).json({ error: 'role name already exists' });
+  const perms = Array.isArray(permissions) ? [...new Set(permissions)] : [];
+  // Validate every permission code exists in activities
+  if (perms.length) {
+    const known = new Set(db.prepare('SELECT code FROM activities').all().map(a=>a.code));
+    const unknown = perms.filter(p => !known.has(p));
+    if (unknown.length) return res.status(400).json({ error: `Unknown activities: ${unknown.join(', ')}` });
+  }
+  const r = db.prepare('INSERT INTO roles(name,department_id,description,permissions_json,is_system) VALUES (?,?,?,?,0)')
+    .run(name, department_id, description || '', JSON.stringify(perms));
+  audit(req.user, 'CREATE', 'Role', r.lastInsertRowid, `Created role "${name}" with ${perms.length} activities`);
+  res.json({ id: r.lastInsertRowid, name, department_id, permissions: perms });
+});
+
+app.put('/api/roles/:id', requireAuth, requireActivity('manage_roles'), (req, res) => {
+  const { name, department_id, description, permissions, status } = req.body || {};
+  const role = db.prepare('SELECT * FROM roles WHERE id=?').get(req.params.id);
+  if (!role) return res.status(404).json({ error: 'Not found' });
+  let permsJson = null;
+  if (Array.isArray(permissions)) {
+    const known = new Set(db.prepare('SELECT code FROM activities').all().map(a=>a.code));
+    const unknown = permissions.filter(p => !known.has(p));
+    if (unknown.length) return res.status(400).json({ error: `Unknown activities: ${unknown.join(', ')}` });
+    permsJson = JSON.stringify([...new Set(permissions)]);
+  }
+  db.prepare(`UPDATE roles SET
+      name = COALESCE(?,name),
+      department_id = COALESCE(?,department_id),
+      description = COALESCE(?,description),
+      permissions_json = COALESCE(?,permissions_json),
+      status = COALESCE(?,status)
+    WHERE id=?`).run(name, department_id, description, permsJson, status, req.params.id);
+
+  // Keep denormalized role/department names on users in sync.
+  if (name || department_id) {
+    const fresh = db.prepare(`SELECT r.name AS rn, d.name AS dn FROM roles r LEFT JOIN departments d ON d.id=r.department_id WHERE r.id=?`).get(req.params.id);
+    db.prepare('UPDATE users SET role=?, department=COALESCE(?,department) WHERE role_id=?').run(fresh.rn, fresh.dn, req.params.id);
+  }
+  audit(req.user, 'UPDATE', 'Role', req.params.id, 'Role modified');
+  res.json({ ok: true });
+});
+
+app.delete('/api/roles/:id', requireAuth, requireActivity('manage_roles'), (req, res) => {
+  const role = db.prepare('SELECT * FROM roles WHERE id=?').get(req.params.id);
+  if (!role) return res.status(404).json({ error: 'Not found' });
+  if (role.is_system) return res.status(409).json({ error: 'Cannot delete built-in role' });
+  const inUse = db.prepare('SELECT COUNT(*) n FROM users WHERE role_id=?').get(req.params.id).n;
+  if (inUse > 0) return res.status(409).json({ error: `Cannot delete — ${inUse} user(s) still have this role. Reassign them first.` });
+  db.prepare('DELETE FROM roles WHERE id=?').run(req.params.id);
+  audit(req.user, 'DELETE', 'Role', req.params.id, `Deleted role "${role.name}"`);
+  res.json({ ok: true });
+});
+
+// =============================================================
+// PM FREQUENCIES — admin-managed master
+// =============================================================
+app.post('/api/frequencies', requireAuth, requireActivity('manage_pm_frequencies'), (req, res) => {
+  const { name, days, tolerance_days } = req.body || {};
+  if (!name || days === undefined) return res.status(400).json({ error: 'name and days required' });
+  const exists = db.prepare('SELECT 1 FROM frequencies WHERE name=?').get(name);
+  if (exists) return res.status(409).json({ error: 'frequency name already exists' });
+  const r = db.prepare('INSERT INTO frequencies(name,days,tolerance_days) VALUES (?,?,?)').run(name, parseInt(days,10), parseInt(tolerance_days || 0,10));
+  audit(req.user, 'CREATE', 'Frequency', r.lastInsertRowid, `Created "${name}" (${days}d)`);
+  res.json(db.prepare('SELECT * FROM frequencies WHERE id=?').get(r.lastInsertRowid));
+});
+
+app.put('/api/frequencies/:id', requireAuth, requireActivity('manage_pm_frequencies'), (req, res) => {
+  const { name, days, tolerance_days, status } = req.body || {};
+  const f = db.prepare('SELECT * FROM frequencies WHERE id=?').get(req.params.id);
+  if (!f) return res.status(404).json({ error: 'Not found' });
+  db.prepare(`UPDATE frequencies SET
+      name=COALESCE(?,name),
+      days=COALESCE(?,days),
+      tolerance_days=COALESCE(?,tolerance_days),
+      status=COALESCE(?,status)
+    WHERE id=?`).run(name, days, tolerance_days, status, req.params.id);
+  audit(req.user, 'UPDATE', 'Frequency', req.params.id, 'Frequency modified');
+  res.json(db.prepare('SELECT * FROM frequencies WHERE id=?').get(req.params.id));
+});
+
+app.delete('/api/frequencies/:id', requireAuth, requireActivity('manage_pm_frequencies'), (req, res) => {
+  const f = db.prepare('SELECT * FROM frequencies WHERE id=?').get(req.params.id);
+  if (!f) return res.status(404).json({ error: 'Not found' });
+  const inUse = db.prepare('SELECT COUNT(*) n FROM pm_schedules WHERE frequency=?').get(f.name).n
+              + db.prepare('SELECT COUNT(*) n FROM checklist_assignments WHERE frequency_id=?').get(req.params.id).n;
+  if (inUse > 0) return res.status(409).json({ error: `Cannot delete — ${inUse} PM(s) or assignment(s) still use this frequency.` });
+  db.prepare('DELETE FROM frequencies WHERE id=?').run(req.params.id);
+  audit(req.user, 'DELETE', 'Frequency', req.params.id, `Deleted "${f.name}"`);
+  res.json({ ok: true });
+});
+
+// =============================================================
+// PM CATEGORIES — admin-managed master
+// =============================================================
+app.post('/api/pm-categories', requireAuth, requireActivity('manage_pm_categories'), (req, res) => {
+  const { name, description } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const exists = db.prepare('SELECT 1 FROM pm_categories WHERE name=?').get(name);
+  if (exists) return res.status(409).json({ error: 'category already exists' });
+  const r = db.prepare('INSERT INTO pm_categories(name,description) VALUES (?,?)').run(name, description || '');
+  audit(req.user, 'CREATE', 'PMCategory', r.lastInsertRowid, `Created "${name}"`);
+  res.json(db.prepare('SELECT * FROM pm_categories WHERE id=?').get(r.lastInsertRowid));
+});
+
+app.put('/api/pm-categories/:id', requireAuth, requireActivity('manage_pm_categories'), (req, res) => {
+  const { name, description, status } = req.body || {};
+  const c = db.prepare('SELECT * FROM pm_categories WHERE id=?').get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Not found' });
+  db.prepare(`UPDATE pm_categories SET name=COALESCE(?,name), description=COALESCE(?,description), status=COALESCE(?,status) WHERE id=?`)
+    .run(name, description, status, req.params.id);
+  audit(req.user, 'UPDATE', 'PMCategory', req.params.id, 'Category modified');
+  res.json(db.prepare('SELECT * FROM pm_categories WHERE id=?').get(req.params.id));
+});
+
+app.delete('/api/pm-categories/:id', requireAuth, requireActivity('manage_pm_categories'), (req, res) => {
+  const c = db.prepare('SELECT * FROM pm_categories WHERE id=?').get(req.params.id);
+  if (!c) return res.status(404).json({ error: 'Not found' });
+  const inUse = db.prepare('SELECT COUNT(*) n FROM pm_schedules WHERE category=?').get(c.name).n
+              + db.prepare('SELECT COUNT(*) n FROM checklists WHERE category_id=?').get(req.params.id).n;
+  if (inUse > 0) return res.status(409).json({ error: `Cannot delete — ${inUse} PM(s) / checklist(s) use this category.` });
+  db.prepare('DELETE FROM pm_categories WHERE id=?').run(req.params.id);
+  audit(req.user, 'DELETE', 'PMCategory', req.params.id, `Deleted "${c.name}"`);
+  res.json({ ok: true });
+});
+
+// =============================================================
+// STRUCTURED CHECKLISTS — sections + questions
+// =============================================================
+function loadChecklistFull(id) {
+  const cl = db.prepare(`
+    SELECT cl.*, d.name AS dept_name, cg.name AS group_name, pc.name AS category_name,
+           u.name AS created_by_name
+    FROM checklists cl
+    LEFT JOIN checklist_groups cg ON cg.id = cl.group_id
+    LEFT JOIN departments d ON d.id = cg.department_id
+    LEFT JOIN pm_categories pc ON pc.id = cl.category_id
+    LEFT JOIN users u ON u.id = cl.created_by
+    WHERE cl.id = ?`).get(id);
+  if (!cl) return null;
+  const sections = db.prepare('SELECT * FROM checklist_sections WHERE checklist_id=? ORDER BY position, id').all(id);
+  for (const s of sections) {
+    const qs = db.prepare('SELECT * FROM checklist_questions WHERE section_id=? ORDER BY position, id').all(s.id);
+    for (const q of qs) {
+      try { q.options = q.options_json ? JSON.parse(q.options_json) : null; } catch(e) { q.options = null; }
+      delete q.options_json;
+    }
+    s.questions = qs;
+  }
+  cl.sections = sections;
+  if (cl.fields_json) {
+    try { cl.legacy_fields = JSON.parse(cl.fields_json); } catch(e) {}
+  }
+  delete cl.fields_json;
+  return cl;
+}
+
+app.get('/api/checklists/:id/full', requireAuth, (req, res) => {
+  const cl = loadChecklistFull(req.params.id);
+  if (!cl) return res.status(404).json({ error: 'Not found' });
+  res.json(cl);
+});
+
+app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (req, res) => {
+  const { name, description, group_id, category_id, version, sections } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const r = db.prepare(`INSERT INTO checklists(name,description,group_id,category_id,version,status,created_by)
+                        VALUES (?,?,?,?,?,?,?)`)
+    .run(name, description || '', group_id || null, category_id || null, version || 'v1.0', 'Active', req.user.id);
+  const newId = r.lastInsertRowid;
+  if (Array.isArray(sections)) {
+    const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
+    const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,position) VALUES (?,?,?,?,?,?,?,?,?)`);
+    sections.forEach((s, sIdx) => {
+      const sId = insSec.run(newId, s.name || `Section ${sIdx+1}`, s.description || '', sIdx+1).lastInsertRowid;
+      (s.questions || []).forEach((q, qIdx) => {
+        insQ.run(sId, q.label || 'Question', q.qtype || 'text',
+                 q.options ? JSON.stringify(q.options) : null,
+                 q.required ? 1 : 0,
+                 q.min_value ?? null, q.max_value ?? null, q.unit || null, qIdx+1);
+      });
+    });
+  }
+  audit(req.user, 'CREATE', 'Checklist', newId, `Created "${name}"`);
+  res.json(loadChecklistFull(newId));
+});
+
+app.put('/api/checklists/:id', requireAuth, requireActivity('manage_checklists'), (req, res) => {
+  const { name, description, group_id, category_id, version, status, sections } = req.body || {};
+  const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
+  if (!cl) return res.status(404).json({ error: 'Not found' });
+  db.prepare(`UPDATE checklists SET
+      name=COALESCE(?,name),
+      description=COALESCE(?,description),
+      group_id=COALESCE(?,group_id),
+      category_id=COALESCE(?,category_id),
+      version=COALESCE(?,version),
+      status=COALESCE(?,status)
+    WHERE id=?`).run(name, description, group_id, category_id, version, status, req.params.id);
+
+  // If sections payload provided, replace structured content (idempotent overwrite).
+  if (Array.isArray(sections)) {
+    db.prepare('DELETE FROM checklist_sections WHERE checklist_id=?').run(req.params.id);
+    const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
+    const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,position) VALUES (?,?,?,?,?,?,?,?,?)`);
+    sections.forEach((s, sIdx) => {
+      const sId = insSec.run(req.params.id, s.name || `Section ${sIdx+1}`, s.description || '', sIdx+1).lastInsertRowid;
+      (s.questions || []).forEach((q, qIdx) => {
+        insQ.run(sId, q.label || 'Question', q.qtype || 'text',
+                 q.options ? JSON.stringify(q.options) : null,
+                 q.required ? 1 : 0,
+                 q.min_value ?? null, q.max_value ?? null, q.unit || null, qIdx+1);
+      });
+    });
+  }
+  audit(req.user, 'UPDATE', 'Checklist', req.params.id, 'Checklist modified');
+  res.json(loadChecklistFull(req.params.id));
+});
+
+app.delete('/api/checklists/:id', requireAuth, requireActivity('manage_checklists'), (req, res) => {
+  const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
+  if (!cl) return res.status(404).json({ error: 'Not found' });
+  const inUse = db.prepare('SELECT COUNT(*) n FROM pm_schedules WHERE checklist_id=?').get(req.params.id).n
+              + db.prepare('SELECT COUNT(*) n FROM checklist_assignments WHERE checklist_id=?').get(req.params.id).n;
+  if (inUse > 0) return res.status(409).json({ error: `Cannot delete — ${inUse} PM(s) / assignment(s) still reference this checklist.` });
+  db.prepare('DELETE FROM checklists WHERE id=?').run(req.params.id);
+  audit(req.user, 'DELETE', 'Checklist', req.params.id, `Deleted "${cl.name}"`);
+  res.json({ ok: true });
+});
+
+// =============================================================
+// CHECKLIST ASSIGNMENTS — manager assigns checklist to user; user is notified
+// =============================================================
+function nextAssignmentId() {
+  const row = db.prepare("SELECT assignment_id FROM checklist_assignments ORDER BY id DESC LIMIT 1").get();
+  if (!row) return 'CA-001';
+  const m = row.assignment_id.match(/(\d+)$/);
+  const n = m ? parseInt(m[1], 10) + 1 : 1;
+  return 'CA-' + String(n).padStart(3, '0');
+}
+
+app.get('/api/assignments', requireAuth, (req, res) => {
+  const { mine, status } = req.query;
+  const where = [];
+  const args = [];
+  if (mine === '1') { where.push('ca.assignee_id = ?'); args.push(req.user.id); }
+  if (status)       { where.push('ca.status = ?');     args.push(status); }
+  const sql = `
+    SELECT ca.id, ca.assignment_id, ca.checklist_id, ca.assignee_id, ca.frequency_id,
+           ca.due_date, ca.status, ca.notes, ca.assigned_at, ca.started_at, ca.completed_at,
+           cl.name AS checklist_name, cl.version AS checklist_version,
+           u.name AS assignee_name, u.user_id AS assignee_user_id,
+           b.name AS assigned_by_name,
+           f.name AS frequency
+    FROM checklist_assignments ca
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN users u ON u.id = ca.assignee_id
+    LEFT JOIN users b ON b.id = ca.assigned_by
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+    ORDER BY ca.due_date IS NULL, ca.due_date ASC, ca.id DESC
+  `;
+  res.json(db.prepare(sql).all(...args));
+});
+
+app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
+  const row = db.prepare(`
+    SELECT ca.*, cl.name AS checklist_name, cl.version AS checklist_version,
+           u.name AS assignee_name, u.user_id AS assignee_user_id,
+           b.name AS assigned_by_name, f.name AS frequency
+    FROM checklist_assignments ca
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN users u ON u.id = ca.assignee_id
+    LEFT JOIN users b ON b.id = ca.assigned_by
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    WHERE ca.assignment_id = ?`).get(req.params.assignment_id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  if (row.response_data) { try { row.response_data = JSON.parse(row.response_data); } catch(e) {} }
+  row.checklist = loadChecklistFull(row.checklist_id);
+  res.json(row);
+});
+
+app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (req, res) => {
+  const { checklist_id, assignee_id, frequency_id, due_date, notes } = req.body || {};
+  if (!checklist_id || !assignee_id) return res.status(400).json({ error: 'checklist_id and assignee_id required' });
+  const cl = db.prepare('SELECT id, name FROM checklists WHERE id=?').get(checklist_id);
+  if (!cl) return res.status(400).json({ error: 'Unknown checklist_id' });
+  const u = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
+  if (!u) return res.status(400).json({ error: 'Unknown assignee_id' });
+
+  const aid = nextAssignmentId();
+  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,assignee_id,frequency_id,due_date,notes,status,assigned_by)
+              VALUES (?,?,?,?,?,?,?,?)`)
+    .run(aid, checklist_id, assignee_id, frequency_id || null, due_date || null, notes || '', 'Pending', req.user.id);
+
+  notify(assignee_id,
+    'New checklist assigned',
+    `${cl.name}${due_date ? ' — due ' + due_date : ''}. Assigned by ${req.user.name}.`,
+    'assignment',
+    `/assignments/${aid}`);
+
+  audit(req.user, 'ASSIGN', 'Checklist', aid, `Assigned "${cl.name}" to ${u.name}`);
+  res.json(db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(aid));
+});
+
+app.put('/api/assignments/:assignment_id/start', requireAuth, (req, res) => {
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.assignee_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assignee can start this assignment' });
+  if (!['Pending'].includes(a.status)) return res.status(409).json({ error: `Cannot start from status ${a.status}` });
+  db.prepare("UPDATE checklist_assignments SET status='In Progress', started_at=datetime('now') WHERE assignment_id=?")
+    .run(req.params.assignment_id);
+  audit(req.user, 'START', 'Checklist', req.params.assignment_id, 'Assignment started');
+  res.json({ ok: true });
+});
+
+app.put('/api/assignments/:assignment_id/complete', requireAuth, (req, res) => {
+  const { response_data, notes } = req.body || {};
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.assignee_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assignee can complete this assignment' });
+  if (!['Pending','In Progress'].includes(a.status)) return res.status(409).json({ error: `Cannot complete from status ${a.status}` });
+  db.prepare(`UPDATE checklist_assignments SET
+      status='Completed',
+      completed_at=datetime('now'),
+      response_data=?,
+      notes=COALESCE(?,notes),
+      started_at=COALESCE(started_at, datetime('now'))
+    WHERE assignment_id=?`)
+    .run(JSON.stringify(response_data || {}), notes || null, req.params.assignment_id);
+  // Notify the assigner
+  if (a.assigned_by && a.assigned_by !== req.user.id) {
+    notify(a.assigned_by,
+      'Checklist completed',
+      `${req.user.name} completed ${req.params.assignment_id}.`,
+      'assignment',
+      `/assignments/${req.params.assignment_id}`);
+  }
+  audit(req.user, 'COMPLETE', 'Checklist', req.params.assignment_id, 'Assignment completed');
+  res.json({ ok: true });
+});
+
+// =============================================================
+// NOTIFICATIONS
+// =============================================================
+app.get('/api/notifications', requireAuth, (req, res) => {
+  const { unread } = req.query;
+  const where = ['user_id = ?'];
+  const args = [req.user.id];
+  if (unread === '1') where.push('is_read = 0');
+  const rows = db.prepare(`
+    SELECT id, title, message, kind, link, is_read, created_at
+    FROM notifications
+    WHERE ${where.join(' AND ')}
+    ORDER BY id DESC
+    LIMIT 100
+  `).all(...args);
+  res.json(rows);
+});
+
+app.get('/api/notifications/unread-count', requireAuth, (req, res) => {
+  const n = db.prepare('SELECT COUNT(*) n FROM notifications WHERE user_id=? AND is_read=0').get(req.user.id).n;
+  res.json({ count: n });
+});
+
+app.put('/api/notifications/:id/read', requireAuth, (req, res) => {
+  db.prepare('UPDATE notifications SET is_read=1 WHERE id=? AND user_id=?').run(req.params.id, req.user.id);
+  res.json({ ok: true });
+});
+
+app.put('/api/notifications/read-all', requireAuth, (req, res) => {
+  db.prepare('UPDATE notifications SET is_read=1 WHERE user_id=? AND is_read=0').run(req.user.id);
+  res.json({ ok: true });
 });
 
 // =============================================================

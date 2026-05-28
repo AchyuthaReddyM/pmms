@@ -69,11 +69,13 @@
       <div class="nav-section">Configuration</div>
       <a data-page="masters"><span class="ico">🏭</span> Masters</a>
       <a data-page="users"><span class="ico">👥</span> User Management</a>
+      <a data-page="settings"><span class="ico">🛡️</span> Admin Settings</a>
       <a data-page="pmconfig"><span class="ico">⚙️</span> PM Configuration</a>
       <a data-page="checklist"><span class="ico">📋</span> Checklists</a>
 
       <div class="nav-section">Operations</div>
       <a data-page="execution"><span class="ico">🛠️</span> PM Execution</a>
+      <a data-page="tasks"><span class="ico">📌</span> My Tasks</a>
       <a data-page="calendar"><span class="ico">🗓️</span> Calendar</a>
       <a data-page="breakdown"><span class="ico">🚨</span> Breakdown</a>
 
@@ -98,6 +100,18 @@
       <div class="search">
         <span>🔍</span>
         <input id="globalSearch" type="text" placeholder="Search equipment, PM ID, BD ID…" />
+      </div>
+      <div class="bell-wrap" style="position:relative;">
+        <button class="bell-btn" id="bellBtn" title="Notifications" onclick="toggleNotifPanel()" style="background:var(--cream-100); border:1px solid var(--border); border-radius:10px; padding:8px 10px; cursor:pointer; font-size:16px;">
+          🔔<span id="bellBadge" class="bell-badge" style="display:none; position:absolute; top:-4px; right:-4px; background:var(--red); color:#fff; border-radius:10px; min-width:18px; height:18px; font-size:10px; padding:0 5px; line-height:18px; text-align:center; font-weight:700;">0</span>
+        </button>
+        <div id="notifPanel" class="notif-panel hidden" style="display:none; position:absolute; right:0; top:44px; width:340px; max-height:440px; overflow:auto; background:#fff; border:1px solid var(--border); border-radius:10px; box-shadow:0 12px 28px rgba(0,0,0,0.18); z-index:50;">
+          <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; border-bottom:1px solid var(--border);">
+            <strong>Notifications</strong>
+            <button class="btn ghost sm" onclick="markAllNotifRead()">Mark all read</button>
+          </div>
+          <ul id="notifList" style="list-style:none; margin:0; padding:0;"></ul>
+        </div>
       </div>
       <div class="userchip">
         <div class="avatar" id="userAvatar">--</div>
@@ -222,13 +236,46 @@
         </div>
       </div>
 
+      <!-- =========== ADMIN SETTINGS =========== -->
+      <div class="page" id="page-settings">
+        <div class="page-head"><div><h1>Admin Settings</h1><p>Manage departments, roles, activities (permissions) and PM masters.</p></div></div>
+        <div class="tabs" id="settingsTabs">
+          <button class="active" data-st="departments">Departments</button>
+          <button data-st="roles">Roles</button>
+          <button data-st="activities">Activities</button>
+        </div>
+        <div id="settingsPanel"></div>
+      </div>
+
       <!-- =========== PM CONFIGURATION =========== -->
       <div class="page" id="page-pmconfig">
-        <div class="page-head"><div><h1>PM Master Configuration</h1><p>Frequencies, categories and checklist groups that drive PM scheduling.</p></div></div>
+        <div class="page-head">
+          <div><h1>PM Master Configuration</h1><p>Frequencies, categories and checklist groups that drive PM scheduling.</p></div>
+        </div>
         <div class="grid cols-3">
-          <div class="card"><h3>Frequency Master</h3><table class="tbl"><tbody id="freqBody"></tbody></table></div>
-          <div class="card"><h3>PM Categories</h3><div id="catBody" class="row-gap" style="gap:6px;"></div></div>
-          <div class="card"><h3>Checklist Groups</h3><table class="tbl"><tbody id="groupBody"></tbody></table></div>
+          <div class="card">
+            <div class="card-head"><h3>Frequency Master</h3>
+              <button class="btn primary sm" onclick="openFreqModal()">+ Add</button></div>
+            <table class="tbl">
+              <thead><tr><th>Name</th><th>Days</th><th>Tol.</th><th></th></tr></thead>
+              <tbody id="freqBody"></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>PM Categories</h3>
+              <button class="btn primary sm" onclick="openCatModal()">+ Add</button></div>
+            <table class="tbl">
+              <thead><tr><th>Name</th><th>Description</th><th></th></tr></thead>
+              <tbody id="catBody"></tbody>
+            </table>
+          </div>
+          <div class="card">
+            <div class="card-head"><h3>Checklist Groups</h3></div>
+            <table class="tbl">
+              <thead><tr><th>Name</th><th>Department</th></tr></thead>
+              <tbody id="groupBody"></tbody>
+            </table>
+          </div>
         </div>
 
         <div class="card" style="margin-top:16px;">
@@ -239,7 +286,7 @@
             <div class="form-row"><label>Frequency</label><select id="pmFrequency" required></select></div>
             <div class="form-row"><label>Category</label><select id="pmCategory"></select></div>
             <div class="form-row"><label>Schedule Date</label><input id="pmDate" type="date" required /></div>
-            <div class="form-row"><label>Department</label><input id="pmDept" type="text" placeholder="e.g., Engineering - Mechanical" /></div>
+            <div class="form-row"><label>Department</label><select id="pmDept"></select></div>
             <div class="form-row"><label>Technician</label><select id="pmTech"><option value="">— Unassigned —</option></select></div>
             <div class="form-row"><label>Reviewer</label><select id="pmReviewer"></select></div>
             <div class="form-row"><label>Approver</label><select id="pmApprover"></select></div>
@@ -253,7 +300,12 @@
 
       <!-- =========== CHECKLISTS =========== -->
       <div class="page" id="page-checklist">
-        <div class="page-head"><div><h1>Checklists</h1><p>Configurable PM checklists with versioning and field types.</p></div></div>
+        <div class="page-head">
+          <div><h1>Checklists</h1><p>Configurable PM checklists with sections, questions and versioning.</p></div>
+          <div class="actions">
+            <button class="btn primary" onclick="openChecklistBuilder()">+ New Checklist</button>
+          </div>
+        </div>
         <div class="grid cols-2">
           <div class="card">
             <div class="card-head"><h3>Available Checklists</h3></div>
@@ -263,9 +315,31 @@
             </table>
           </div>
           <div class="card" id="checklistPreviewCard">
-            <div class="card-head"><h3 id="checklistPreviewTitle">Select a checklist to preview</h3></div>
-            <ul class="checklist" id="checklistPreviewBody"></ul>
+            <div class="card-head"><h3 id="checklistPreviewTitle">Select a checklist to preview</h3>
+              <div id="checklistPreviewActions"></div>
+            </div>
+            <div id="checklistPreviewBody"></div>
           </div>
+        </div>
+      </div>
+
+      <!-- =========== MY TASKS =========== -->
+      <div class="page" id="page-tasks">
+        <div class="page-head">
+          <div><h1>My Tasks</h1><p>Checklists assigned to you — plus assignments you've created for your team.</p></div>
+          <div class="actions">
+            <button class="btn primary" onclick="openAssignChecklistModal()">+ Assign Checklist</button>
+          </div>
+        </div>
+        <div class="tabs" id="tasksTabs">
+          <button class="active" data-tt="mine">Assigned to me</button>
+          <button data-tt="all">All assignments</button>
+        </div>
+        <div class="card">
+          <table class="tbl">
+            <thead><tr><th>ID</th><th>Checklist</th><th>Assignee</th><th>Frequency</th><th>Due</th><th>Status</th><th></th></tr></thead>
+            <tbody id="tasksBody"></tbody>
+          </table>
         </div>
       </div>
 

@@ -89,14 +89,17 @@ async function logout() {
 function onLoggedIn() {
   showApp();
   $('topUserName').textContent = CURRENT_USER.name;
-  $('topUserRole').textContent = CURRENT_USER.role;
+  $('topUserRole').textContent = `${CURRENT_USER.role} · ${CURRENT_USER.department || ''}`;
   $('userAvatar').textContent = CURRENT_USER.name.split(/\s+/).map(s => s[0]).slice(0,2).join('').toUpperCase();
+  refreshNotifBadge();
+  if (window._notifTimer) clearInterval(window._notifTimer);
+  window._notifTimer = setInterval(refreshNotifBadge, 30000);
   loadDashboard();
 }
 
 // ---------- Routing ----------
-const PAGES = ['dashboard','services','masters','users','pmconfig','checklist','execution','calendar','breakdown','reports','audit','compliance','about'];
-const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', pmconfig:'PM Configuration', checklist:'Checklists', execution:'PM Execution', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
+const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','execution','tasks','calendar','breakdown','reports','audit','compliance','about'];
+const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', execution:'PM Execution', tasks:'My Tasks', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
 
 function goto(name) {
   PAGES.forEach(p => $('page-'+p)?.classList.toggle('active', p === name));
@@ -108,15 +111,24 @@ function goto(name) {
     dashboard: loadDashboard,
     masters: () => loadMasters('plants'),
     users: loadUsers,
+    settings: () => loadSettings('departments'),
     pmconfig: loadPmConfig,
     checklist: loadChecklists,
     execution: loadPmList,
+    tasks: () => loadTasks('mine'),
     calendar: loadCalendar,
     breakdown: loadBreakdowns,
     audit: () => loadAudit(100),
     compliance: loadCompliance,
   };
   loaders[name] && loaders[name]();
+}
+
+// Permission helper
+function can(activity) {
+  if (!CURRENT_USER) return false;
+  if (CURRENT_USER.is_admin) return true;
+  return (CURRENT_USER.permissions || []).includes(activity);
 }
 
 document.querySelectorAll('.nav a').forEach(a => a.addEventListener('click', () => goto(a.dataset.page)));
@@ -341,29 +353,45 @@ async function setUserStatus(user_id, status) {
   try { await api('PUT', `/api/users/${user_id}/status`, { status }); toast(`User ${user_id} set to ${status}`, 'success'); loadUsers(); }
   catch (e) { toast(e.message, 'error'); }
 }
-function openUserAddModal() {
-  openModal({
-    title: 'Add User',
-    body: `
-      <div class="form-row"><label>User ID *</label><input name="user_id" required /></div>
-      <div class="form-row"><label>Full Name *</label><input name="name" required /></div>
-      <div class="form-row"><label>Email</label><input name="email" type="email" /></div>
-      <div class="form-row"><label>Password *</label><input name="password" type="password" required /></div>
-      <div class="form-row"><label>Role *</label>
-        <select name="role">
-          <option>System Administrator</option><option>Approver</option><option>Reviewer</option>
-          <option>Engineering</option><option>Production</option><option>QA</option>
-          <option>Warehouse</option><option>Technician</option>
-        </select>
-      </div>
-      <div class="form-row"><label>Department</label><input name="department" placeholder="e.g., Engineering - Mechanical" /></div>
-    `,
-    onSubmit: async (data) => {
-      await api('POST','/api/users',data);
-      toast('User created.', 'success');
-      loadUsers();
-    }
-  });
+async function openUserAddModal() {
+  try {
+    const [roles, depts] = await Promise.all([
+      api('GET','/api/roles'),
+      api('GET','/api/departments'),
+    ]);
+    openModal({
+      title: 'Add User',
+      body: `
+        <div class="form-row"><label>User ID *</label><input name="user_id" required /></div>
+        <div class="form-row"><label>Full Name *</label><input name="name" required /></div>
+        <div class="form-row"><label>Email</label><input name="email" type="email" /></div>
+        <div class="form-row"><label>Password *</label><input name="password" type="password" required /></div>
+        <div class="form-row"><label>Role *</label>
+          <select name="role_id" id="userRoleSel" required>
+            ${roles.filter(r=>r.status==='Active').map(r => `<option value="${r.id}" data-dept="${r.department_id}">${escapeHtml(r.name)} — ${escapeHtml(r.department_name)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>Department</label>
+          <select name="department_id" id="userDeptSel">
+            <option value="">— use role's department —</option>
+            ${depts.filter(d=>d.status==='Active').map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('')}
+          </select>
+        </div>
+        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Each role belongs to a department. Override only if this user should be in a different department from the role's default.</p>
+      `,
+      onSubmit: async (data) => {
+        const payload = {
+          user_id: data.user_id, name: data.name, email: data.email,
+          password: data.password,
+          role_id: Number(data.role_id),
+          department_id: data.department_id ? Number(data.department_id) : null,
+        };
+        await api('POST','/api/users', payload);
+        toast('User created.', 'success');
+        loadUsers();
+      }
+    });
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 // ===========================================================
@@ -371,22 +399,42 @@ function openUserAddModal() {
 // ===========================================================
 async function loadPmConfig() {
   try {
-    const [freqs, cats, groups, equipment, checklists, users] = await Promise.all([
+    const [freqs, cats, groups, equipment, checklists, users, depts] = await Promise.all([
       api('GET','/api/frequencies'),
       api('GET','/api/pm-categories'),
       api('GET','/api/checklist-groups'),
       api('GET','/api/equipment'),
       api('GET','/api/checklists'),
       api('GET','/api/users'),
+      api('GET','/api/departments'),
     ]);
-    $('freqBody').innerHTML = freqs.map(f => `<tr><td>${escapeHtml(f.name)}</td><td>±${f.tolerance_days} d</td></tr>`).join('');
-    $('catBody').innerHTML = cats.map(c => `<span class="pill brown">${escapeHtml(c.name)}</span>`).join('');
-    $('groupBody').innerHTML = groups.map(g => `<tr><td>${escapeHtml(g.name)}</td><td>${escapeHtml(g.department || '')}</td></tr>`).join('');
+    const adminMode = can('manage_pm_frequencies');
+    const adminCatMode = can('manage_pm_categories');
+    $('freqBody').innerHTML = freqs.length === 0 ? '<tr class="empty-row"><td colspan="4">No frequencies</td></tr>' :
+      freqs.map(f => `<tr>
+        <td><strong>${escapeHtml(f.name)}</strong></td>
+        <td>${f.days} d</td>
+        <td>±${f.tolerance_days} d</td>
+        <td style="text-align:right;">
+          ${adminMode ? `<button class="btn ghost sm" onclick='openFreqModal(${escapeHtml(JSON.stringify(f))})'>Edit</button>
+                         <button class="btn ghost sm" onclick="deleteFreq(${f.id})">×</button>` : ''}
+        </td></tr>`).join('');
+    $('catBody').innerHTML = cats.length === 0 ? '<tr class="empty-row"><td colspan="3">No categories</td></tr>' :
+      cats.map(c => `<tr>
+        <td><strong>${escapeHtml(c.name)}</strong></td>
+        <td>${escapeHtml(c.description || '')}</td>
+        <td style="text-align:right;">
+          ${adminCatMode ? `<button class="btn ghost sm" onclick='openCatModal(${escapeHtml(JSON.stringify(c))})'>Edit</button>
+                            <button class="btn ghost sm" onclick="deleteCat(${c.id})">×</button>` : ''}
+        </td></tr>`).join('');
+    $('groupBody').innerHTML = groups.length === 0 ? '<tr class="empty-row"><td colspan="2">—</td></tr>' :
+      groups.map(g => `<tr><td>${escapeHtml(g.name)}</td><td>${escapeHtml(g.department || '')}</td></tr>`).join('');
 
     fillSelect($('pmEquipment'), equipment, 'equipment_id', e => `${e.equipment_id} · ${e.name}`);
     fillSelect($('pmChecklist'), checklists, 'id', c => `${c.name} (${c.version})`, true);
     fillSelect($('pmFrequency'), freqs, 'name', f => f.name);
     fillSelect($('pmCategory'), cats, 'name', c => c.name, true);
+    fillSelect($('pmDept'), depts, 'name', d => d.name, true);
     const techs = users.filter(u => u.role === 'Technician');
     const revs = users.filter(u => u.role === 'Reviewer' || u.role === 'QA');
     const apps = users.filter(u => u.role === 'Approver' || u.role === 'System Administrator' || u.role === 'Engineering');
@@ -397,6 +445,52 @@ async function loadPmConfig() {
     // Default schedule date = today
     $('pmDate').value = new Date().toISOString().slice(0,10);
   } catch (e) { toast(e.message, 'error'); }
+}
+
+// ----- Frequency master CRUD -----
+function openFreqModal(existing) {
+  const f = existing || { name:'', days:'', tolerance_days:0 };
+  openModal({
+    title: existing ? `Edit Frequency — ${escapeHtml(f.name)}` : 'Add Frequency',
+    body: `
+      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(f.name)}" required /></div>
+      <div class="form-row"><label>Days *</label><input name="days" type="number" min="1" value="${escapeHtml(f.days)}" required /></div>
+      <div class="form-row"><label>Tolerance (days)</label><input name="tolerance_days" type="number" min="0" value="${escapeHtml(f.tolerance_days)}" /></div>
+    `,
+    onSubmit: async (data) => {
+      const payload = { name: data.name, days: Number(data.days), tolerance_days: Number(data.tolerance_days || 0) };
+      if (existing) await api('PUT', `/api/frequencies/${existing.id}`, payload);
+      else          await api('POST','/api/frequencies', payload);
+      toast('Saved.', 'success'); loadPmConfig();
+    }
+  });
+}
+async function deleteFreq(id) {
+  if (!confirm('Delete this frequency?')) return;
+  try { await api('DELETE', `/api/frequencies/${id}`); toast('Deleted.','success'); loadPmConfig(); }
+  catch (e) { toast(e.message,'error'); }
+}
+
+// ----- PM Category master CRUD -----
+function openCatModal(existing) {
+  const c = existing || { name:'', description:'' };
+  openModal({
+    title: existing ? `Edit Category — ${escapeHtml(c.name)}` : 'Add PM Category',
+    body: `
+      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(c.name)}" required /></div>
+      <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(c.description || '')}</textarea></div>
+    `,
+    onSubmit: async (data) => {
+      if (existing) await api('PUT', `/api/pm-categories/${existing.id}`, data);
+      else          await api('POST','/api/pm-categories', data);
+      toast('Saved.', 'success'); loadPmConfig();
+    }
+  });
+}
+async function deleteCat(id) {
+  if (!confirm('Delete this PM category?')) return;
+  try { await api('DELETE', `/api/pm-categories/${id}`); toast('Deleted.','success'); loadPmConfig(); }
+  catch (e) { toast(e.message,'error'); }
 }
 
 function fillSelect(el, rows, valKey, labelFn, allowEmpty=false) {
@@ -431,23 +525,50 @@ $('newPmForm').addEventListener('submit', async (ev) => {
 async function loadChecklists() {
   try {
     const rows = await api('GET','/api/checklists');
-    $('checklistsBody').innerHTML = rows.map(c => `
+    $('checklistsBody').innerHTML = rows.length === 0
+      ? '<tr class="empty-row"><td colspan="5">No checklists</td></tr>'
+      : rows.map(c => `
       <tr>
         <td>${c.id}</td><td>${escapeHtml(c.name)}</td><td>${escapeHtml(c.version)}</td><td>${statusPill(c.status)}</td>
         <td><button class="btn ghost sm" onclick="previewChecklist(${c.id})">Preview</button></td>
       </tr>`).join('');
   } catch (e) { toast(e.message, 'error'); }
 }
+
+let CURRENT_CHECKLIST_ID = null;
 async function previewChecklist(id) {
   try {
-    const cl = await api('GET', `/api/checklists/${id}`);
+    const cl = await api('GET', `/api/checklists/${id}/full`);
+    CURRENT_CHECKLIST_ID = id;
     $('checklistPreviewTitle').textContent = `${cl.name} (${cl.version})`;
-    $('checklistPreviewBody').innerHTML = cl.fields.map((f, i) => `
-      <li><div class="chk-num">${i+1}</div>
-        <div class="chk-body">
-          <div class="chk-title">${escapeHtml(f.label)}${f.required?' *':''}</div>
-          <div class="chk-meta">Type: ${escapeHtml(f.type)}${f.options?' · {'+f.options.join('/')+'}':''}${f.min!==undefined?` · range ${f.min}–${f.max}`:''}</div>
-        </div></li>`).join('');
+    const editBtn = can('manage_checklists') ? `<button class="btn ghost sm" onclick="openChecklistBuilder(${cl.id})">Edit</button>` : '';
+    const assnBtn = can('assign_checklist') ? `<button class="btn primary sm" onclick="openAssignChecklistModal(${cl.id})">Assign…</button>` : '';
+    $('checklistPreviewActions').innerHTML = `${editBtn} ${assnBtn}`;
+
+    let html = '';
+    if (cl.sections && cl.sections.length) {
+      html = cl.sections.map((s, si) => `
+        <div style="margin: 12px 0 8px; padding: 10px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
+          <div style="font-weight:600;">${si+1}. ${escapeHtml(s.name)}</div>
+          ${s.description ? `<div style="color:var(--muted); font-size:12px; margin-top:2px;">${escapeHtml(s.description)}</div>` : ''}
+        </div>
+        <ul class="checklist">${s.questions.map((q, qi) => `
+          <li><div class="chk-num">${si+1}.${qi+1}</div>
+            <div class="chk-body">
+              <div class="chk-title">${escapeHtml(q.label)}${q.required?' *':''}</div>
+              <div class="chk-meta">Type: ${escapeHtml(q.qtype)}${q.options?' · {'+q.options.join('/')+'}':''}${q.min_value!=null?` · range ${q.min_value}–${q.max_value}${q.unit?' '+q.unit:''}`:''}</div>
+            </div></li>`).join('')}</ul>`).join('');
+    } else if (cl.legacy_fields) {
+      html = '<ul class="checklist">' + cl.legacy_fields.map((f, i) => `
+        <li><div class="chk-num">${i+1}</div>
+          <div class="chk-body">
+            <div class="chk-title">${escapeHtml(f.label)}${f.required?' *':''}</div>
+            <div class="chk-meta">Type: ${escapeHtml(f.type)}${f.options?' · {'+f.options.join('/')+'}':''}${f.min!==undefined?` · range ${f.min}–${f.max}`:''}</div>
+          </div></li>`).join('') + '</ul>';
+    } else {
+      html = '<p style="color:var(--muted); margin: 10px 0;">This checklist has no questions yet.</p>';
+    }
+    $('checklistPreviewBody').innerHTML = html;
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -885,6 +1006,539 @@ $('globalSearch').addEventListener('keydown', async (ev) => {
     toast('Search: try a PM-, BD- or EQ- ID', 'error');
   } catch (e) { toast(e.message, 'error'); }
 });
+
+// ===========================================================
+// NOTIFICATIONS (bell)
+// ===========================================================
+async function refreshNotifBadge() {
+  try {
+    const { count } = await api('GET','/api/notifications/unread-count');
+    const b = $('bellBadge');
+    if (count > 0) { b.style.display = 'inline-block'; b.textContent = count > 99 ? '99+' : count; }
+    else           { b.style.display = 'none'; }
+  } catch (e) {}
+}
+async function toggleNotifPanel() {
+  const p = $('notifPanel');
+  if (p.style.display === 'none' || !p.style.display) {
+    try {
+      const rows = await api('GET','/api/notifications');
+      $('notifList').innerHTML = rows.length === 0
+        ? `<li style="padding:18px; color:var(--muted); text-align:center;">No notifications yet.</li>`
+        : rows.map(n => `
+          <li style="padding:10px 14px; border-bottom:1px solid var(--border); background:${n.is_read?'#fff':'var(--cream-100)'}; cursor:pointer;"
+              onclick="onNotifClick(${n.id}, '${escapeHtml(n.link||'')}')">
+            <div style="font-weight:600; font-size:13px;">${escapeHtml(n.title)}</div>
+            <div style="color:var(--muted); font-size:12px; margin-top:2px;">${escapeHtml(n.message || '')}</div>
+            <div style="color:var(--muted); font-size:10px; margin-top:4px;">${escapeHtml(n.created_at)}</div>
+          </li>`).join('');
+      p.style.display = 'block';
+    } catch (e) { toast(e.message,'error'); }
+  } else {
+    p.style.display = 'none';
+  }
+}
+async function markAllNotifRead() {
+  try { await api('PUT','/api/notifications/read-all'); refreshNotifBadge(); toggleNotifPanel(); toggleNotifPanel(); }
+  catch (e) { toast(e.message,'error'); }
+}
+async function onNotifClick(id, link) {
+  try { await api('PUT', `/api/notifications/${id}/read`); } catch(e) {}
+  refreshNotifBadge();
+  // If link points to an assignment, open it
+  if (link && link.startsWith('/assignments/')) {
+    const aid = link.replace('/assignments/','');
+    $('notifPanel').style.display = 'none';
+    goto('tasks');
+    setTimeout(() => openAssignment(aid), 300);
+  }
+}
+// Close notif panel on outside click
+document.addEventListener('click', (ev) => {
+  const p = $('notifPanel');
+  const b = $('bellBtn');
+  if (!p || p.style.display !== 'block') return;
+  if (p.contains(ev.target) || b.contains(ev.target)) return;
+  p.style.display = 'none';
+});
+
+// ===========================================================
+// ADMIN SETTINGS — Departments / Roles / Activities
+// ===========================================================
+let CURRENT_SETTINGS_TAB = 'departments';
+
+document.querySelectorAll('#settingsTabs button').forEach(b => {
+  b.addEventListener('click', () => loadSettings(b.dataset.st));
+});
+
+async function loadSettings(tab) {
+  CURRENT_SETTINGS_TAB = tab;
+  document.querySelectorAll('#settingsTabs button').forEach(b => b.classList.toggle('active', b.dataset.st === tab));
+  if (tab === 'departments') return renderDeptsTab();
+  if (tab === 'roles')        return renderRolesTab();
+  if (tab === 'activities')   return renderActivitiesTab();
+}
+
+// ----- Departments tab -----
+async function renderDeptsTab() {
+  try {
+    const depts = await api('GET','/api/departments');
+    const canEdit = can('manage_departments');
+    $('settingsPanel').innerHTML = `
+      <div class="card">
+        <div class="card-head"><h3>Departments</h3>
+          ${canEdit ? `<button class="btn primary sm" onclick="openDeptModal()">+ Add Department</button>` : ''}
+        </div>
+        <table class="tbl">
+          <thead><tr><th>Name</th><th>Description</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            ${depts.length === 0 ? '<tr class="empty-row"><td colspan="4">No departments</td></tr>' :
+              depts.map(d => `<tr>
+                <td><strong>${escapeHtml(d.name)}</strong></td>
+                <td>${escapeHtml(d.description || '')}</td>
+                <td>${statusPill(d.status)}</td>
+                <td style="text-align:right;">
+                  ${canEdit ? `<button class="btn ghost sm" onclick='openDeptModal(${escapeHtml(JSON.stringify(d))})'>Edit</button>
+                               <button class="btn ghost sm" onclick="deleteDept(${d.id})">×</button>` : ''}
+                </td></tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  } catch (e) { toast(e.message,'error'); }
+}
+
+function openDeptModal(existing) {
+  const d = existing || { name:'', description:'' };
+  openModal({
+    title: existing ? `Edit Department — ${escapeHtml(d.name)}` : 'Add Department',
+    body: `
+      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(d.name)}" required /></div>
+      <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(d.description || '')}</textarea></div>
+    `,
+    onSubmit: async (data) => {
+      if (existing) await api('PUT', `/api/departments/${existing.id}`, data);
+      else          await api('POST','/api/departments', data);
+      toast('Saved.', 'success'); renderDeptsTab();
+    }
+  });
+}
+async function deleteDept(id) {
+  if (!confirm('Delete this department?')) return;
+  try { await api('DELETE', `/api/departments/${id}`); toast('Deleted.','success'); renderDeptsTab(); }
+  catch (e) { toast(e.message,'error'); }
+}
+
+// ----- Roles tab -----
+async function renderRolesTab() {
+  try {
+    const [roles, depts, activities] = await Promise.all([
+      api('GET','/api/roles'),
+      api('GET','/api/departments'),
+      api('GET','/api/activities'),
+    ]);
+    const canEdit = can('manage_roles');
+    $('settingsPanel').innerHTML = `
+      <div class="card">
+        <div class="card-head"><h3>Roles</h3>
+          ${canEdit ? `<button class="btn primary sm" onclick='openRoleModal(null, ${escapeHtml(JSON.stringify(depts))}, ${escapeHtml(JSON.stringify(activities))})'>+ Add Role</button>` : ''}
+        </div>
+        <table class="tbl">
+          <thead><tr><th>Role</th><th>Department</th><th>Users</th><th>Activities</th><th>Status</th><th></th></tr></thead>
+          <tbody>
+            ${roles.length === 0 ? '<tr class="empty-row"><td colspan="6">No roles</td></tr>' :
+              roles.map(r => `<tr>
+                <td><strong>${escapeHtml(r.name)}</strong>${r.is_system?' <span class="pill brown" style="font-size:9px;">SYSTEM</span>':''}</td>
+                <td>${escapeHtml(r.department_name || '—')}</td>
+                <td>${r.user_count}</td>
+                <td><span style="font-size:11px; color:var(--muted);">${(r.permissions || []).length} activities</span></td>
+                <td>${statusPill(r.status)}</td>
+                <td style="text-align:right;">
+                  ${canEdit ? `<button class="btn ghost sm" onclick='openRoleModal(${escapeHtml(JSON.stringify(r))}, ${escapeHtml(JSON.stringify(depts))}, ${escapeHtml(JSON.stringify(activities))})'>Edit</button>
+                               ${r.is_system ? '' : `<button class="btn ghost sm" onclick="deleteRole(${r.id})">×</button>`}` : ''}
+                </td></tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  } catch (e) { toast(e.message,'error'); }
+}
+
+function openRoleModal(existing, depts, activities) {
+  const r = existing || { name:'', description:'', department_id:'', permissions:[] };
+  // Group activities by category
+  const byCat = {};
+  activities.forEach(a => { (byCat[a.category || 'Other'] = byCat[a.category || 'Other'] || []).push(a); });
+  const checked = new Set(r.permissions || []);
+  const actGroupsHtml = Object.entries(byCat).map(([cat, list]) => `
+    <fieldset style="border:1px solid var(--border); border-radius:8px; padding:8px 12px; margin-bottom:8px;">
+      <legend style="font-size:12px; color:var(--muted); padding:0 6px;">${escapeHtml(cat)}</legend>
+      ${list.map(a => `
+        <label style="display:flex; align-items:center; gap:6px; padding:3px 0; font-size:12px;">
+          <input type="checkbox" class="perm-cb" value="${escapeHtml(a.code)}" ${checked.has(a.code)?'checked':''} />
+          <span><strong>${escapeHtml(a.label)}</strong> <code style="font-size:10px; color:var(--muted);">${escapeHtml(a.code)}</code></span>
+        </label>`).join('')}
+    </fieldset>`).join('');
+
+  openModal({
+    title: existing ? `Edit Role — ${escapeHtml(r.name)}` : 'Add Role',
+    width: 640,
+    body: `
+      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(r.name)}" required ${r.is_system?'readonly':''} /></div>
+      <div class="form-row"><label>Department *</label>
+        <select name="department_id" required>
+          <option value="">— pick —</option>
+          ${depts.map(d => `<option value="${d.id}" ${d.id===r.department_id?'selected':''}>${escapeHtml(d.name)}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(r.description || '')}</textarea></div>
+      <div style="margin-top:10px; font-size:13px; font-weight:600;">Activities this role can perform</div>
+      <div style="max-height:320px; overflow:auto; margin-top:6px;">${actGroupsHtml}</div>
+    `,
+    onSubmit: async (data) => {
+      const perms = Array.from(document.querySelectorAll('.perm-cb')).filter(c => c.checked).map(c => c.value);
+      const payload = {
+        name: data.name, description: data.description,
+        department_id: Number(data.department_id),
+        permissions: perms
+      };
+      if (existing) await api('PUT', `/api/roles/${existing.id}`, payload);
+      else          await api('POST','/api/roles', payload);
+      toast('Saved.', 'success'); renderRolesTab();
+    }
+  });
+}
+async function deleteRole(id) {
+  if (!confirm('Delete this role?')) return;
+  try { await api('DELETE', `/api/roles/${id}`); toast('Deleted.','success'); renderRolesTab(); }
+  catch (e) { toast(e.message,'error'); }
+}
+
+// ----- Activities tab -----
+async function renderActivitiesTab() {
+  try {
+    const activities = await api('GET','/api/activities');
+    const canEdit = can('manage_activities');
+    const byCat = {};
+    activities.forEach(a => { (byCat[a.category || 'Other'] = byCat[a.category || 'Other'] || []).push(a); });
+    $('settingsPanel').innerHTML = `
+      <div class="card">
+        <div class="card-head"><h3>Activities (Permissions Catalog)</h3>
+          ${canEdit ? `<button class="btn primary sm" onclick="openActivityModal()">+ Add Activity</button>` : ''}
+        </div>
+        <p style="color:var(--muted); font-size:12px; margin-top:0;">Activities are the fine-grained things a role can do. Built-in activities are referenced by application code and cannot be deleted.</p>
+        ${Object.entries(byCat).map(([cat, list]) => `
+          <div style="margin-top:14px;">
+            <div style="font-weight:600; margin-bottom:6px;">${escapeHtml(cat)}</div>
+            <table class="tbl">
+              <thead><tr><th>Code</th><th>Label</th><th>Type</th><th></th></tr></thead>
+              <tbody>
+                ${list.map(a => `<tr>
+                  <td><code style="font-size:11px;">${escapeHtml(a.code)}</code></td>
+                  <td>${escapeHtml(a.label)}</td>
+                  <td>${a.is_system?'<span class="pill brown" style="font-size:9px;">SYSTEM</span>':'<span class="pill blue" style="font-size:9px;">CUSTOM</span>'}</td>
+                  <td style="text-align:right;">
+                    ${canEdit ? `<button class="btn ghost sm" onclick='openActivityModal(${escapeHtml(JSON.stringify(a))})'>Edit</button>
+                                 ${a.is_system ? '' : `<button class="btn ghost sm" onclick="deleteActivity(${a.id})">×</button>`}` : ''}
+                  </td></tr>`).join('')}
+              </tbody>
+            </table>
+          </div>`).join('')}
+      </div>`;
+  } catch (e) { toast(e.message,'error'); }
+}
+
+function openActivityModal(existing) {
+  const a = existing || { code:'', label:'', category:'Custom' };
+  openModal({
+    title: existing ? `Edit Activity — ${escapeHtml(a.code)}` : 'Add Activity',
+    body: `
+      <div class="form-row"><label>Code *</label><input name="code" value="${escapeHtml(a.code)}" required ${existing?'readonly':''} placeholder="e.g. approve_capex" pattern="[a-z][a-z0-9_]*" /></div>
+      <div class="form-row"><label>Label *</label><input name="label" value="${escapeHtml(a.label)}" required /></div>
+      <div class="form-row"><label>Category</label><input name="category" value="${escapeHtml(a.category || 'Custom')}" /></div>
+      <p style="font-size:11px; color:var(--muted);">Note: custom activities won't actually gate any backend route until the developer wires them up. They can still be assigned to roles.</p>
+    `,
+    onSubmit: async (data) => {
+      if (existing) await api('PUT', `/api/activities/${existing.id}`, data);
+      else          await api('POST','/api/activities', data);
+      toast('Saved.', 'success'); renderActivitiesTab();
+    }
+  });
+}
+async function deleteActivity(id) {
+  if (!confirm('Delete this activity?')) return;
+  try { await api('DELETE', `/api/activities/${id}`); toast('Deleted.','success'); renderActivitiesTab(); }
+  catch (e) { toast(e.message,'error'); }
+}
+
+// ===========================================================
+// CHECKLIST BUILDER
+// ===========================================================
+async function openChecklistBuilder(existingId) {
+  try {
+    const [groups, cats] = await Promise.all([
+      api('GET','/api/checklist-groups'),
+      api('GET','/api/pm-categories'),
+    ]);
+    let cl = null;
+    if (existingId) cl = await api('GET', `/api/checklists/${existingId}/full`);
+    // Seed initial sections data
+    let sections = (cl && cl.sections && cl.sections.length)
+      ? cl.sections.map(s => ({
+          name: s.name, description: s.description || '',
+          questions: (s.questions || []).map(q => ({
+            label: q.label, qtype: q.qtype,
+            options: q.options ? q.options.join('|') : '',
+            required: !!q.required, min_value: q.min_value, max_value: q.max_value, unit: q.unit || ''
+          }))
+        }))
+      : [{ name:'Section 1', description:'', questions:[{ label:'', qtype:'text', options:'', required:true, min_value:null, max_value:null, unit:'' }] }];
+
+    const renderBuilder = () => `
+      <div class="form-row"><label>Checklist Name *</label><input name="name" value="${escapeHtml(cl?.name || '')}" required /></div>
+      <div class="form-row"><label>Version</label><input name="version" value="${escapeHtml(cl?.version || 'v1.0')}" /></div>
+      <div class="form-row"><label>Group</label>
+        <select name="group_id"><option value="">—</option>${groups.map(g => `<option value="${g.id}" ${cl && cl.group_id===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}</select>
+      </div>
+      <div class="form-row"><label>Category</label>
+        <select name="category_id"><option value="">—</option>${cats.map(c => `<option value="${c.id}" ${cl && cl.category_id===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}</select>
+      </div>
+      <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(cl?.description || '')}</textarea></div>
+      <hr class="sep" />
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <strong>Sections &amp; Questions</strong>
+        <button type="button" class="btn ghost sm" onclick="__cbAddSection()">+ Add Section</button>
+      </div>
+      <div id="cbSections" style="margin-top:8px;">
+        ${sections.map((s, si) => renderSection(s, si)).join('')}
+      </div>
+    `;
+    const renderSection = (s, si) => `
+      <div class="card" style="padding:10px 12px; margin-bottom:10px; border-left:3px solid var(--brand);" data-sidx="${si}">
+        <div style="display:flex; gap:6px; align-items:center; margin-bottom:6px;">
+          <input class="cb-sname" placeholder="Section name" value="${escapeHtml(s.name)}" style="flex:1; font-weight:600;" />
+          <button type="button" class="btn ghost sm" onclick="__cbDelSection(${si})">×</button>
+        </div>
+        <input class="cb-sdesc" placeholder="Section description (optional)" value="${escapeHtml(s.description || '')}" style="width:100%; font-size:12px;" />
+        <div class="cb-questions" style="margin-top:8px;">
+          ${s.questions.map((q, qi) => renderQuestion(q, si, qi)).join('')}
+        </div>
+        <button type="button" class="btn ghost sm" onclick="__cbAddQ(${si})" style="margin-top:6px;">+ Add Question</button>
+      </div>`;
+    const renderQuestion = (q, si, qi) => `
+      <div class="cb-q" data-qidx="${qi}" style="display:grid; grid-template-columns: 2fr 1fr 1.5fr auto auto; gap:6px; align-items:center; padding:5px 0;">
+        <input class="cb-qlabel" placeholder="Question label" value="${escapeHtml(q.label)}" />
+        <select class="cb-qtype">
+          ${['text','number','dropdown','checkbox','yesno'].map(t => `<option value="${t}" ${t===q.qtype?'selected':''}>${t}</option>`).join('')}
+        </select>
+        <input class="cb-qopts" placeholder="opt1 | opt2 (for dropdown)" value="${escapeHtml(q.options || '')}" />
+        <label style="font-size:11px; display:flex; gap:3px; align-items:center;"><input type="checkbox" class="cb-qreq" ${q.required?'checked':''} /> req</label>
+        <button type="button" class="btn ghost sm" onclick="__cbDelQ(${si}, ${qi})">×</button>
+      </div>`;
+
+    // Make helpers globally callable for inline onclick
+    window.__cbReadDOM = () => {
+      const out = [];
+      document.querySelectorAll('#cbSections > .card').forEach(secEl => {
+        const sec = {
+          name: secEl.querySelector('.cb-sname').value || 'Section',
+          description: secEl.querySelector('.cb-sdesc').value || '',
+          questions: []
+        };
+        secEl.querySelectorAll('.cb-q').forEach(qEl => {
+          const q = {
+            label: qEl.querySelector('.cb-qlabel').value,
+            qtype: qEl.querySelector('.cb-qtype').value,
+            options: qEl.querySelector('.cb-qopts').value,
+            required: qEl.querySelector('.cb-qreq').checked,
+            min_value: null, max_value: null, unit: ''
+          };
+          sec.questions.push(q);
+        });
+        out.push(sec);
+      });
+      return out;
+    };
+    window.__cbAddSection = () => {
+      sections = window.__cbReadDOM();
+      sections.push({ name:`Section ${sections.length+1}`, description:'', questions:[{label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:''}] });
+      $('cbSections').innerHTML = sections.map((s, si) => renderSection(s, si)).join('');
+    };
+    window.__cbDelSection = (si) => {
+      sections = window.__cbReadDOM();
+      sections.splice(si, 1);
+      $('cbSections').innerHTML = sections.map((s, si) => renderSection(s, si)).join('');
+    };
+    window.__cbAddQ = (si) => {
+      sections = window.__cbReadDOM();
+      sections[si].questions.push({ label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:'' });
+      $('cbSections').innerHTML = sections.map((s, si) => renderSection(s, si)).join('');
+    };
+    window.__cbDelQ = (si, qi) => {
+      sections = window.__cbReadDOM();
+      sections[si].questions.splice(qi, 1);
+      if (sections[si].questions.length === 0) sections[si].questions.push({ label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:'' });
+      $('cbSections').innerHTML = sections.map((s, si) => renderSection(s, si)).join('');
+    };
+
+    openModal({
+      title: existingId ? `Edit Checklist — ${escapeHtml(cl.name)}` : 'New Checklist',
+      width: 820,
+      body: renderBuilder(),
+      submitLabel: existingId ? 'Save Changes' : 'Create Checklist',
+      onSubmit: async (data) => {
+        const built = window.__cbReadDOM().map(s => ({
+          name: s.name, description: s.description,
+          questions: s.questions.filter(q => q.label.trim()).map(q => ({
+            label: q.label, qtype: q.qtype,
+            options: q.qtype === 'dropdown' ? q.options.split('|').map(x => x.trim()).filter(Boolean) : null,
+            required: q.required, min_value: q.min_value, max_value: q.max_value, unit: q.unit
+          }))
+        })).filter(s => s.questions.length > 0);
+        const payload = {
+          name: data.name, version: data.version || 'v1.0',
+          description: data.description || '',
+          group_id: data.group_id ? Number(data.group_id) : null,
+          category_id: data.category_id ? Number(data.category_id) : null,
+          sections: built
+        };
+        if (existingId) await api('PUT', `/api/checklists/${existingId}`, payload);
+        else            await api('POST','/api/checklists', payload);
+        toast('Checklist saved.', 'success');
+        loadChecklists();
+        if (existingId) previewChecklist(existingId);
+      }
+    });
+  } catch (e) { toast(e.message,'error'); }
+}
+
+// ===========================================================
+// CHECKLIST ASSIGNMENTS — MY TASKS
+// ===========================================================
+let CURRENT_TASKS_TAB = 'mine';
+
+document.querySelectorAll('#tasksTabs button').forEach(b => {
+  b.addEventListener('click', () => loadTasks(b.dataset.tt));
+});
+
+async function loadTasks(tab) {
+  CURRENT_TASKS_TAB = tab;
+  document.querySelectorAll('#tasksTabs button').forEach(b => b.classList.toggle('active', b.dataset.tt === tab));
+  try {
+    const url = tab === 'mine' ? '/api/assignments?mine=1' : '/api/assignments';
+    const rows = await api('GET', url);
+    $('tasksBody').innerHTML = rows.length === 0
+      ? `<tr class="empty-row"><td colspan="7">${tab==='mine'?'No assignments for you yet.':'No assignments.'}</td></tr>`
+      : rows.map(a => `<tr>
+          <td><strong>${escapeHtml(a.assignment_id)}</strong></td>
+          <td>${escapeHtml(a.checklist_name || '')} <span style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_version || '')}</span></td>
+          <td>${escapeHtml(a.assignee_name || '')}</td>
+          <td>${escapeHtml(a.frequency || '—')}</td>
+          <td>${escapeHtml(a.due_date || '—')}</td>
+          <td>${statusPill(a.status)}</td>
+          <td><button class="btn ghost sm" onclick="openAssignment('${escapeHtml(a.assignment_id)}')">${a.status==='Completed'?'View':'Open'}</button></td>
+        </tr>`).join('');
+  } catch (e) { toast(e.message,'error'); }
+}
+
+async function openAssignChecklistModal(presetChecklistId) {
+  try {
+    const [checklists, users, freqs] = await Promise.all([
+      api('GET','/api/checklists'),
+      api('GET','/api/users'),
+      api('GET','/api/frequencies'),
+    ]);
+    openModal({
+      title: 'Assign Checklist',
+      body: `
+        <div class="form-row"><label>Checklist *</label>
+          <select name="checklist_id" required>
+            ${checklists.map(c => `<option value="${c.id}" ${presetChecklistId===c.id?'selected':''}>${escapeHtml(c.name)} (${escapeHtml(c.version)})</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>Assign To *</label>
+          <select name="assignee_id" required>
+            ${users.filter(u=>u.status==='Active').map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>Frequency</label>
+          <select name="frequency_id"><option value="">— one-off —</option>${freqs.map(f => `<option value="${f.id}">${escapeHtml(f.name)} (every ${f.days} d)</option>`).join('')}</select>
+        </div>
+        <div class="form-row"><label>Due Date</label><input name="due_date" type="date" /></div>
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Notes</label><textarea name="notes" placeholder="Optional context for the assignee"></textarea></div>
+      `,
+      onSubmit: async (data) => {
+        await api('POST','/api/assignments', {
+          checklist_id: Number(data.checklist_id),
+          assignee_id: Number(data.assignee_id),
+          frequency_id: data.frequency_id ? Number(data.frequency_id) : null,
+          due_date: data.due_date || null,
+          notes: data.notes || ''
+        });
+        toast('Checklist assigned. Assignee notified.', 'success');
+        if ($('page-tasks').classList.contains('active')) loadTasks(CURRENT_TASKS_TAB);
+      }
+    });
+  } catch (e) { toast(e.message,'error'); }
+}
+
+async function openAssignment(assignmentId) {
+  try {
+    const a = await api('GET', `/api/assignments/${assignmentId}`);
+    const cl = a.checklist;
+    const existing = a.response_data || {};
+    const editable = (a.status !== 'Completed') && (a.assignee_id === CURRENT_USER.id || CURRENT_USER.is_admin);
+    const sectionsHtml = (cl?.sections || []).map((s, si) => `
+      <div style="margin: 10px 0 6px; padding: 8px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
+        <strong>${si+1}. ${escapeHtml(s.name)}</strong>
+        ${s.description ? `<div style="color:var(--muted); font-size:12px;">${escapeHtml(s.description)}</div>` : ''}
+      </div>
+      <ul class="checklist">
+        ${s.questions.map((q, qi) => {
+          const val = existing[`q_${q.id}`] ?? '';
+          let inp = '';
+          const dis = editable ? '' : 'disabled';
+          if (q.qtype === 'number')        inp = `<input type="number" name="q_${q.id}" min="${q.min_value ?? ''}" max="${q.max_value ?? ''}" value="${escapeHtml(val)}" ${q.required?'required':''} ${dis}/>${q.unit?` <span style='color:var(--muted); font-size:11px;'>${escapeHtml(q.unit)}</span>`:''}`;
+          else if (q.qtype === 'checkbox') inp = `<label><input type="checkbox" name="q_${q.id}" ${val?'checked':''} ${dis}/> Yes</label>`;
+          else if (q.qtype === 'yesno')    inp = `<select name="q_${q.id}" ${q.required?'required':''} ${dis}><option value="">—</option><option ${val==='Yes'?'selected':''}>Yes</option><option ${val==='No'?'selected':''}>No</option></select>`;
+          else if (q.qtype === 'dropdown') inp = `<select name="q_${q.id}" ${q.required?'required':''} ${dis}><option value="">—</option>${(q.options||[]).map(o => `<option ${o===val?'selected':''}>${escapeHtml(o)}</option>`).join('')}</select>`;
+          else                             inp = `<input type="text" name="q_${q.id}" value="${escapeHtml(val)}" ${q.required?'required':''} ${dis}/>`;
+          return `<li><div class="chk-num">${si+1}.${qi+1}</div><div class="chk-body">
+            <div class="chk-title">${escapeHtml(q.label)}${q.required?' *':''}</div>
+            <div class="chk-input">${inp}</div></div></li>`;
+        }).join('')}
+      </ul>`).join('');
+
+    const banner = `
+      <div class="row-gap" style="font-size:12px; margin-bottom: 12px;">
+        ${statusPill(a.status)}
+        ${a.due_date ? `<span class="pill brown">Due: ${escapeHtml(a.due_date)}</span>` : ''}
+        ${a.frequency ? `<span class="pill brown">${escapeHtml(a.frequency)}</span>` : ''}
+        <span class="pill brown">Assignee: ${escapeHtml(a.assignee_name)}</span>
+        <span class="pill brown">Assigned by: ${escapeHtml(a.assigned_by_name || '')}</span>
+      </div>`;
+    const notesBox = editable
+      ? `<div class="form-row" style="grid-template-columns:1fr;"><label>Notes</label><textarea name="__notes" placeholder="Observations / remarks">${escapeHtml(a.notes || '')}</textarea></div>`
+      : (a.notes ? `<div style="color:var(--muted); font-size:12px; margin-top:8px;"><strong>Notes:</strong> ${escapeHtml(a.notes)}</div>` : '');
+
+    openModal({
+      title: `Assignment ${a.assignment_id} — ${escapeHtml(cl?.name || '')}`,
+      width: 760,
+      body: `${banner}${sectionsHtml}${notesBox}`,
+      submitLabel: a.status === 'Pending' ? 'Start &amp; Save' : 'Complete &amp; Sign',
+      hideDefaultSubmit: !editable,
+      onSubmit: async (data) => {
+        const resp = {};
+        Object.entries(data).forEach(([k,v]) => { if (k.startsWith('q_')) resp[k] = v; });
+        document.querySelectorAll('input[type="checkbox"][name^="q_"]').forEach(cb => { resp[cb.name] = cb.checked; });
+        await api('PUT', `/api/assignments/${assignmentId}/complete`, {
+          response_data: resp, notes: data['__notes'] || ''
+        });
+        toast(`Assignment ${assignmentId} completed.`, 'success');
+        loadTasks(CURRENT_TASKS_TAB);
+        refreshNotifBadge();
+      }
+    });
+  } catch (e) { toast(e.message,'error'); }
+}
 
 // ===========================================================
 // BOOT

@@ -22,7 +22,7 @@ services:
   - type: web
     name: pmms
     runtime: node
-    region: singapore   # closest to India; change to oregon / frankfurt / ohio if needed
+    region: oregon      # free plan is restricted to oregon. Upgrade to a paid plan to use singapore/frankfurt/ohio.
     plan: free          # change to 'starter' to enable persistent disk below
     branch: main
     buildCommand: npm install
