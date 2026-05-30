@@ -230,7 +230,7 @@
         </div>
         <div class="card">
           <table class="tbl">
-            <thead><tr><th>User ID</th><th>Name</th><th>Role</th><th>Department</th><th>Status</th><th>Last Login</th><th></th></tr></thead>
+            <thead><tr><th>Login ID</th><th>Emp ID</th><th>Name</th><th>Role</th><th>Department</th><th>Status</th><th>Last Login</th><th></th></tr></thead>
             <tbody id="usersBody"></tbody>
           </table>
         </div>
@@ -270,9 +270,10 @@
             </table>
           </div>
           <div class="card">
-            <div class="card-head"><h3>Checklist Groups</h3></div>
+            <div class="card-head"><h3>Checklist Groups</h3>
+              <button class="btn primary sm" onclick="openGroupModal()">+ Add</button></div>
             <table class="tbl">
-              <thead><tr><th>Name</th><th>Department</th></tr></thead>
+              <thead><tr><th>Name</th><th>Department</th><th></th></tr></thead>
               <tbody id="groupBody"></tbody>
             </table>
           </div>
@@ -337,7 +338,7 @@
         </div>
         <div class="card">
           <table class="tbl">
-            <thead><tr><th>ID</th><th>Checklist</th><th>Assignee</th><th>Frequency</th><th>Due</th><th>Status</th><th></th></tr></thead>
+            <thead><tr><th>ID</th><th>Checklist</th><th>Target</th><th>Assignee</th><th>Frequency</th><th>Due</th><th>Status</th><th></th></tr></thead>
             <tbody id="tasksBody"></tbody>
           </table>
         </div>

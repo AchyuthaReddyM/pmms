@@ -217,9 +217,11 @@ function statusPill(status) {
   const map = {
     'Pending':'brown','Approved':'green','Assigned':'amber','In Progress':'blue',
     'Completed':'gray','Overdue':'red','Expired':'red','Escalated':'blue',
-    'Active':'red','Investigating':'amber','Spares Awaited':'blue','Closed':'gray','Resolved':'gray',
+    'Active':'green','Investigating':'amber','Spares Awaited':'blue','Closed':'gray','Resolved':'gray',
     'Inactive':'gray','Under Review':'amber','Locked':'amber','Validation':'amber',
-    'Under Maintenance':'red'
+    'Under Maintenance':'red',
+    // Checklist workflow states
+    'Draft':'gray','Pending Review':'amber','Pending Approval':'amber','Rejected':'red'
   };
   return `<span class="pill ${map[status] || 'gray'}">${escapeHtml(status)}</span>`;
 }
@@ -249,8 +251,8 @@ const MASTER_DEFS = {
     row: r => [r.block_id, r.plant_id, r.name, statusPill(r.status)],
     canAdd: true,
     addFields: [
-      { id:'plant_id', label:'Plant ID', required:true, placeholder:'e.g., PL-001' },
-      { id:'name', label:'Name', required:true },
+      { id:'plant_id', label:'Plant', required:true, type:'remoteSelect', source:'/api/plants', valueKey:'plant_id', labelFn:r => `${r.plant_id} · ${r.name}` },
+      { id:'name', label:'Block Name', required:true },
     ],
     create: (data) => api('POST','/api/blocks',data),
   },
@@ -258,19 +260,34 @@ const MASTER_DEFS = {
     api: '/api/formulations',
     head: ['Formulation ID','Name','Department','Status'],
     row: r => [r.formulation_id, r.name, r.department, statusPill(r.status)],
-    canAdd: false,
+    canAdd: true,
+    addFields: [
+      { id:'name', label:'Name', required:true },
+      { id:'department', label:'Department', type:'remoteSelect', source:'/api/departments', valueKey:'name', labelFn:r => r.name },
+    ],
+    create: (data) => api('POST','/api/formulations',data),
   },
   locations: {
     api: '/api/locations',
     head: ['Location ID','Block','Description','Status'],
     row: r => [r.location_id, r.block_id, r.description, statusPill(r.status)],
-    canAdd: false,
+    canAdd: true,
+    addFields: [
+      { id:'block_id', label:'Block', required:true, type:'remoteSelect', source:'/api/blocks', valueKey:'block_id', labelFn:r => `${r.block_id} · ${r.name}` },
+      { id:'description', label:'Description', required:true, placeholder:'e.g., Granulation Room 1' },
+    ],
+    create: (data) => api('POST','/api/locations',data),
   },
   areas: {
     api: '/api/areas',
     head: ['Area ID','Location','Area Type','Status'],
     row: r => [r.area_id, r.location_id, r.area_type, statusPill(r.status)],
-    canAdd: false,
+    canAdd: true,
+    addFields: [
+      { id:'location_id', label:'Location', required:true, type:'remoteSelect', source:'/api/locations', valueKey:'location_id', labelFn:r => `${r.location_id} · ${r.description}` },
+      { id:'area_type', label:'Area Type', required:true, placeholder:'e.g., Classified — Grade D' },
+    ],
+    create: (data) => api('POST','/api/areas',data),
   },
   equipment: {
     api: '/api/equipment',
@@ -282,7 +299,7 @@ const MASTER_DEFS = {
       { id:'make_model', label:'Make / Model' },
       { id:'serial', label:'Serial Number' },
       { id:'capacity', label:'Capacity' },
-      { id:'area_id', label:'Area ID', placeholder:'e.g., AR-001' },
+      { id:'area_id', label:'Area', type:'remoteSelect', source:'/api/areas', valueKey:'area_id', labelFn:r => `${r.area_id} · ${r.area_type}` },
       { id:'status', label:'Status', type:'select', options:['Active','Inactive','Under Maintenance','Validation'] },
     ],
     create: (data) => api('POST','/api/equipment',data),
@@ -306,15 +323,31 @@ async function loadMasters(which) {
 
 document.querySelectorAll('#masterTabs button').forEach(b => b.addEventListener('click', () => loadMasters(b.dataset.mt)));
 
-function openMasterAddModal() {
+async function openMasterAddModal() {
   const def = MASTER_DEFS[CURRENT_MASTER];
   if (!def.canAdd) return;
+  // Pre-load any remote select options
+  const remoteData = {};
+  for (const f of def.addFields) {
+    if (f.type === 'remoteSelect') {
+      try { remoteData[f.id] = await api('GET', f.source); }
+      catch (e) { remoteData[f.id] = []; }
+    }
+  }
   openModal({
     title: `Add ${CURRENT_MASTER.slice(0,-1).replace(/^./, c=>c.toUpperCase())}`,
     body: def.addFields.map(f => {
       if (f.type === 'select') {
-        return `<div class="form-row"><label>${f.label}</label>
-          <select name="${f.id}">${f.options.map(o => `<option>${o}</option>`).join('')}</select></div>`;
+        return `<div class="form-row"><label>${f.label}${f.required?' *':''}</label>
+          <select name="${f.id}" ${f.required?'required':''}>${f.options.map(o => `<option>${o}</option>`).join('')}</select></div>`;
+      }
+      if (f.type === 'remoteSelect') {
+        const rows = remoteData[f.id] || [];
+        return `<div class="form-row"><label>${f.label}${f.required?' *':''}</label>
+          <select name="${f.id}" ${f.required?'required':''}>
+            ${f.required ? '' : '<option value="">—</option>'}
+            ${rows.map(r => `<option value="${escapeHtml(r[f.valueKey])}">${escapeHtml(f.labelFn(r))}</option>`).join('')}
+          </select></div>`;
       }
       return `<div class="form-row"><label>${f.label}${f.required?' *':''}</label>
         <input name="${f.id}" type="text" placeholder="${f.placeholder || ''}" ${f.required?'required':''} /></div>`;
@@ -333,25 +366,53 @@ function openMasterAddModal() {
 async function loadUsers() {
   try {
     const users = await api('GET','/api/users');
-    $('usersBody').innerHTML = users.map(u => `
+    $('usersBody').innerHTML = users.length === 0
+      ? '<tr class="empty-row"><td colspan="8">No users</td></tr>'
+      : users.map(u => `
       <tr>
         <td><strong>${escapeHtml(u.user_id)}</strong></td>
-        <td>${escapeHtml(u.name)}</td>
+        <td>${escapeHtml(u.employee_id || '—')}</td>
+        <td>${escapeHtml(u.name)}<div style="color:var(--muted); font-size:11px;">${escapeHtml(u.email || '')}</div></td>
         <td>${escapeHtml(u.role)}</td>
         <td>${escapeHtml(u.department || '')}</td>
         <td>${statusPill(u.status)}</td>
         <td>${escapeHtml(u.last_login || 'Never')}</td>
-        <td>
+        <td style="white-space:nowrap;">
+          <button class="btn ghost sm" onclick="resetUserPasswordPrompt('${u.user_id}','${escapeHtml(u.name)}')">🔑 Reset</button>
           ${u.status === 'Active'
-            ? `<button class="btn ghost sm" onclick="setUserStatus('${u.user_id}','Locked')">Lock</button>`
-            : `<button class="btn ghost sm" onclick="setUserStatus('${u.user_id}','Active')">Unlock</button>`}
+            ? `<button class="btn ghost sm" onclick="setUserStatus('${u.user_id}','Locked')">Lock</button>
+               <button class="btn ghost sm" onclick="confirmDeactivate('${u.user_id}','${escapeHtml(u.name)}')">Deactivate</button>`
+            : `<button class="btn ghost sm" onclick="setUserStatus('${u.user_id}','Active')">Activate</button>`}
         </td>
       </tr>`).join('');
   } catch (e) { toast(e.message, 'error'); }
 }
+
 async function setUserStatus(user_id, status) {
   try { await api('PUT', `/api/users/${user_id}/status`, { status }); toast(`User ${user_id} set to ${status}`, 'success'); loadUsers(); }
   catch (e) { toast(e.message, 'error'); }
+}
+
+function confirmDeactivate(user_id, name) {
+  if (!confirm(`Deactivate ${name}? Their active sessions will be terminated and they won't be able to sign in.`)) return;
+  setUserStatus(user_id, 'Inactive');
+}
+
+function resetUserPasswordPrompt(user_id, name) {
+  openModal({
+    title: `Reset password for ${escapeHtml(name)}`,
+    body: `
+      <p style="font-size:12px; color:var(--muted); margin-top:0;">Setting a new password will sign this user out of all active sessions. They'll need to log in again with the new password.</p>
+      <div class="form-row"><label>New Password *</label><input name="password" type="password" minlength="6" required autofocus /></div>
+      <div class="form-row"><label>Confirm *</label><input name="confirm" type="password" minlength="6" required /></div>
+    `,
+    submitLabel: 'Reset Password',
+    onSubmit: async (data) => {
+      if (data.password !== data.confirm) throw new Error('Passwords do not match');
+      await api('PUT', `/api/users/${user_id}/password`, { password: data.password });
+      toast(`Password reset for ${name}.`, 'success');
+    }
+  });
 }
 async function openUserAddModal() {
   try {
@@ -361,11 +422,14 @@ async function openUserAddModal() {
     ]);
     openModal({
       title: 'Add User',
+      width: 560,
       body: `
-        <div class="form-row"><label>User ID *</label><input name="user_id" required /></div>
+        <div class="form-row"><label>Login ID *</label><input name="user_id" required placeholder="short username, e.g. jsharma" /></div>
+        <div class="form-row"><label>Employee ID</label><input name="employee_id" placeholder="e.g. EMP-1234" /></div>
         <div class="form-row"><label>Full Name *</label><input name="name" required /></div>
         <div class="form-row"><label>Email</label><input name="email" type="email" /></div>
-        <div class="form-row"><label>Password *</label><input name="password" type="password" required /></div>
+        <div class="form-row"><label>Phone</label><input name="phone" type="tel" placeholder="+91 ..." /></div>
+        <div class="form-row"><label>Initial Password *</label><input name="password" type="password" minlength="6" required /></div>
         <div class="form-row"><label>Role *</label>
           <select name="role_id" id="userRoleSel" required>
             ${roles.filter(r=>r.status==='Active').map(r => `<option value="${r.id}" data-dept="${r.department_id}">${escapeHtml(r.name)} — ${escapeHtml(r.department_name)}</option>`).join('')}
@@ -377,11 +441,12 @@ async function openUserAddModal() {
             ${depts.filter(d=>d.status==='Active').map(d => `<option value="${d.id}">${escapeHtml(d.name)}</option>`).join('')}
           </select>
         </div>
-        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Each role belongs to a department. Override only if this user should be in a different department from the role's default.</p>
+        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Each role belongs to a department by default. Override only if this user should report in a different department.</p>
       `,
       onSubmit: async (data) => {
         const payload = {
-          user_id: data.user_id, name: data.name, email: data.email,
+          user_id: data.user_id, employee_id: data.employee_id || null,
+          name: data.name, email: data.email, phone: data.phone,
           password: data.password,
           role_id: Number(data.role_id),
           department_id: data.department_id ? Number(data.department_id) : null,
@@ -427,8 +492,15 @@ async function loadPmConfig() {
           ${adminCatMode ? `<button class="btn ghost sm" onclick='openCatModal(${escapeHtml(JSON.stringify(c))})'>Edit</button>
                             <button class="btn ghost sm" onclick="deleteCat(${c.id})">×</button>` : ''}
         </td></tr>`).join('');
-    $('groupBody').innerHTML = groups.length === 0 ? '<tr class="empty-row"><td colspan="2">—</td></tr>' :
-      groups.map(g => `<tr><td>${escapeHtml(g.name)}</td><td>${escapeHtml(g.department || '')}</td></tr>`).join('');
+    const groupEdit = can('manage_checklists') || can('manage_pm_categories');
+    $('groupBody').innerHTML = groups.length === 0 ? '<tr class="empty-row"><td colspan="3">No groups</td></tr>' :
+      groups.map(g => `<tr>
+        <td><strong>${escapeHtml(g.name)}</strong></td>
+        <td>${escapeHtml(g.department || '')}</td>
+        <td style="text-align:right;">
+          ${groupEdit ? `<button class="btn ghost sm" onclick='openGroupModal(${escapeHtml(JSON.stringify(g))})'>Edit</button>
+                        <button class="btn ghost sm" onclick="deleteGroup(${g.id})">×</button>` : ''}
+        </td></tr>`).join('');
 
     fillSelect($('pmEquipment'), equipment, 'equipment_id', e => `${e.equipment_id} · ${e.name}`);
     fillSelect($('pmChecklist'), checklists, 'id', c => `${c.name} (${c.version})`, true);
@@ -493,6 +565,36 @@ async function deleteCat(id) {
   catch (e) { toast(e.message,'error'); }
 }
 
+// ----- Checklist Group master CRUD -----
+async function openGroupModal(existing) {
+  const g = existing || { name:'', department_id:'' };
+  let depts = [];
+  try { depts = await api('GET','/api/departments'); } catch (e) {}
+  openModal({
+    title: existing ? `Edit Checklist Group — ${escapeHtml(g.name)}` : 'Add Checklist Group',
+    body: `
+      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(g.name)}" required /></div>
+      <div class="form-row"><label>Department</label>
+        <select name="department_id">
+          <option value="">— none —</option>
+          ${depts.map(d => `<option value="${d.id}" ${d.id===g.department_id?'selected':''}>${escapeHtml(d.name)}</option>`).join('')}
+        </select>
+      </div>
+    `,
+    onSubmit: async (data) => {
+      const payload = { name: data.name, department_id: data.department_id ? Number(data.department_id) : null };
+      if (existing) await api('PUT', `/api/checklist-groups/${existing.id}`, payload);
+      else          await api('POST','/api/checklist-groups', payload);
+      toast('Saved.', 'success'); loadPmConfig();
+    }
+  });
+}
+async function deleteGroup(id) {
+  if (!confirm('Delete this checklist group?')) return;
+  try { await api('DELETE', `/api/checklist-groups/${id}`); toast('Deleted.','success'); loadPmConfig(); }
+  catch (e) { toast(e.message,'error'); }
+}
+
 function fillSelect(el, rows, valKey, labelFn, allowEmpty=false) {
   el.innerHTML = (allowEmpty ? '<option value="">—</option>' : '') +
     rows.map(r => `<option value="${escapeHtml(r[valKey])}">${escapeHtml(labelFn(r))}</option>`).join('');
@@ -526,11 +628,16 @@ async function loadChecklists() {
   try {
     const rows = await api('GET','/api/checklists');
     $('checklistsBody').innerHTML = rows.length === 0
-      ? '<tr class="empty-row"><td colspan="5">No checklists</td></tr>'
+      ? '<tr class="empty-row"><td colspan="5">No checklists yet — click "+ New Checklist" to create one.</td></tr>'
       : rows.map(c => `
       <tr>
-        <td>${c.id}</td><td>${escapeHtml(c.name)}</td><td>${escapeHtml(c.version)}</td><td>${statusPill(c.status)}</td>
-        <td><button class="btn ghost sm" onclick="previewChecklist(${c.id})">Preview</button></td>
+        <td>${c.id}</td>
+        <td><strong>${escapeHtml(c.name)}</strong>
+          <div style="color:var(--muted); font-size:11px;">by ${escapeHtml(c.created_by_name || '—')}${c.reviewer_name?` · rev. ${escapeHtml(c.reviewer_name)}`:''}${c.approver_name?` · app. ${escapeHtml(c.approver_name)}`:''}</div>
+        </td>
+        <td>${escapeHtml(c.version)}</td>
+        <td>${statusPill(c.status)}</td>
+        <td><button class="btn ghost sm" onclick="previewChecklist(${c.id})">Open</button></td>
       </tr>`).join('');
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -540,14 +647,48 @@ async function previewChecklist(id) {
   try {
     const cl = await api('GET', `/api/checklists/${id}/full`);
     CURRENT_CHECKLIST_ID = id;
-    $('checklistPreviewTitle').textContent = `${cl.name} (${cl.version})`;
-    const editBtn = can('manage_checklists') ? `<button class="btn ghost sm" onclick="openChecklistBuilder(${cl.id})">Edit</button>` : '';
-    const assnBtn = can('assign_checklist') ? `<button class="btn primary sm" onclick="openAssignChecklistModal(${cl.id})">Assign…</button>` : '';
-    $('checklistPreviewActions').innerHTML = `${editBtn} ${assnBtn}`;
+    $('checklistPreviewTitle').innerHTML = `${escapeHtml(cl.name)} <span style="color:var(--muted); font-size:13px;">${escapeHtml(cl.version)}</span> ${statusPill(cl.status)}`;
 
-    let html = '';
+    // Build workflow action buttons based on status + permissions
+    const isAuthor   = cl.created_by === CURRENT_USER.id;
+    const isReviewer = cl.reviewer_id === CURRENT_USER.id;
+    const isApprover = cl.approver_id === CURRENT_USER.id;
+    const editable   = ['Draft','Rejected'].includes(cl.status);
+    const buttons = [];
+
+    if (editable && can('manage_checklists') && (isAuthor || CURRENT_USER.is_admin)) {
+      buttons.push(`<button class="btn ghost sm" onclick="openChecklistBuilder(${cl.id})">Edit</button>`);
+      buttons.push(`<button class="btn primary sm" onclick="openSubmitChecklistModal(${cl.id})">Submit for Review →</button>`);
+    }
+    if (cl.status === 'Pending Review' && (isReviewer || CURRENT_USER.is_admin) && can('review_checklist')) {
+      buttons.push(`<button class="btn primary sm" onclick="reviewChecklistDecision(${cl.id},'approve')">✓ Pass Review</button>`);
+      buttons.push(`<button class="btn ghost sm" onclick="reviewChecklistDecision(${cl.id},'reject')">✗ Reject</button>`);
+    }
+    if (cl.status === 'Pending Approval' && (isApprover || CURRENT_USER.is_admin) && can('approve_checklist')) {
+      buttons.push(`<button class="btn primary sm" onclick="approveChecklistDecision(${cl.id},'approve')">✓ Final Approve</button>`);
+      buttons.push(`<button class="btn ghost sm" onclick="approveChecklistDecision(${cl.id},'reject')">✗ Reject</button>`);
+    }
+    if (cl.status === 'Approved' && can('assign_checklist')) {
+      buttons.push(`<button class="btn primary sm" onclick="openAssignChecklistModal(${cl.id})">Assign…</button>`);
+    }
+    $('checklistPreviewActions').innerHTML = buttons.join(' ');
+
+    // Workflow info banner
+    const wf = `
+      <div style="margin:8px 0 12px; padding:8px 12px; background:var(--cream-100); border-radius:6px; font-size:12px;">
+        <strong>Workflow:</strong>
+        Initiator <em>${escapeHtml(cl.created_by_name || '—')}</em>
+        ${cl.reviewer_name ? `&nbsp;→&nbsp; Reviewer <em>${escapeHtml(cl.reviewer_name)}</em>` : ''}
+        ${cl.approver_name ? `&nbsp;→&nbsp; Approver <em>${escapeHtml(cl.approver_name)}</em>` : ''}
+        ${cl.submitted_at ? `<div style="color:var(--muted); margin-top:3px;">Submitted ${escapeHtml(cl.submitted_at)}</div>` : ''}
+        ${cl.reviewed_at ? `<div style="color:var(--muted);">Reviewed ${escapeHtml(cl.reviewed_at)}</div>` : ''}
+        ${cl.approved_at ? `<div style="color:var(--muted);">Approved ${escapeHtml(cl.approved_at)}</div>` : ''}
+        ${cl.rejection_reason ? `<div style="color:var(--red); margin-top:3px;"><strong>Rejected:</strong> ${escapeHtml(cl.rejection_reason)}</div>` : ''}
+      </div>`;
+
+    let html = wf;
     if (cl.sections && cl.sections.length) {
-      html = cl.sections.map((s, si) => `
+      html += cl.sections.map((s, si) => `
         <div style="margin: 12px 0 8px; padding: 10px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
           <div style="font-weight:600;">${si+1}. ${escapeHtml(s.name)}</div>
           ${s.description ? `<div style="color:var(--muted); font-size:12px; margin-top:2px;">${escapeHtml(s.description)}</div>` : ''}
@@ -559,14 +700,14 @@ async function previewChecklist(id) {
               <div class="chk-meta">Type: ${escapeHtml(q.qtype)}${q.options?' · {'+q.options.join('/')+'}':''}${q.min_value!=null?` · range ${q.min_value}–${q.max_value}${q.unit?' '+q.unit:''}`:''}</div>
             </div></li>`).join('')}</ul>`).join('');
     } else if (cl.legacy_fields) {
-      html = '<ul class="checklist">' + cl.legacy_fields.map((f, i) => `
+      html += '<ul class="checklist">' + cl.legacy_fields.map((f, i) => `
         <li><div class="chk-num">${i+1}</div>
           <div class="chk-body">
             <div class="chk-title">${escapeHtml(f.label)}${f.required?' *':''}</div>
             <div class="chk-meta">Type: ${escapeHtml(f.type)}${f.options?' · {'+f.options.join('/')+'}':''}${f.min!==undefined?` · range ${f.min}–${f.max}`:''}</div>
           </div></li>`).join('') + '</ul>';
     } else {
-      html = '<p style="color:var(--muted); margin: 10px 0;">This checklist has no questions yet.</p>';
+      html += '<p style="color:var(--muted); margin: 10px 0;">This checklist has no questions yet.</p>';
     }
     $('checklistPreviewBody').innerHTML = html;
   } catch (e) { toast(e.message, 'error'); }
@@ -1426,11 +1567,12 @@ async function loadTasks(tab) {
     const url = tab === 'mine' ? '/api/assignments?mine=1' : '/api/assignments';
     const rows = await api('GET', url);
     $('tasksBody').innerHTML = rows.length === 0
-      ? `<tr class="empty-row"><td colspan="7">${tab==='mine'?'No assignments for you yet.':'No assignments.'}</td></tr>`
+      ? `<tr class="empty-row"><td colspan="8">${tab==='mine'?'No assignments for you yet.':'No assignments.'}</td></tr>`
       : rows.map(a => `<tr>
           <td><strong>${escapeHtml(a.assignment_id)}</strong></td>
           <td>${escapeHtml(a.checklist_name || '')} <span style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_version || '')}</span></td>
-          <td>${escapeHtml(a.assignee_name || '')}</td>
+          <td>${escapeHtml(a.target_type || '')} <strong>${escapeHtml(a.target_id || '')}</strong>${a.target_label?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.target_label)}</div>`:''}</td>
+          <td>${escapeHtml(a.assignee_name || '— open —')}</td>
           <td>${escapeHtml(a.frequency || '—')}</td>
           <td>${escapeHtml(a.due_date || '—')}</td>
           <td>${statusPill(a.status)}</td>
@@ -1441,21 +1583,47 @@ async function loadTasks(tab) {
 
 async function openAssignChecklistModal(presetChecklistId) {
   try {
-    const [checklists, users, freqs] = await Promise.all([
-      api('GET','/api/checklists'),
+    const [checklists, users, freqs, equipment, areas] = await Promise.all([
+      api('GET','/api/checklists?status=Approved'),
       api('GET','/api/users'),
       api('GET','/api/frequencies'),
+      api('GET','/api/equipment'),
+      api('GET','/api/areas'),
     ]);
+    if (checklists.length === 0) {
+      toast('No approved checklists yet. A checklist must complete Review + Approval before it can be assigned.', 'error');
+      return;
+    }
+    // Stash target choices for the inline switcher
+    window.__assignEquipOptions = equipment.map(e => `<option value="${e.equipment_id}">${e.equipment_id} · ${escapeHtml(e.name)}</option>`).join('');
+    window.__assignAreaOptions  = areas.map(a => `<option value="${a.area_id}">${a.area_id} · ${escapeHtml(a.area_type)}</option>`).join('');
+    window.__switchAssignTarget = (sel) => {
+      const wrap = document.getElementById('targetWrap');
+      const opts = sel.value === 'equipment' ? window.__assignEquipOptions : window.__assignAreaOptions;
+      wrap.innerHTML = `<select name="target_id" required>${opts}</select>`;
+    };
+
     openModal({
       title: 'Assign Checklist',
+      width: 560,
       body: `
         <div class="form-row"><label>Checklist *</label>
           <select name="checklist_id" required>
             ${checklists.map(c => `<option value="${c.id}" ${presetChecklistId===c.id?'selected':''}>${escapeHtml(c.name)} (${escapeHtml(c.version)})</option>`).join('')}
           </select>
         </div>
-        <div class="form-row"><label>Assign To *</label>
-          <select name="assignee_id" required>
+        <div class="form-row"><label>Target Type *</label>
+          <select id="targetTypeSel" name="target_type" required onchange="window.__switchAssignTarget(this)">
+            <option value="equipment">Equipment</option>
+            <option value="area">Area</option>
+          </select>
+        </div>
+        <div class="form-row"><label>Target *</label>
+          <span id="targetWrap"><select name="target_id" required>${window.__assignEquipOptions}</select></span>
+        </div>
+        <div class="form-row"><label>Assignee</label>
+          <select name="assignee_id">
+            <option value="">— open assignment (anyone with execute_checklist) —</option>
             ${users.filter(u=>u.status==='Active').map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
           </select>
         </div>
@@ -1468,7 +1636,9 @@ async function openAssignChecklistModal(presetChecklistId) {
       onSubmit: async (data) => {
         await api('POST','/api/assignments', {
           checklist_id: Number(data.checklist_id),
-          assignee_id: Number(data.assignee_id),
+          target_type: data.target_type,
+          target_id: data.target_id,
+          assignee_id: data.assignee_id ? Number(data.assignee_id) : null,
           frequency_id: data.frequency_id ? Number(data.frequency_id) : null,
           due_date: data.due_date || null,
           notes: data.notes || ''
@@ -1480,12 +1650,81 @@ async function openAssignChecklistModal(presetChecklistId) {
   } catch (e) { toast(e.message,'error'); }
 }
 
+// ----- Checklist workflow actions -----
+async function openSubmitChecklistModal(checklistId) {
+  try {
+    const users = await api('GET','/api/users');
+    const reviewers = users.filter(u => u.status === 'Active');
+    openModal({
+      title: 'Submit Checklist for Review',
+      body: `
+        <p style="font-size:12px; color:var(--muted); margin-top:0;">Pick a reviewer and a final approver. The reviewer is notified first; once they pass it, the approver is notified.</p>
+        <div class="form-row"><label>Reviewer *</label>
+          <select name="reviewer_id" required>
+            ${reviewers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>Approver *</label>
+          <select name="approver_id" required>
+            ${reviewers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+          </select>
+        </div>
+      `,
+      submitLabel: 'Submit',
+      onSubmit: async (data) => {
+        await api('PUT', `/api/checklists/${checklistId}/submit`, {
+          reviewer_id: Number(data.reviewer_id),
+          approver_id: Number(data.approver_id),
+        });
+        toast('Submitted for review.', 'success');
+        previewChecklist(checklistId);
+        loadChecklists();
+        refreshNotifBadge();
+      }
+    });
+  } catch (e) { toast(e.message,'error'); }
+}
+
+async function reviewChecklistDecision(checklistId, decision) {
+  let reason = null;
+  if (decision === 'reject') {
+    reason = prompt('Reason for rejection:');
+    if (!reason) return;
+  }
+  try {
+    await api('PUT', `/api/checklists/${checklistId}/review`, { decision, reason });
+    toast(decision === 'approve' ? 'Review passed — sent to approver.' : 'Checklist rejected.', 'success');
+    previewChecklist(checklistId);
+    loadChecklists();
+    refreshNotifBadge();
+  } catch (e) { toast(e.message,'error'); }
+}
+
+async function approveChecklistDecision(checklistId, decision) {
+  let reason = null;
+  if (decision === 'reject') {
+    reason = prompt('Reason for rejection:');
+    if (!reason) return;
+  }
+  try {
+    await api('PUT', `/api/checklists/${checklistId}/approve`, { decision, reason });
+    toast(decision === 'approve' ? 'Checklist approved — now available for assignment.' : 'Checklist rejected.', 'success');
+    previewChecklist(checklistId);
+    loadChecklists();
+    refreshNotifBadge();
+  } catch (e) { toast(e.message,'error'); }
+}
+
 async function openAssignment(assignmentId) {
   try {
     const a = await api('GET', `/api/assignments/${assignmentId}`);
     const cl = a.checklist;
     const existing = a.response_data || {};
-    const editable = (a.status !== 'Completed') && (a.assignee_id === CURRENT_USER.id || CURRENT_USER.is_admin);
+    const editable = (a.status !== 'Completed') && (
+      a.assignee_id === CURRENT_USER.id ||
+      CURRENT_USER.is_admin ||
+      (!a.assignee_id && can('execute_checklist'))
+    );
     const sectionsHtml = (cl?.sections || []).map((s, si) => `
       <div style="margin: 10px 0 6px; padding: 8px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
         <strong>${si+1}. ${escapeHtml(s.name)}</strong>
@@ -1510,9 +1749,10 @@ async function openAssignment(assignmentId) {
     const banner = `
       <div class="row-gap" style="font-size:12px; margin-bottom: 12px;">
         ${statusPill(a.status)}
+        ${a.target_id ? `<span class="pill brown">${escapeHtml(a.target_type)}: ${escapeHtml(a.target_id)}${a.target_label?' · '+escapeHtml(a.target_label):''}</span>` : ''}
         ${a.due_date ? `<span class="pill brown">Due: ${escapeHtml(a.due_date)}</span>` : ''}
         ${a.frequency ? `<span class="pill brown">${escapeHtml(a.frequency)}</span>` : ''}
-        <span class="pill brown">Assignee: ${escapeHtml(a.assignee_name)}</span>
+        <span class="pill brown">Assignee: ${escapeHtml(a.assignee_name || '— open —')}</span>
         <span class="pill brown">Assigned by: ${escapeHtml(a.assigned_by_name || '')}</span>
       </div>`;
     const notesBox = editable

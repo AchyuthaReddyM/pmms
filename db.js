@@ -64,8 +64,10 @@ function createSchema() {
     CREATE TABLE IF NOT EXISTS users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id TEXT UNIQUE NOT NULL,
+      employee_id TEXT UNIQUE,
       name TEXT NOT NULL,
       email TEXT,
+      phone TEXT,
       password_hash TEXT NOT NULL,
       role_id INTEGER REFERENCES roles(id),
       department_id INTEGER REFERENCES departments(id),
@@ -164,8 +166,8 @@ function createSchema() {
       department TEXT
     );
 
-    -- Checklists — keep legacy fields_json for backwards compat,
-    -- but new structured checklists live in checklist_sections + checklist_questions.
+    -- Checklists — Draft / Pending Review / Pending Approval / Approved / Rejected
+    -- Only Approved checklists can be assigned. Initiator -> Reviewer -> Approver workflow.
     CREATE TABLE IF NOT EXISTS checklists (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
@@ -173,9 +175,15 @@ function createSchema() {
       group_id INTEGER REFERENCES checklist_groups(id),
       category_id INTEGER REFERENCES pm_categories(id),
       version TEXT NOT NULL DEFAULT 'v1.0',
-      status TEXT NOT NULL DEFAULT 'Active',
+      status TEXT NOT NULL DEFAULT 'Draft',
       fields_json TEXT,
       created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      submitted_at TEXT,
+      reviewed_at TEXT,
+      approved_at TEXT,
+      rejection_reason TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -202,12 +210,15 @@ function createSchema() {
       position INTEGER NOT NULL DEFAULT 0
     );
 
-    -- Checklist assignment: manager assigns a checklist to a user
+    -- Checklist assignment: manager assigns an approved checklist to an equipment or area,
+    -- plus a specific user who is responsible for executing it.
     CREATE TABLE IF NOT EXISTS checklist_assignments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       assignment_id TEXT UNIQUE NOT NULL,
       checklist_id INTEGER NOT NULL REFERENCES checklists(id),
-      assignee_id INTEGER NOT NULL REFERENCES users(id),
+      target_type TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      assignee_id INTEGER REFERENCES users(id),
       frequency_id INTEGER REFERENCES frequencies(id),
       due_date TEXT,
       status TEXT NOT NULL DEFAULT 'Pending',
@@ -315,8 +326,11 @@ const BUILTIN_ACTIVITIES = [
   ['assign_pm',              'Assign PM to Technician',   'PM Lifecycle'],
   ['execute_pm',             'Execute PM',                'PM Lifecycle'],
   ['review_pm',              'Review Completed PM',       'PM Lifecycle'],
+  // Checklist authoring workflow
+  ['review_checklist',       'Review Checklist',          'Checklists'],
+  ['approve_checklist',      'Approve Checklist',         'Checklists'],
   // Checklist assignments
-  ['assign_checklist',       'Assign Checklist to User',  'Checklists'],
+  ['assign_checklist',       'Assign Checklist',          'Checklists'],
   ['execute_checklist',      'Execute Assigned Checklist','Checklists'],
   // Breakdowns
   ['view_breakdowns',        'View Breakdowns',           'Breakdowns'],
@@ -355,10 +369,10 @@ function seed() {
   // 3. Roles — each tied to one department, with permission set.
   // Names match the legacy role strings so existing requireRole() checks still work.
   const techActs   = ['view_pm','execute_pm','view_equipment','report_breakdown','execute_checklist'];
-  const reviewerActs = ['view_pm','review_pm','view_equipment','view_reports','view_audit','execute_checklist'];
-  const approverActs = ['view_pm','create_pm','approve_pm','assign_pm','view_equipment','manage_equipment','view_reports','view_breakdowns','resolve_breakdown','manage_checklists','assign_checklist','execute_checklist'];
+  const reviewerActs = ['view_pm','review_pm','view_equipment','view_reports','view_audit','execute_checklist','review_checklist'];
+  const approverActs = ['view_pm','create_pm','approve_pm','assign_pm','view_equipment','manage_equipment','view_reports','view_breakdowns','resolve_breakdown','manage_checklists','assign_checklist','execute_checklist','review_checklist','approve_checklist'];
   const prodActs   = ['view_pm','view_equipment','report_breakdown','view_breakdowns','execute_checklist'];
-  const qaActs     = ['view_pm','approve_pm','review_pm','view_reports','view_audit','execute_checklist'];
+  const qaActs     = ['view_pm','approve_pm','review_pm','view_reports','view_audit','execute_checklist','review_checklist','approve_checklist'];
   const whActs     = ['view_equipment','view_pm','execute_checklist'];
 
   const roles = [
@@ -384,26 +398,26 @@ function seed() {
   }
   const mkHash = (pw) => hashPassword(pw);
   const insertUser = db.prepare(`
-    INSERT INTO users (user_id, name, email, password_hash, role_id, department_id, role, department, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active')
+    INSERT INTO users (user_id, employee_id, name, email, password_hash, role_id, department_id, role, department, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')
   `);
-  // [user_id, name, email, password, role_name, override_department_name?]
+  // [user_id, employee_id, name, email, password, role_name, override_department_name?]
   const users = [
-    ['admin',     'Achyutha Reddy', 'achyutha2006@gmail.com', adminPw,          'System Administrator', null],
-    ['siyer',     'S. Iyer',        'siyer@ways.local',       'approver123',    'Approver',             null],
-    ['rmehta',    'R. Mehta',       'rmehta@ways.local',      'reviewer123',    'Reviewer',             null],
-    ['pkumar',    'P. Kumar',       'pkumar@ways.local',      'tech123',        'Technician',           'Engineering - Mechanical'],
-    ['krao',      'K. Rao',         'krao@ways.local',        'tech123',        'Technician',           'Engineering - Electrical'],
-    ['snaidu',    'S. Naidu',       'snaidu@ways.local',      'tech123',        'Technician',           'HVAC'],
-    ['mverma',    'M. Verma',       'mverma@ways.local',      'prod123',        'Production',           null],
-    ['qaapprove', 'Q. Anand',       'qa@ways.local',          'qa123',          'QA',                   null],
-    ['stores',    'Stores Officer', 'stores@ways.local',      'store123',       'Warehouse',            null],
+    ['admin',     'EMP-0001', 'Achyutha Reddy', 'achyutha2006@gmail.com', adminPw,         'System Administrator', null],
+    ['siyer',     'EMP-1001', 'S. Iyer',        'siyer@ways.local',       'approver123',   'Approver',             null],
+    ['rmehta',    'EMP-1002', 'R. Mehta',       'rmehta@ways.local',      'reviewer123',   'Reviewer',             null],
+    ['pkumar',    'EMP-2001', 'P. Kumar',       'pkumar@ways.local',      'tech123',       'Technician',           'Engineering - Mechanical'],
+    ['krao',      'EMP-2002', 'K. Rao',         'krao@ways.local',        'tech123',       'Technician',           'Engineering - Electrical'],
+    ['snaidu',    'EMP-2003', 'S. Naidu',       'snaidu@ways.local',      'tech123',       'Technician',           'HVAC'],
+    ['mverma',    'EMP-3001', 'M. Verma',       'mverma@ways.local',      'prod123',       'Production',           null],
+    ['qaapprove', 'EMP-4001', 'Q. Anand',       'qa@ways.local',          'qa123',         'QA',                   null],
+    ['stores',    'EMP-5001', 'Stores Officer', 'stores@ways.local',      'store123',      'Warehouse',            null],
   ];
   for (const u of users) {
-    const r = roleByName(u[4]);
-    const dId = u[5] ? deptId(u[5]) : r.department_id;
-    const dName = u[5] || db.prepare('SELECT name FROM departments WHERE id=?').get(dId).name;
-    insertUser.run(u[0], u[1], u[2], mkHash(u[3]), r.id, dId, r.name, dName);
+    const r = roleByName(u[5]);
+    const dId = u[6] ? deptId(u[6]) : r.department_id;
+    const dName = u[6] || db.prepare('SELECT name FROM departments WHERE id=?').get(dId).name;
+    insertUser.run(u[0], u[1], u[2], u[3], mkHash(u[4]), r.id, dId, r.name, dName);
   }
 
   const ins = (sql) => db.prepare(sql);
@@ -492,7 +506,7 @@ function seed() {
     { id: 'q5', type: 'text',     label: 'Lubricant batch ID', required:true },
     { id: 'q6', type: 'text',     label: 'Remarks', required:false },
   ]);
-  ins('INSERT INTO checklists(name,group_id,version,fields_json) VALUES (?,?,?,?)').run('FBD Monthly Mechanical',1,'v3.2',fbdChecklist);
+  ins("INSERT INTO checklists(name,group_id,version,fields_json,status) VALUES (?,?,?,?,'Approved')").run('FBD Monthly Mechanical',1,'v3.2',fbdChecklist);
 
   const rmgChecklist = JSON.stringify([
     { id: 'q1', type: 'dropdown', label: 'Power isolation done', options:['Yes','No'], required:true },
@@ -500,7 +514,7 @@ function seed() {
     { id: 'q3', type: 'dropdown', label: 'Impeller condition', options:['OK','Worn'], required:true },
     { id: 'q4', type: 'text',     label: 'Remarks', required:false },
   ]);
-  ins('INSERT INTO checklists(name,group_id,version,fields_json) VALUES (?,?,?,?)').run('RMG Weekly Electrical',1,'v2.1',rmgChecklist);
+  ins("INSERT INTO checklists(name,group_id,version,fields_json,status) VALUES (?,?,?,?,'Approved')").run('RMG Weekly Electrical',1,'v2.1',rmgChecklist);
 
   const ahuChecklist = JSON.stringify([
     { id: 'q1', type: 'dropdown', label: 'Filter status', options:['OK','Replace'], required:true },
@@ -508,13 +522,16 @@ function seed() {
     { id: 'q3', type: 'number',   label: 'Supply air flow (CFM)', min:0, max:20000, required:true },
     { id: 'q4', type: 'text',     label: 'Remarks', required:false },
   ]);
-  ins('INSERT INTO checklists(name,group_id,version,fields_json) VALUES (?,?,?,?)').run('AHU Quarterly HVAC',4,'v1.4',ahuChecklist);
+  ins("INSERT INTO checklists(name,group_id,version,fields_json,status) VALUES (?,?,?,?,'Approved')").run('AHU Quarterly HVAC',4,'v1.4',ahuChecklist);
 
   // ---- Structured (new) checklist sample: AHU Monthly Inspection ----
   const adminId = db.prepare("SELECT id FROM users WHERE user_id='admin'").get().id;
   const ahuCatId = db.prepare("SELECT id FROM pm_categories WHERE name='HVAC'").get().id;
-  const clRes = ins('INSERT INTO checklists(name,description,group_id,category_id,version,status,created_by) VALUES (?,?,?,?,?,?,?)')
-    .run('AHU Monthly Inspection (v2)', 'Structured monthly AHU inspection with grouped checkpoints.', 4, ahuCatId, 'v2.0', 'Active', adminId);
+  const reviewerId = db.prepare("SELECT id FROM users WHERE user_id='rmehta'").get().id;
+  const approverId = db.prepare("SELECT id FROM users WHERE user_id='siyer'").get().id;
+  const clRes = ins(`INSERT INTO checklists(name,description,group_id,category_id,version,status,created_by,reviewer_id,approver_id,submitted_at,reviewed_at,approved_at)
+                     VALUES (?,?,?,?,?,?,?,?,?, datetime('now','-3 days'), datetime('now','-2 days'), datetime('now','-1 day'))`)
+    .run('AHU Monthly Inspection (v2)', 'Structured monthly AHU inspection with grouped checkpoints.', 4, ahuCatId, 'v2.0', 'Approved', adminId, reviewerId, approverId);
   const ahuCl = clRes.lastInsertRowid;
 
   const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
@@ -562,15 +579,15 @@ function seed() {
   db.prepare(`UPDATE pm_schedules SET execution_data=?, started_at=?, completed_at=?, technician_sig=?, reviewer_sig=?, approver_sig=? WHERE pm_id='PM-2575'`)
     .run(completedData, fmt(addDays(today, -16))+' 09:15:00', fmt(addDays(today,-16))+' 11:20:00','S. Naidu','R. Mehta','S. Iyer');
 
-  // Sample checklist assignment with notification
-  const assn1 = ins('INSERT INTO checklist_assignments(assignment_id,checklist_id,assignee_id,frequency_id,due_date,status,assigned_by) VALUES (?,?,?,?,?,?,?)')
-    .run('CA-001', ahuCl, u('snaidu'),
+  // Sample checklist assignment with notification (target = equipment)
+  ins('INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,frequency_id,due_date,status,assigned_by) VALUES (?,?,?,?,?,?,?,?,?)')
+    .run('CA-001', ahuCl, 'equipment', 'EQ-AHU-12', u('snaidu'),
          db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
          fmt(addDays(today, 3)), 'Pending', u('admin'));
   ins('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
     .run(u('snaidu'),
          'New checklist assigned',
-         'AHU Monthly Inspection (v2) is due ' + fmt(addDays(today,3)) + '.',
+         'AHU Monthly Inspection (v2) for EQ-AHU-12 is due ' + fmt(addDays(today,3)) + '.',
          'assignment',
          '/assignments/CA-001');
 

@@ -220,10 +220,15 @@ app.post('/api/plants', requireAuth, requireRole('System Administrator'), (req, 
 });
 app.put('/api/plants/:plant_id', requireAuth, requireRole('System Administrator'), (req, res) => {
   const { name, location, status } = req.body;
-  const r = db.prepare('UPDATE plants SET name=COALESCE(?,name), location=COALESCE(?,location), status=COALESCE(?,status), modified_at=datetime(\'now\') WHERE plant_id=?')
+  const before = db.prepare('SELECT * FROM plants WHERE plant_id=?').get(req.params.plant_id);
+  if (!before) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE plants SET name=COALESCE(?,name), location=COALESCE(?,location), status=COALESCE(?,status), modified_at=datetime(\'now\') WHERE plant_id=?')
     .run(name, location, status, req.params.plant_id);
-  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
-  audit(req.user, 'UPDATE', 'Plant', req.params.plant_id, 'Plant modified');
+  const changes = [];
+  if (name && name !== before.name)         changes.push(`name "${before.name}" -> "${name}"`);
+  if (location && location !== before.location) changes.push(`location "${before.location||'-'}" -> "${location}"`);
+  if (status && status !== before.status)   changes.push(`status "${before.status}" -> "${status}"`);
+  audit(req.user, 'UPDATE', 'Plant', req.params.plant_id, changes.length ? changes.join('; ') : 'Plant touched');
   res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(req.params.plant_id));
 });
 
@@ -246,12 +251,64 @@ app.post('/api/blocks', requireAuth, requireRole('System Administrator'), (req, 
 
 // FORMULATIONS
 app.get('/api/formulations', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM formulations ORDER BY formulation_id').all()));
+app.post('/api/formulations', requireAuth, requireActivity('manage_plants'), (req, res) => {
+  const { name, department } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const formulation_id = nextId('FRM-', 'formulations', 'formulation_id');
+  db.prepare('INSERT INTO formulations(formulation_id,name,department) VALUES (?,?,?)').run(formulation_id, name, department || '');
+  audit(req.user, 'CREATE', 'Formulation', formulation_id, `"${name}" under "${department || '—'}"`);
+  res.json(db.prepare('SELECT * FROM formulations WHERE formulation_id=?').get(formulation_id));
+});
+app.put('/api/formulations/:formulation_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
+  const { name, department, status } = req.body || {};
+  const r = db.prepare('UPDATE formulations SET name=COALESCE(?,name), department=COALESCE(?,department), status=COALESCE(?,status) WHERE formulation_id=?')
+    .run(name, department, status, req.params.formulation_id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  audit(req.user, 'UPDATE', 'Formulation', req.params.formulation_id, `Updated formulation: ${name || ''}`);
+  res.json(db.prepare('SELECT * FROM formulations WHERE formulation_id=?').get(req.params.formulation_id));
+});
 
 // LOCATIONS
 app.get('/api/locations', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM locations ORDER BY location_id').all()));
+app.post('/api/locations', requireAuth, requireActivity('manage_plants'), (req, res) => {
+  const { block_id, description } = req.body || {};
+  if (!block_id) return res.status(400).json({ error: 'block_id required' });
+  const block = db.prepare('SELECT name FROM blocks WHERE block_id=?').get(block_id);
+  if (!block) return res.status(400).json({ error: 'Unknown block_id' });
+  const location_id = nextId('LOC-', 'locations', 'location_id');
+  db.prepare('INSERT INTO locations(location_id,block_id,description) VALUES (?,?,?)').run(location_id, block_id, description || '');
+  audit(req.user, 'CREATE', 'Location', location_id, `"${description || location_id}" under block ${block_id} (${block.name})`);
+  res.json(db.prepare('SELECT * FROM locations WHERE location_id=?').get(location_id));
+});
+app.put('/api/locations/:location_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
+  const { block_id, description, status } = req.body || {};
+  const r = db.prepare('UPDATE locations SET block_id=COALESCE(?,block_id), description=COALESCE(?,description), status=COALESCE(?,status) WHERE location_id=?')
+    .run(block_id, description, status, req.params.location_id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  audit(req.user, 'UPDATE', 'Location', req.params.location_id, 'Location modified');
+  res.json(db.prepare('SELECT * FROM locations WHERE location_id=?').get(req.params.location_id));
+});
 
 // AREAS
 app.get('/api/areas', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM areas ORDER BY area_id').all()));
+app.post('/api/areas', requireAuth, requireActivity('manage_plants'), (req, res) => {
+  const { location_id, area_type } = req.body || {};
+  if (!location_id) return res.status(400).json({ error: 'location_id required' });
+  const loc = db.prepare('SELECT description FROM locations WHERE location_id=?').get(location_id);
+  if (!loc) return res.status(400).json({ error: 'Unknown location_id' });
+  const area_id = nextId('AR-', 'areas', 'area_id');
+  db.prepare('INSERT INTO areas(area_id,location_id,area_type) VALUES (?,?,?)').run(area_id, location_id, area_type || '');
+  audit(req.user, 'CREATE', 'Area', area_id, `"${area_type || '—'}" under location ${location_id}`);
+  res.json(db.prepare('SELECT * FROM areas WHERE area_id=?').get(area_id));
+});
+app.put('/api/areas/:area_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
+  const { location_id, area_type, status } = req.body || {};
+  const r = db.prepare('UPDATE areas SET location_id=COALESCE(?,location_id), area_type=COALESCE(?,area_type), status=COALESCE(?,status) WHERE area_id=?')
+    .run(location_id, area_type, status, req.params.area_id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  audit(req.user, 'UPDATE', 'Area', req.params.area_id, 'Area modified');
+  res.json(db.prepare('SELECT * FROM areas WHERE area_id=?').get(req.params.area_id));
+});
 
 // EQUIPMENT
 app.get('/api/equipment', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM equipment ORDER BY equipment_id').all()));
@@ -291,7 +348,7 @@ app.put('/api/equipment/:equipment_id', requireAuth, requireRole('System Adminis
 // =============================================================
 app.get('/api/users', requireAuth, (req, res) => {
   res.json(db.prepare(`
-    SELECT u.id, u.user_id, u.name, u.email,
+    SELECT u.id, u.user_id, u.employee_id, u.name, u.email, u.phone,
            u.role_id, u.department_id,
            COALESCE(r.name, u.role)        AS role,
            COALESCE(d.name, u.department)  AS department,
@@ -304,28 +361,32 @@ app.get('/api/users', requireAuth, (req, res) => {
 });
 
 app.post('/api/users', requireAuth, requireActivity('manage_users'), (req, res) => {
-  const { user_id, name, email, password, role_id, department_id } = req.body || {};
+  const { user_id, employee_id, name, email, phone, password, role_id, department_id } = req.body || {};
   if (!user_id || !name || !password || !role_id) {
     return res.status(400).json({ error: 'user_id, name, password and role_id required' });
   }
-  const role = db.prepare('SELECT id, name, department_id FROM roles WHERE id=? AND status=\'Active\'').get(role_id);
+  const role = db.prepare("SELECT id, name, department_id FROM roles WHERE id=? AND status='Active'").get(role_id);
   if (!role) return res.status(400).json({ error: 'Unknown role_id' });
   const finalDeptId = department_id || role.department_id;
   const dept = db.prepare('SELECT id, name FROM departments WHERE id=?').get(finalDeptId);
   if (!dept) return res.status(400).json({ error: 'Unknown department_id' });
   const exists = db.prepare('SELECT 1 FROM users WHERE user_id=?').get(user_id);
   if (exists) return res.status(409).json({ error: 'user_id already exists' });
+  if (employee_id) {
+    const dupEmp = db.prepare('SELECT 1 FROM users WHERE employee_id=?').get(employee_id);
+    if (dupEmp) return res.status(409).json({ error: 'employee_id already exists' });
+  }
 
   const hash = hashPassword(password);
-  const r = db.prepare(`INSERT INTO users(user_id,name,email,password_hash,role_id,department_id,role,department)
-                        VALUES (?,?,?,?,?,?,?,?)`)
-    .run(user_id, name, email||'', hash, role.id, dept.id, role.name, dept.name);
-  audit(req.user, 'CREATE', 'User', user_id, `Role ${role.name} / Dept ${dept.name}`);
-  res.json({ id: r.lastInsertRowid, user_id, name, role: role.name, department: dept.name });
+  const r = db.prepare(`INSERT INTO users(user_id,employee_id,name,email,phone,password_hash,role_id,department_id,role,department)
+                        VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(user_id, employee_id || null, name, email||'', phone||'', hash, role.id, dept.id, role.name, dept.name);
+  audit(req.user, 'CREATE', 'User', user_id, `Created ${name} (${employee_id || 'no emp id'}) — Role: ${role.name}, Dept: ${dept.name}`);
+  res.json({ id: r.lastInsertRowid, user_id, employee_id, name, role: role.name, department: dept.name });
 });
 
 app.put('/api/users/:user_id', requireAuth, requireActivity('manage_users'), (req, res) => {
-  const { name, email, role_id, department_id, password } = req.body || {};
+  const { employee_id, name, email, phone, role_id, department_id, password } = req.body || {};
   const u = db.prepare('SELECT * FROM users WHERE user_id=?').get(req.params.user_id);
   if (!u) return res.status(404).json({ error: 'Not found' });
 
@@ -339,29 +400,63 @@ app.put('/api/users/:user_id', requireAuth, requireActivity('manage_users'), (re
     dept = db.prepare('SELECT id,name FROM departments WHERE id=?').get(dId);
     if (!dept) return res.status(400).json({ error: 'Unknown department_id' });
   }
+  if (employee_id && employee_id !== u.employee_id) {
+    const dup = db.prepare('SELECT 1 FROM users WHERE employee_id=? AND user_id!=?').get(employee_id, req.params.user_id);
+    if (dup) return res.status(409).json({ error: 'employee_id already exists' });
+  }
+
+  const changes = [];
+  if (name && name !== u.name)             changes.push(`name "${u.name}" -> "${name}"`);
+  if (email && email !== u.email)          changes.push('email updated');
+  if (phone && phone !== u.phone)          changes.push('phone updated');
+  if (employee_id && employee_id !== u.employee_id) changes.push(`emp_id "${u.employee_id||'-'}" -> "${employee_id}"`);
+  if (role && role.id !== u.role_id)       changes.push(`role "${u.role}" -> "${role.name}"`);
+  if (dept && dept.id !== u.department_id) changes.push(`dept "${u.department}" -> "${dept.name}"`);
+  if (password)                            changes.push('password changed');
 
   db.prepare(`UPDATE users SET
+      employee_id = COALESCE(?,employee_id),
       name = COALESCE(?,name),
       email = COALESCE(?,email),
+      phone = COALESCE(?,phone),
       role_id = COALESCE(?,role_id),
       department_id = COALESCE(?,department_id),
       role = COALESCE(?,role),
       department = COALESCE(?,department),
       password_hash = COALESCE(?,password_hash)
     WHERE user_id=?`)
-    .run(name, email, role?.id || null, dept?.id || null,
+    .run(employee_id, name, email, phone, role?.id || null, dept?.id || null,
          role?.name || null, dept?.name || null,
          password ? hashPassword(password) : null,
          req.params.user_id);
-  audit(req.user, 'UPDATE', 'User', req.params.user_id, 'User profile updated');
+  audit(req.user, 'UPDATE', 'User', req.params.user_id, changes.length ? changes.join('; ') : 'User profile touched');
   res.json({ ok: true });
 });
 
 app.put('/api/users/:user_id/status', requireAuth, requireActivity('manage_users'), (req, res) => {
   const { status } = req.body;
   if (!['Active','Locked','Inactive'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
+  const before = db.prepare('SELECT status FROM users WHERE user_id=?').get(req.params.user_id);
+  if (!before) return res.status(404).json({ error: 'Not found' });
   db.prepare('UPDATE users SET status=? WHERE user_id=?').run(status, req.params.user_id);
-  audit(req.user, 'UPDATE', 'User', req.params.user_id, `Status set to ${status}`);
+  // Kill active sessions if deactivating/locking
+  if (status !== 'Active') {
+    db.prepare('DELETE FROM sessions WHERE user_id=(SELECT id FROM users WHERE user_id=?)').run(req.params.user_id);
+  }
+  audit(req.user, 'UPDATE', 'User', req.params.user_id, `Status changed: ${before.status} -> ${status}`);
+  res.json({ ok: true });
+});
+
+// Admin-driven password reset
+app.put('/api/users/:user_id/password', requireAuth, requireActivity('manage_users'), (req, res) => {
+  const { password } = req.body || {};
+  if (!password || password.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
+  const u = db.prepare('SELECT id, name FROM users WHERE user_id=?').get(req.params.user_id);
+  if (!u) return res.status(404).json({ error: 'Not found' });
+  db.prepare('UPDATE users SET password_hash=? WHERE user_id=?').run(hashPassword(password), req.params.user_id);
+  // Invalidate sessions so the user must re-login with the new password
+  db.prepare('DELETE FROM sessions WHERE user_id=?').run(u.id);
+  audit(req.user, 'RESET_PASSWORD', 'User', req.params.user_id, `Password reset for ${u.name}; sessions invalidated`);
   res.json({ ok: true });
 });
 
@@ -370,8 +465,66 @@ app.put('/api/users/:user_id/status', requireAuth, requireActivity('manage_users
 // =============================================================
 app.get('/api/frequencies', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM frequencies ORDER BY days').all()));
 app.get('/api/pm-categories', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM pm_categories ORDER BY name').all()));
-app.get('/api/checklist-groups', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM checklist_groups ORDER BY name').all()));
-app.get('/api/checklists', requireAuth, (req,res) => res.json(db.prepare('SELECT id,name,group_id,version,status FROM checklists ORDER BY id').all()));
+app.get('/api/checklist-groups', requireAuth, (req,res) => res.json(db.prepare(`
+  SELECT cg.id, cg.name, cg.department_id, COALESCE(d.name, cg.department) AS department
+  FROM checklist_groups cg LEFT JOIN departments d ON d.id = cg.department_id
+  ORDER BY cg.name`).all()));
+
+app.post('/api/checklist-groups', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
+  const { name, department_id } = req.body || {};
+  if (!name) return res.status(400).json({ error: 'name required' });
+  const exists = db.prepare('SELECT 1 FROM checklist_groups WHERE name=?').get(name);
+  if (exists) return res.status(409).json({ error: 'group already exists' });
+  let dName = null;
+  if (department_id) {
+    const d = db.prepare('SELECT name FROM departments WHERE id=?').get(department_id);
+    if (!d) return res.status(400).json({ error: 'Unknown department_id' });
+    dName = d.name;
+  }
+  const r = db.prepare('INSERT INTO checklist_groups(name,department_id,department) VALUES (?,?,?)').run(name, department_id || null, dName);
+  audit(req.user, 'CREATE', 'ChecklistGroup', r.lastInsertRowid, `"${name}"${dName ? ' under ' + dName : ''}`);
+  res.json({ id: r.lastInsertRowid, name, department_id, department: dName });
+});
+
+app.put('/api/checklist-groups/:id', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
+  const { name, department_id } = req.body || {};
+  let dName = null;
+  if (department_id) {
+    const d = db.prepare('SELECT name FROM departments WHERE id=?').get(department_id);
+    if (!d) return res.status(400).json({ error: 'Unknown department_id' });
+    dName = d.name;
+  }
+  const r = db.prepare('UPDATE checklist_groups SET name=COALESCE(?,name), department_id=COALESCE(?,department_id), department=COALESCE(?,department) WHERE id=?')
+    .run(name, department_id || null, dName, req.params.id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  audit(req.user, 'UPDATE', 'ChecklistGroup', req.params.id, `Updated`);
+  res.json({ ok: true });
+});
+
+app.delete('/api/checklist-groups/:id', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
+  const inUse = db.prepare('SELECT COUNT(*) n FROM checklists WHERE group_id=?').get(req.params.id).n;
+  if (inUse > 0) return res.status(409).json({ error: `Cannot delete — ${inUse} checklist(s) belong to this group.` });
+  const r = db.prepare('DELETE FROM checklist_groups WHERE id=?').run(req.params.id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  audit(req.user, 'DELETE', 'ChecklistGroup', req.params.id, 'Group deleted');
+  res.json({ ok: true });
+});
+app.get('/api/checklists', requireAuth, (req,res) => {
+  const { status } = req.query;
+  const where = status ? 'WHERE cl.status = ?' : '';
+  const args = status ? [status] : [];
+  res.json(db.prepare(`
+    SELECT cl.id, cl.name, cl.group_id, cl.version, cl.status,
+           cl.reviewer_id, cl.approver_id, cl.created_by,
+           cb.name AS created_by_name, rv.name AS reviewer_name, ap.name AS approver_name
+    FROM checklists cl
+    LEFT JOIN users cb ON cb.id = cl.created_by
+    LEFT JOIN users rv ON rv.id = cl.reviewer_id
+    LEFT JOIN users ap ON ap.id = cl.approver_id
+    ${where}
+    ORDER BY cl.id
+  `).all(...args));
+});
 app.get('/api/checklists/:id', requireAuth, (req,res) => {
   const row = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
   if (!row) return res.status(404).json({ error: 'Not found' });
@@ -900,7 +1053,7 @@ app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (
   if (!name) return res.status(400).json({ error: 'name required' });
   const r = db.prepare(`INSERT INTO checklists(name,description,group_id,category_id,version,status,created_by)
                         VALUES (?,?,?,?,?,?,?)`)
-    .run(name, description || '', group_id || null, category_id || null, version || 'v1.0', 'Active', req.user.id);
+    .run(name, description || '', group_id || null, category_id || null, version || 'v1.0', 'Draft', req.user.id);
   const newId = r.lastInsertRowid;
   if (Array.isArray(sections)) {
     const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
@@ -923,6 +1076,10 @@ app.put('/api/checklists/:id', requireAuth, requireActivity('manage_checklists')
   const { name, description, group_id, category_id, version, status, sections } = req.body || {};
   const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
   if (!cl) return res.status(404).json({ error: 'Not found' });
+  // Only allow content edits while in Draft / Rejected. Approved checklists are locked.
+  if (!['Draft','Rejected'].includes(cl.status) && (sections || name || description)) {
+    return res.status(409).json({ error: `Cannot edit checklist in status "${cl.status}". Bump the version or push back to Draft.` });
+  }
   db.prepare(`UPDATE checklists SET
       name=COALESCE(?,name),
       description=COALESCE(?,description),
@@ -962,6 +1119,96 @@ app.delete('/api/checklists/:id', requireAuth, requireActivity('manage_checklist
   res.json({ ok: true });
 });
 
+// ---- Checklist workflow: Initiator -> Reviewer -> Approver ----
+// Draft  ->[submit]-> Pending Review ->[review]-> Pending Approval ->[approve]-> Approved
+//                                                          \-> Rejected (any stage with rejection_reason)
+app.put('/api/checklists/:id/submit', requireAuth, requireActivity('manage_checklists'), (req, res) => {
+  const { reviewer_id, approver_id } = req.body || {};
+  const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
+  if (!cl) return res.status(404).json({ error: 'Not found' });
+  if (!['Draft','Rejected'].includes(cl.status)) return res.status(409).json({ error: `Cannot submit from status "${cl.status}"` });
+  if (!reviewer_id || !approver_id) return res.status(400).json({ error: 'reviewer_id and approver_id required' });
+  if (reviewer_id === approver_id) return res.status(400).json({ error: 'Reviewer and approver must be different users' });
+  const reviewer = db.prepare('SELECT id, name FROM users WHERE id=?').get(reviewer_id);
+  const approver = db.prepare('SELECT id, name FROM users WHERE id=?').get(approver_id);
+  if (!reviewer || !approver) return res.status(400).json({ error: 'Unknown reviewer or approver' });
+  // Must have at least one section with at least one question to be submittable
+  const sectionCount = db.prepare('SELECT COUNT(*) n FROM checklist_sections WHERE checklist_id=?').get(req.params.id).n;
+  if (sectionCount === 0) return res.status(409).json({ error: 'Add at least one section + question before submitting' });
+
+  db.prepare(`UPDATE checklists SET
+      status='Pending Review', reviewer_id=?, approver_id=?,
+      submitted_at=datetime('now'), reviewed_at=NULL, approved_at=NULL, rejection_reason=NULL
+    WHERE id=?`).run(reviewer_id, approver_id, req.params.id);
+  notify(reviewer_id,
+    'Checklist awaiting your review',
+    `${cl.name} (${cl.version}) submitted by ${req.user.name}.`,
+    'checklist_review',
+    `/checklists/${req.params.id}`);
+  audit(req.user, 'SUBMIT', 'Checklist', req.params.id, `Submitted "${cl.name}" for review (reviewer: ${reviewer.name}, approver: ${approver.name})`);
+  res.json({ ok: true });
+});
+
+app.put('/api/checklists/:id/review', requireAuth, requireActivity('review_checklist'), (req, res) => {
+  const { decision, reason } = req.body || {};
+  const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
+  if (!cl) return res.status(404).json({ error: 'Not found' });
+  if (cl.status !== 'Pending Review') return res.status(409).json({ error: `Not in Pending Review (currently ${cl.status})` });
+  if (cl.reviewer_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assigned reviewer can review this checklist' });
+  if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+
+  if (decision === 'approve') {
+    db.prepare("UPDATE checklists SET status='Pending Approval', reviewed_at=datetime('now') WHERE id=?").run(req.params.id);
+    notify(cl.approver_id,
+      'Checklist awaiting your approval',
+      `${cl.name} (${cl.version}) reviewed by ${req.user.name}.`,
+      'checklist_approve',
+      `/checklists/${req.params.id}`);
+    audit(req.user, 'REVIEW', 'Checklist', req.params.id, `Reviewed "${cl.name}" — passed to approver`);
+  } else {
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'reason required for rejection' });
+    db.prepare("UPDATE checklists SET status='Rejected', rejection_reason=? WHERE id=?").run(reason, req.params.id);
+    notify(cl.created_by,
+      'Checklist rejected by reviewer',
+      `${cl.name}: ${reason}`,
+      'checklist_rejected',
+      `/checklists/${req.params.id}`);
+    audit(req.user, 'REJECT', 'Checklist', req.params.id, `Rejected at review: ${reason}`);
+  }
+  res.json({ ok: true });
+});
+
+app.put('/api/checklists/:id/approve', requireAuth, requireActivity('approve_checklist'), (req, res) => {
+  const { decision, reason } = req.body || {};
+  const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
+  if (!cl) return res.status(404).json({ error: 'Not found' });
+  if (cl.status !== 'Pending Approval') return res.status(409).json({ error: `Not in Pending Approval (currently ${cl.status})` });
+  if (cl.approver_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assigned approver can approve this checklist' });
+
+  if (decision === 'reject') {
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'reason required for rejection' });
+    db.prepare("UPDATE checklists SET status='Rejected', rejection_reason=? WHERE id=?").run(reason, req.params.id);
+    notify(cl.created_by,
+      'Checklist rejected by approver',
+      `${cl.name}: ${reason}`,
+      'checklist_rejected',
+      `/checklists/${req.params.id}`);
+    audit(req.user, 'REJECT', 'Checklist', req.params.id, `Rejected at approval: ${reason}`);
+  } else {
+    db.prepare("UPDATE checklists SET status='Approved', approved_at=datetime('now') WHERE id=?").run(req.params.id);
+    notify(cl.created_by,
+      'Checklist approved',
+      `${cl.name} (${cl.version}) is now approved and available for assignment.`,
+      'checklist_approved',
+      `/checklists/${req.params.id}`);
+    if (cl.reviewer_id && cl.reviewer_id !== req.user.id) {
+      notify(cl.reviewer_id, 'Checklist approved', `${cl.name} (${cl.version}) has been approved.`, 'checklist_approved', `/checklists/${req.params.id}`);
+    }
+    audit(req.user, 'APPROVE', 'Checklist', req.params.id, `Approved "${cl.name}" (${cl.version}) — available for assignment`);
+  }
+  res.json({ ok: true });
+});
+
 // =============================================================
 // CHECKLIST ASSIGNMENTS — manager assigns checklist to user; user is notified
 // =============================================================
@@ -980,12 +1227,18 @@ app.get('/api/assignments', requireAuth, (req, res) => {
   if (mine === '1') { where.push('ca.assignee_id = ?'); args.push(req.user.id); }
   if (status)       { where.push('ca.status = ?');     args.push(status); }
   const sql = `
-    SELECT ca.id, ca.assignment_id, ca.checklist_id, ca.assignee_id, ca.frequency_id,
+    SELECT ca.id, ca.assignment_id, ca.checklist_id, ca.target_type, ca.target_id,
+           ca.assignee_id, ca.frequency_id,
            ca.due_date, ca.status, ca.notes, ca.assigned_at, ca.started_at, ca.completed_at,
            cl.name AS checklist_name, cl.version AS checklist_version,
            u.name AS assignee_name, u.user_id AS assignee_user_id,
            b.name AS assigned_by_name,
-           f.name AS frequency
+           f.name AS frequency,
+           CASE ca.target_type
+             WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
+             WHEN 'area'      THEN (SELECT area_type FROM areas WHERE area_id = ca.target_id)
+             ELSE NULL
+           END AS target_label
     FROM checklist_assignments ca
     LEFT JOIN checklists cl ON cl.id = ca.checklist_id
     LEFT JOIN users u ON u.id = ca.assignee_id
@@ -1001,7 +1254,12 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
   const row = db.prepare(`
     SELECT ca.*, cl.name AS checklist_name, cl.version AS checklist_version,
            u.name AS assignee_name, u.user_id AS assignee_user_id,
-           b.name AS assigned_by_name, f.name AS frequency
+           b.name AS assigned_by_name, f.name AS frequency,
+           CASE ca.target_type
+             WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
+             WHEN 'area'      THEN (SELECT area_type FROM areas WHERE area_id = ca.target_id)
+             ELSE NULL
+           END AS target_label
     FROM checklist_assignments ca
     LEFT JOIN checklists cl ON cl.id = ca.checklist_id
     LEFT JOIN users u ON u.id = ca.assignee_id
@@ -1015,36 +1273,74 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
 });
 
 app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (req, res) => {
-  const { checklist_id, assignee_id, frequency_id, due_date, notes } = req.body || {};
-  if (!checklist_id || !assignee_id) return res.status(400).json({ error: 'checklist_id and assignee_id required' });
-  const cl = db.prepare('SELECT id, name FROM checklists WHERE id=?').get(checklist_id);
+  const { checklist_id, target_type, target_id, assignee_id, frequency_id, due_date, notes } = req.body || {};
+  if (!checklist_id || !target_type || !target_id) {
+    return res.status(400).json({ error: 'checklist_id, target_type and target_id required' });
+  }
+  if (!['equipment','area'].includes(target_type)) {
+    return res.status(400).json({ error: 'target_type must be "equipment" or "area"' });
+  }
+  const cl = db.prepare('SELECT id, name, status FROM checklists WHERE id=?').get(checklist_id);
   if (!cl) return res.status(400).json({ error: 'Unknown checklist_id' });
-  const u = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
-  if (!u) return res.status(400).json({ error: 'Unknown assignee_id' });
+  if (cl.status !== 'Approved') {
+    return res.status(409).json({ error: `Cannot assign — checklist is "${cl.status}". Only Approved checklists can be assigned.` });
+  }
+  // Validate target exists
+  let targetName = '';
+  if (target_type === 'equipment') {
+    const eq = db.prepare('SELECT equipment_id, name FROM equipment WHERE equipment_id=?').get(target_id);
+    if (!eq) return res.status(400).json({ error: 'Unknown equipment_id' });
+    targetName = `${eq.equipment_id} (${eq.name})`;
+  } else {
+    const ar = db.prepare('SELECT area_id, area_type FROM areas WHERE area_id=?').get(target_id);
+    if (!ar) return res.status(400).json({ error: 'Unknown area_id' });
+    targetName = `${ar.area_id} (${ar.area_type})`;
+  }
+  let assignee = null;
+  if (assignee_id) {
+    assignee = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
+    if (!assignee) return res.status(400).json({ error: 'Unknown assignee_id' });
+  }
 
   const aid = nextAssignmentId();
-  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,assignee_id,frequency_id,due_date,notes,status,assigned_by)
-              VALUES (?,?,?,?,?,?,?,?)`)
-    .run(aid, checklist_id, assignee_id, frequency_id || null, due_date || null, notes || '', 'Pending', req.user.id);
+  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,frequency_id,due_date,notes,status,assigned_by)
+              VALUES (?,?,?,?,?,?,?,?,?,?)`)
+    .run(aid, checklist_id, target_type, target_id, assignee_id || null, frequency_id || null, due_date || null, notes || '', 'Pending', req.user.id);
 
-  notify(assignee_id,
-    'New checklist assigned',
-    `${cl.name}${due_date ? ' — due ' + due_date : ''}. Assigned by ${req.user.name}.`,
-    'assignment',
-    `/assignments/${aid}`);
+  if (assignee_id) {
+    notify(assignee_id,
+      'New checklist assigned',
+      `${cl.name} on ${target_type} ${targetName}${due_date ? ' — due ' + due_date : ''}. Assigned by ${req.user.name}.`,
+      'assignment',
+      `/assignments/${aid}`);
+  }
 
-  audit(req.user, 'ASSIGN', 'Checklist', aid, `Assigned "${cl.name}" to ${u.name}`);
+  audit(req.user, 'ASSIGN', 'Checklist', aid,
+    `Assigned "${cl.name}" to ${target_type} ${targetName}` + (assignee ? `; assignee: ${assignee.name}` : '; no specific assignee'));
   res.json(db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(aid));
 });
+
+function canTakeAssignment(a, user) {
+  if (user.is_admin) return true;
+  if (a.assignee_id && a.assignee_id === user.id) return true;
+  // Open assignment (no fixed assignee) — anyone with execute_checklist can pick it up
+  if (!a.assignee_id && userHasActivity(user, 'execute_checklist')) return true;
+  return false;
+}
 
 app.put('/api/assignments/:assignment_id/start', requireAuth, (req, res) => {
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
-  if (a.assignee_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assignee can start this assignment' });
+  if (!canTakeAssignment(a, req.user)) return res.status(403).json({ error: 'You are not authorized to start this assignment' });
   if (!['Pending'].includes(a.status)) return res.status(409).json({ error: `Cannot start from status ${a.status}` });
+  // If unclaimed, claim it for the current user
+  if (!a.assignee_id) {
+    db.prepare("UPDATE checklist_assignments SET assignee_id=? WHERE assignment_id=?").run(req.user.id, req.params.assignment_id);
+  }
   db.prepare("UPDATE checklist_assignments SET status='In Progress', started_at=datetime('now') WHERE assignment_id=?")
     .run(req.params.assignment_id);
-  audit(req.user, 'START', 'Checklist', req.params.assignment_id, 'Assignment started');
+  audit(req.user, 'START', 'Checklist', req.params.assignment_id,
+    `Assignment started${!a.assignee_id ? ' (claimed open assignment)' : ''}`);
   res.json({ ok: true });
 });
 
@@ -1052,8 +1348,12 @@ app.put('/api/assignments/:assignment_id/complete', requireAuth, (req, res) => {
   const { response_data, notes } = req.body || {};
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
-  if (a.assignee_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assignee can complete this assignment' });
+  if (!canTakeAssignment(a, req.user)) return res.status(403).json({ error: 'You are not authorized to complete this assignment' });
   if (!['Pending','In Progress'].includes(a.status)) return res.status(409).json({ error: `Cannot complete from status ${a.status}` });
+  // Claim if open
+  if (!a.assignee_id) {
+    db.prepare("UPDATE checklist_assignments SET assignee_id=? WHERE assignment_id=?").run(req.user.id, req.params.assignment_id);
+  }
   db.prepare(`UPDATE checklist_assignments SET
       status='Completed',
       completed_at=datetime('now'),
@@ -1070,7 +1370,8 @@ app.put('/api/assignments/:assignment_id/complete', requireAuth, (req, res) => {
       'assignment',
       `/assignments/${req.params.assignment_id}`);
   }
-  audit(req.user, 'COMPLETE', 'Checklist', req.params.assignment_id, 'Assignment completed');
+  audit(req.user, 'COMPLETE', 'Checklist', req.params.assignment_id,
+    `Assignment ${req.params.assignment_id} completed by ${req.user.name}`);
   res.json({ ok: true });
 });
 
