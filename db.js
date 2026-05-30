@@ -211,7 +211,9 @@ function createSchema() {
     );
 
     -- Checklist assignment: manager assigns an approved checklist to an equipment or area,
-    -- plus a specific user who is responsible for executing it.
+    -- plus an executor + reviewer + approver for the execution workflow.
+    -- Lifecycle: Pending -> In Progress (executor) -> Pending Review -> Pending Approval -> Completed
+    --           or -> Rejected (from review/approval; goes back to In Progress on rework).
     CREATE TABLE IF NOT EXISTS checklist_assignments (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       assignment_id TEXT UNIQUE NOT NULL,
@@ -219,14 +221,23 @@ function createSchema() {
       target_type TEXT NOT NULL,
       target_id TEXT NOT NULL,
       assignee_id INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
       frequency_id INTEGER REFERENCES frequencies(id),
       due_date TEXT,
       status TEXT NOT NULL DEFAULT 'Pending',
       response_data TEXT,
       notes TEXT,
+      executor_sig TEXT,
+      reviewer_sig TEXT,
+      approver_sig TEXT,
+      rejection_reason TEXT,
       assigned_by INTEGER REFERENCES users(id),
       assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
       started_at TEXT,
+      submitted_at TEXT,
+      reviewed_at TEXT,
+      approved_at TEXT,
       completed_at TEXT
     );
 
@@ -580,10 +591,11 @@ function seed() {
     .run(completedData, fmt(addDays(today, -16))+' 09:15:00', fmt(addDays(today,-16))+' 11:20:00','S. Naidu','R. Mehta','S. Iyer');
 
   // Sample checklist assignment with notification (target = equipment)
-  ins('INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,frequency_id,due_date,status,assigned_by) VALUES (?,?,?,?,?,?,?,?,?)')
-    .run('CA-001', ahuCl, 'equipment', 'EQ-AHU-12', u('snaidu'),
+  // Workflow: Executor snaidu -> Reviewer rmehta -> Approver qaapprove
+  ins('INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,due_date,status,assigned_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+    .run('CA-001', ahuCl, 'equipment', 'EQ-AHU-12', u('snaidu'), u('rmehta'), u('qaapprove'),
          db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
-         fmt(addDays(today, 3)), 'Pending', u('admin'));
+         fmt(addDays(today, 3)), 'Pending', u('siyer'));
   ins('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
     .run(u('snaidu'),
          'New checklist assigned',

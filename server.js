@@ -1221,19 +1221,25 @@ function nextAssignmentId() {
 }
 
 app.get('/api/assignments', requireAuth, (req, res) => {
-  const { mine, status } = req.query;
+  const { mine, status, inbox } = req.query;
+  // "inbox=1" means: anything where the user is executor / reviewer / approver
   const where = [];
   const args = [];
-  if (mine === '1') { where.push('ca.assignee_id = ?'); args.push(req.user.id); }
-  if (status)       { where.push('ca.status = ?');     args.push(status); }
+  if (mine === '1')  { where.push('ca.assignee_id = ?'); args.push(req.user.id); }
+  if (inbox === '1') { where.push('(ca.assignee_id = ? OR ca.reviewer_id = ? OR ca.approver_id = ?)'); args.push(req.user.id, req.user.id, req.user.id); }
+  if (status)        { where.push('ca.status = ?');     args.push(status); }
   const sql = `
     SELECT ca.id, ca.assignment_id, ca.checklist_id, ca.target_type, ca.target_id,
-           ca.assignee_id, ca.frequency_id,
-           ca.due_date, ca.status, ca.notes, ca.assigned_at, ca.started_at, ca.completed_at,
+           ca.assignee_id, ca.reviewer_id, ca.approver_id, ca.frequency_id,
+           ca.due_date, ca.status, ca.notes, ca.assigned_at, ca.started_at,
+           ca.submitted_at, ca.reviewed_at, ca.approved_at, ca.completed_at,
+           ca.rejection_reason,
            cl.name AS checklist_name, cl.version AS checklist_version,
-           u.name AS assignee_name, u.user_id AS assignee_user_id,
-           b.name AS assigned_by_name,
-           f.name AS frequency,
+           u.name  AS assignee_name, u.user_id  AS assignee_user_id,
+           rv.name AS reviewer_name, rv.user_id AS reviewer_user_id,
+           ap.name AS approver_name, ap.user_id AS approver_user_id,
+           b.name  AS assigned_by_name,
+           f.name  AS frequency,
            CASE ca.target_type
              WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
              WHEN 'area'      THEN (SELECT area_type FROM areas WHERE area_id = ca.target_id)
@@ -1241,8 +1247,10 @@ app.get('/api/assignments', requireAuth, (req, res) => {
            END AS target_label
     FROM checklist_assignments ca
     LEFT JOIN checklists cl ON cl.id = ca.checklist_id
-    LEFT JOIN users u ON u.id = ca.assignee_id
-    LEFT JOIN users b ON b.id = ca.assigned_by
+    LEFT JOIN users u   ON u.id   = ca.assignee_id
+    LEFT JOIN users rv  ON rv.id  = ca.reviewer_id
+    LEFT JOIN users ap  ON ap.id  = ca.approver_id
+    LEFT JOIN users b   ON b.id   = ca.assigned_by
     LEFT JOIN frequencies f ON f.id = ca.frequency_id
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY ca.due_date IS NULL, ca.due_date ASC, ca.id DESC
@@ -1253,8 +1261,10 @@ app.get('/api/assignments', requireAuth, (req, res) => {
 app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
   const row = db.prepare(`
     SELECT ca.*, cl.name AS checklist_name, cl.version AS checklist_version,
-           u.name AS assignee_name, u.user_id AS assignee_user_id,
-           b.name AS assigned_by_name, f.name AS frequency,
+           u.name  AS assignee_name, u.user_id  AS assignee_user_id,
+           rv.name AS reviewer_name, rv.user_id AS reviewer_user_id,
+           ap.name AS approver_name, ap.user_id AS approver_user_id,
+           b.name  AS assigned_by_name, f.name AS frequency,
            CASE ca.target_type
              WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
              WHEN 'area'      THEN (SELECT area_type FROM areas WHERE area_id = ca.target_id)
@@ -1262,8 +1272,10 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
            END AS target_label
     FROM checklist_assignments ca
     LEFT JOIN checklists cl ON cl.id = ca.checklist_id
-    LEFT JOIN users u ON u.id = ca.assignee_id
-    LEFT JOIN users b ON b.id = ca.assigned_by
+    LEFT JOIN users u   ON u.id   = ca.assignee_id
+    LEFT JOIN users rv  ON rv.id  = ca.reviewer_id
+    LEFT JOIN users ap  ON ap.id  = ca.approver_id
+    LEFT JOIN users b   ON b.id   = ca.assigned_by
     LEFT JOIN frequencies f ON f.id = ca.frequency_id
     WHERE ca.assignment_id = ?`).get(req.params.assignment_id);
   if (!row) return res.status(404).json({ error: 'Not found' });
@@ -1273,14 +1285,15 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
 });
 
 app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (req, res) => {
-  const { checklist_id, target_type, target_id, assignee_id, frequency_id, due_date, notes } = req.body || {};
+  const { checklist_id, target_type, target_id, assignee_id, reviewer_id, approver_id, frequency_id, due_date, notes } = req.body || {};
   if (!checklist_id || !target_type || !target_id) {
     return res.status(400).json({ error: 'checklist_id, target_type and target_id required' });
   }
+  if (!assignee_id) return res.status(400).json({ error: 'assignee_id (executor) required' });
   if (!['equipment','area'].includes(target_type)) {
     return res.status(400).json({ error: 'target_type must be "equipment" or "area"' });
   }
-  const cl = db.prepare('SELECT id, name, status FROM checklists WHERE id=?').get(checklist_id);
+  const cl = db.prepare('SELECT id, name, status, reviewer_id AS template_reviewer, approver_id AS template_approver FROM checklists WHERE id=?').get(checklist_id);
   if (!cl) return res.status(400).json({ error: 'Unknown checklist_id' });
   if (cl.status !== 'Approved') {
     return res.status(409).json({ error: `Cannot assign — checklist is "${cl.status}". Only Approved checklists can be assigned.` });
@@ -1296,82 +1309,181 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
     if (!ar) return res.status(400).json({ error: 'Unknown area_id' });
     targetName = `${ar.area_id} (${ar.area_type})`;
   }
-  let assignee = null;
-  if (assignee_id) {
-    assignee = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
-    if (!assignee) return res.status(400).json({ error: 'Unknown assignee_id' });
+  const assignee = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
+  if (!assignee) return res.status(400).json({ error: 'Unknown assignee_id' });
+
+  // Reviewer/approver: default to checklist's template reviewer/approver if not given.
+  const finalReviewer = reviewer_id || cl.template_reviewer;
+  const finalApprover = approver_id || cl.template_approver;
+  if (!finalReviewer || !finalApprover) {
+    return res.status(400).json({ error: 'reviewer_id and approver_id are required (checklist has no defaults)' });
   }
+  if (finalReviewer === finalApprover) {
+    return res.status(400).json({ error: 'Reviewer and approver must be different users' });
+  }
+  if (finalReviewer === assignee.id || finalApprover === assignee.id) {
+    return res.status(400).json({ error: 'Executor cannot also be their own reviewer or approver' });
+  }
+  const rv = db.prepare('SELECT id, name FROM users WHERE id=?').get(finalReviewer);
+  const ap = db.prepare('SELECT id, name FROM users WHERE id=?').get(finalApprover);
+  if (!rv || !ap) return res.status(400).json({ error: 'Unknown reviewer/approver' });
 
   const aid = nextAssignmentId();
-  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,frequency_id,due_date,notes,status,assigned_by)
-              VALUES (?,?,?,?,?,?,?,?,?,?)`)
-    .run(aid, checklist_id, target_type, target_id, assignee_id || null, frequency_id || null, due_date || null, notes || '', 'Pending', req.user.id);
+  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,due_date,notes,status,assigned_by)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(aid, checklist_id, target_type, target_id, assignee.id, rv.id, ap.id, frequency_id || null, due_date || null, notes || '', 'Pending', req.user.id);
 
-  if (assignee_id) {
-    notify(assignee_id,
-      'New checklist assigned',
-      `${cl.name} on ${target_type} ${targetName}${due_date ? ' — due ' + due_date : ''}. Assigned by ${req.user.name}.`,
-      'assignment',
-      `/assignments/${aid}`);
-  }
+  notify(assignee.id,
+    'New PM activity assigned',
+    `${cl.name} on ${target_type} ${targetName}${due_date ? ' — due ' + due_date : ''}. Assigned by ${req.user.name}.`,
+    'assignment',
+    `/assignments/${aid}`);
 
   audit(req.user, 'ASSIGN', 'Checklist', aid,
-    `Assigned "${cl.name}" to ${target_type} ${targetName}` + (assignee ? `; assignee: ${assignee.name}` : '; no specific assignee'));
+    `Assigned "${cl.name}" to ${target_type} ${targetName} — Executor: ${assignee.name}, Reviewer: ${rv.name}, Approver: ${ap.name}`);
   res.json(db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(aid));
 });
 
-function canTakeAssignment(a, user) {
+function isExecutor(a, user) {
   if (user.is_admin) return true;
   if (a.assignee_id && a.assignee_id === user.id) return true;
-  // Open assignment (no fixed assignee) — anyone with execute_checklist can pick it up
+  // Open assignment — first taker claims it
   if (!a.assignee_id && userHasActivity(user, 'execute_checklist')) return true;
   return false;
 }
 
+// Executor begins work
 app.put('/api/assignments/:assignment_id/start', requireAuth, (req, res) => {
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
-  if (!canTakeAssignment(a, req.user)) return res.status(403).json({ error: 'You are not authorized to start this assignment' });
+  if (!isExecutor(a, req.user)) return res.status(403).json({ error: 'Only the assigned executor can start this assignment' });
   if (!['Pending'].includes(a.status)) return res.status(409).json({ error: `Cannot start from status ${a.status}` });
-  // If unclaimed, claim it for the current user
   if (!a.assignee_id) {
     db.prepare("UPDATE checklist_assignments SET assignee_id=? WHERE assignment_id=?").run(req.user.id, req.params.assignment_id);
   }
   db.prepare("UPDATE checklist_assignments SET status='In Progress', started_at=datetime('now') WHERE assignment_id=?")
     .run(req.params.assignment_id);
-  audit(req.user, 'START', 'Checklist', req.params.assignment_id,
-    `Assignment started${!a.assignee_id ? ' (claimed open assignment)' : ''}`);
+  audit(req.user, 'START', 'Assignment', req.params.assignment_id,
+    `Assignment started by ${req.user.name}${!a.assignee_id ? ' (claimed open assignment)' : ''}`);
   res.json({ ok: true });
 });
 
-app.put('/api/assignments/:assignment_id/complete', requireAuth, (req, res) => {
+// Executor saves partial progress without changing status (autosave-like).
+app.put('/api/assignments/:assignment_id/save', requireAuth, (req, res) => {
   const { response_data, notes } = req.body || {};
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
-  if (!canTakeAssignment(a, req.user)) return res.status(403).json({ error: 'You are not authorized to complete this assignment' });
-  if (!['Pending','In Progress'].includes(a.status)) return res.status(409).json({ error: `Cannot complete from status ${a.status}` });
+  if (!isExecutor(a, req.user)) return res.status(403).json({ error: 'Only the executor can save progress' });
+  if (!['Pending','In Progress'].includes(a.status)) return res.status(409).json({ error: `Cannot save from status ${a.status}` });
+  if (a.status === 'Pending') {
+    db.prepare("UPDATE checklist_assignments SET status='In Progress', started_at=COALESCE(started_at, datetime('now')), assignee_id=COALESCE(assignee_id, ?) WHERE assignment_id=?")
+      .run(req.user.id, req.params.assignment_id);
+  }
+  db.prepare('UPDATE checklist_assignments SET response_data=?, notes=COALESCE(?,notes) WHERE assignment_id=?')
+    .run(JSON.stringify(response_data || {}), notes || null, req.params.assignment_id);
+  res.json({ ok: true });
+});
+
+// Executor submits completed work for review
+app.put('/api/assignments/:assignment_id/submit', requireAuth, (req, res) => {
+  const { response_data, notes } = req.body || {};
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (!isExecutor(a, req.user)) return res.status(403).json({ error: 'Only the executor can submit this assignment' });
+  if (!['Pending','In Progress'].includes(a.status)) return res.status(409).json({ error: `Cannot submit from status ${a.status}` });
+  if (!a.reviewer_id || !a.approver_id) return res.status(409).json({ error: 'No reviewer/approver attached to this assignment — ask the manager to set them.' });
+
   // Claim if open
   if (!a.assignee_id) {
     db.prepare("UPDATE checklist_assignments SET assignee_id=? WHERE assignment_id=?").run(req.user.id, req.params.assignment_id);
   }
+  const sig = `${req.user.name} @ ${new Date().toISOString()}`;
   db.prepare(`UPDATE checklist_assignments SET
-      status='Completed',
-      completed_at=datetime('now'),
+      status='Pending Review',
       response_data=?,
       notes=COALESCE(?,notes),
-      started_at=COALESCE(started_at, datetime('now'))
+      executor_sig=?,
+      submitted_at=datetime('now'),
+      started_at=COALESCE(started_at, datetime('now')),
+      rejection_reason=NULL
     WHERE assignment_id=?`)
-    .run(JSON.stringify(response_data || {}), notes || null, req.params.assignment_id);
-  // Notify the assigner
-  if (a.assigned_by && a.assigned_by !== req.user.id) {
-    notify(a.assigned_by,
-      'Checklist completed',
-      `${req.user.name} completed ${req.params.assignment_id}.`,
-      'assignment',
+    .run(JSON.stringify(response_data || {}), notes || null, sig, req.params.assignment_id);
+  notify(a.reviewer_id,
+    'PM activity awaiting your review',
+    `${req.params.assignment_id} submitted by ${req.user.name}.`,
+    'assignment_review',
+    `/assignments/${req.params.assignment_id}`);
+  audit(req.user, 'SUBMIT', 'Assignment', req.params.assignment_id,
+    `Submitted for review by ${req.user.name}`);
+  res.json({ ok: true });
+});
+
+// Reviewer's action: pass to approver, or reject back to executor
+app.put('/api/assignments/:assignment_id/review', requireAuth, requireActivity('review_pm','review_checklist'), (req, res) => {
+  const { decision, reason } = req.body || {};
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Pending Review') return res.status(409).json({ error: `Cannot review from status ${a.status}` });
+  if (a.reviewer_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assigned reviewer can review this assignment' });
+  if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+
+  if (decision === 'approve') {
+    const sig = `${req.user.name} @ ${new Date().toISOString()}`;
+    db.prepare("UPDATE checklist_assignments SET status='Pending Approval', reviewer_sig=?, reviewed_at=datetime('now') WHERE assignment_id=?")
+      .run(sig, req.params.assignment_id);
+    notify(a.approver_id,
+      'PM activity awaiting your approval',
+      `${req.params.assignment_id} reviewed by ${req.user.name}.`,
+      'assignment_approve',
       `/assignments/${req.params.assignment_id}`);
+    audit(req.user, 'REVIEW', 'Assignment', req.params.assignment_id, `Reviewed — passed to approver`);
+  } else {
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'reason required for rejection' });
+    db.prepare("UPDATE checklist_assignments SET status='In Progress', rejection_reason=?, reviewed_at=NULL, reviewer_sig=NULL WHERE assignment_id=?")
+      .run(reason, req.params.assignment_id);
+    if (a.assignee_id) {
+      notify(a.assignee_id,
+        'Your PM activity needs rework',
+        `${req.params.assignment_id}: ${reason}`,
+        'assignment_rejected',
+        `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'REJECT', 'Assignment', req.params.assignment_id, `Rejected at review: ${reason}`);
   }
-  audit(req.user, 'COMPLETE', 'Checklist', req.params.assignment_id,
-    `Assignment ${req.params.assignment_id} completed by ${req.user.name}`);
+  res.json({ ok: true });
+});
+
+// Approver's action: final approval or rejection back to executor
+app.put('/api/assignments/:assignment_id/approve', requireAuth, requireActivity('approve_pm','approve_checklist'), (req, res) => {
+  const { decision, reason } = req.body || {};
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Pending Approval') return res.status(409).json({ error: `Cannot approve from status ${a.status}` });
+  if (a.approver_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assigned approver can approve this assignment' });
+
+  if (decision === 'reject') {
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'reason required for rejection' });
+    db.prepare("UPDATE checklist_assignments SET status='In Progress', rejection_reason=?, approved_at=NULL, approver_sig=NULL, reviewed_at=NULL, reviewer_sig=NULL WHERE assignment_id=?")
+      .run(reason, req.params.assignment_id);
+    if (a.assignee_id) {
+      notify(a.assignee_id, 'Your PM activity was rejected by QA', `${req.params.assignment_id}: ${reason}`, 'assignment_rejected', `/assignments/${req.params.assignment_id}`);
+    }
+    if (a.reviewer_id) {
+      notify(a.reviewer_id, 'PM activity rejected by approver', `${req.params.assignment_id}: ${reason}`, 'assignment_rejected', `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'REJECT', 'Assignment', req.params.assignment_id, `Rejected at approval: ${reason}`);
+  } else {
+    const sig = `${req.user.name} @ ${new Date().toISOString()}`;
+    db.prepare("UPDATE checklist_assignments SET status='Completed', approver_sig=?, approved_at=datetime('now'), completed_at=datetime('now') WHERE assignment_id=?")
+      .run(sig, req.params.assignment_id);
+    if (a.assignee_id) {
+      notify(a.assignee_id, 'PM activity approved & closed', `${req.params.assignment_id} has been approved.`, 'assignment_completed', `/assignments/${req.params.assignment_id}`);
+    }
+    if (a.assigned_by && a.assigned_by !== req.user.id) {
+      notify(a.assigned_by, 'PM activity completed', `${req.params.assignment_id} is closed.`, 'assignment_completed', `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'APPROVE', 'Assignment', req.params.assignment_id, `Final approval — assignment closed`);
+  }
   res.json({ ok: true });
 });
 

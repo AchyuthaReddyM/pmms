@@ -1186,12 +1186,16 @@ async function markAllNotifRead() {
 async function onNotifClick(id, link) {
   try { await api('PUT', `/api/notifications/${id}/read`); } catch(e) {}
   refreshNotifBadge();
+  $('notifPanel').style.display = 'none';
   // If link points to an assignment, open it
   if (link && link.startsWith('/assignments/')) {
     const aid = link.replace('/assignments/','');
-    $('notifPanel').style.display = 'none';
     goto('tasks');
     setTimeout(() => openAssignment(aid), 300);
+  } else if (link && link.startsWith('/checklists/')) {
+    const cid = Number(link.replace('/checklists/',''));
+    goto('checklist');
+    setTimeout(() => previewChecklist(cid), 300);
   }
 }
 // Close notif panel on outside click
@@ -1554,38 +1558,61 @@ async function openChecklistBuilder(existingId) {
 // ===========================================================
 // CHECKLIST ASSIGNMENTS — MY TASKS
 // ===========================================================
-let CURRENT_TASKS_TAB = 'mine';
+let CURRENT_TASKS_TAB = 'inbox';
 
 document.querySelectorAll('#tasksTabs button').forEach(b => {
   b.addEventListener('click', () => loadTasks(b.dataset.tt));
 });
 
+function actionableForUser(a) {
+  // What's awaiting THIS user on this assignment? Returns a label or null.
+  const uid = CURRENT_USER.id;
+  if (a.status === 'Pending' && a.assignee_id === uid)         return { label: 'Start', tone: 'amber' };
+  if (a.status === 'In Progress' && a.assignee_id === uid)    return { label: 'Continue execution', tone: 'blue' };
+  if (a.status === 'Pending Review' && a.reviewer_id === uid) return { label: 'Review', tone: 'amber' };
+  if (a.status === 'Pending Approval' && a.approver_id === uid) return { label: 'Approve', tone: 'amber' };
+  return null;
+}
+
 async function loadTasks(tab) {
   CURRENT_TASKS_TAB = tab;
   document.querySelectorAll('#tasksTabs button').forEach(b => b.classList.toggle('active', b.dataset.tt === tab));
   try {
-    const url = tab === 'mine' ? '/api/assignments?mine=1' : '/api/assignments';
-    const rows = await api('GET', url);
+    let url = '/api/assignments';
+    if (tab === 'mine')  url = '/api/assignments?mine=1';
+    if (tab === 'inbox') url = '/api/assignments?inbox=1';
+    let rows = await api('GET', url);
+    if (tab === 'inbox') {
+      rows = rows.filter(a => actionableForUser(a) != null);
+    }
     $('tasksBody').innerHTML = rows.length === 0
-      ? `<tr class="empty-row"><td colspan="8">${tab==='mine'?'No assignments for you yet.':'No assignments.'}</td></tr>`
-      : rows.map(a => `<tr>
-          <td><strong>${escapeHtml(a.assignment_id)}</strong></td>
+      ? `<tr class="empty-row"><td colspan="8">${tab==='inbox'?'Nothing awaiting your action 🎉':(tab==='mine'?'No assignments for you yet.':'No assignments.')}</td></tr>`
+      : rows.map(a => {
+          const act = actionableForUser(a);
+          const actBadge = act ? `<span class="pill ${act.tone}" style="font-size:9px; margin-left:6px;">${escapeHtml(act.label)}</span>` : '';
+          return `<tr>
+          <td><strong>${escapeHtml(a.assignment_id)}</strong>${actBadge}</td>
           <td>${escapeHtml(a.checklist_name || '')} <span style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_version || '')}</span></td>
           <td>${escapeHtml(a.target_type || '')} <strong>${escapeHtml(a.target_id || '')}</strong>${a.target_label?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.target_label)}</div>`:''}</td>
-          <td>${escapeHtml(a.assignee_name || '— open —')}</td>
+          <td>
+            ${escapeHtml(a.assignee_name || '— open —')}
+            <div style="color:var(--muted); font-size:11px;">rev: ${escapeHtml(a.reviewer_name || '—')} · app: ${escapeHtml(a.approver_name || '—')}</div>
+          </td>
           <td>${escapeHtml(a.frequency || '—')}</td>
           <td>${escapeHtml(a.due_date || '—')}</td>
           <td>${statusPill(a.status)}</td>
-          <td><button class="btn ghost sm" onclick="openAssignment('${escapeHtml(a.assignment_id)}')">${a.status==='Completed'?'View':'Open'}</button></td>
-        </tr>`).join('');
+          <td><button class="btn ${act?'primary':'ghost'} sm" onclick="openAssignment('${escapeHtml(a.assignment_id)}')">${a.status==='Completed'?'View':'Open'}</button></td>
+        </tr>`;
+        }).join('');
   } catch (e) { toast(e.message,'error'); }
 }
 
 async function openAssignChecklistModal(presetChecklistId) {
   try {
-    const [checklists, users, freqs, equipment, areas] = await Promise.all([
+    const [checklists, users, roles, freqs, equipment, areas] = await Promise.all([
       api('GET','/api/checklists?status=Approved'),
       api('GET','/api/users'),
+      api('GET','/api/roles'),
       api('GET','/api/frequencies'),
       api('GET','/api/equipment'),
       api('GET','/api/areas'),
@@ -1594,6 +1621,18 @@ async function openAssignChecklistModal(presetChecklistId) {
       toast('No approved checklists yet. A checklist must complete Review + Approval before it can be assigned.', 'error');
       return;
     }
+    // Filter sets by activity
+    const executorSet = usersWithActivity(users, roles, 'execute_checklist','execute_pm');
+    const reviewerSet = usersWithActivity(users, roles, 'review_pm','review_checklist');
+    const approverSet = usersWithActivity(users, roles, 'approve_pm','approve_checklist');
+    const executors = users.filter(u => executorSet.has(u.id));
+    const reviewers = users.filter(u => reviewerSet.has(u.id));
+    const approvers = users.filter(u => approverSet.has(u.id));
+    if (executors.length === 0) { toast('No users with execute permission.','error'); return; }
+    if (reviewers.length === 0 || approvers.length === 0) {
+      toast('No users with the review/approve permission. Configure roles first.','error'); return;
+    }
+
     // Stash target choices for the inline switcher
     window.__assignEquipOptions = equipment.map(e => `<option value="${e.equipment_id}">${e.equipment_id} · ${escapeHtml(e.name)}</option>`).join('');
     window.__assignAreaOptions  = areas.map(a => `<option value="${a.area_id}">${a.area_id} · ${escapeHtml(a.area_type)}</option>`).join('');
@@ -1603,12 +1642,25 @@ async function openAssignChecklistModal(presetChecklistId) {
       wrap.innerHTML = `<select name="target_id" required>${opts}</select>`;
     };
 
+    // Auto-fill reviewer/approver from the checklist template when checklist is changed
+    window.__checklistDefaults = {};
+    checklists.forEach(c => { window.__checklistDefaults[c.id] = { reviewer_id: c.reviewer_id, approver_id: c.approver_id }; });
+    window.__syncAsignDefaults = (sel) => {
+      const d = window.__checklistDefaults[Number(sel.value)] || {};
+      if (d.reviewer_id) document.querySelector('select[name="reviewer_id"]').value = d.reviewer_id;
+      if (d.approver_id) document.querySelector('select[name="approver_id"]').value = d.approver_id;
+    };
+
+    const initialChecklist = presetChecklistId ? checklists.find(c => c.id === presetChecklistId) : checklists[0];
+    const initRevId = initialChecklist?.reviewer_id || '';
+    const initAppId = initialChecklist?.approver_id || '';
+
     openModal({
-      title: 'Assign Checklist',
-      width: 560,
+      title: 'Assign PM Activity',
+      width: 600,
       body: `
-        <div class="form-row"><label>Checklist *</label>
-          <select name="checklist_id" required>
+        <div class="form-row"><label>Checklist (Approved) *</label>
+          <select name="checklist_id" required onchange="window.__syncAsignDefaults(this)">
             ${checklists.map(c => `<option value="${c.id}" ${presetChecklistId===c.id?'selected':''}>${escapeHtml(c.name)} (${escapeHtml(c.version)})</option>`).join('')}
           </select>
         </div>
@@ -1621,52 +1673,78 @@ async function openAssignChecklistModal(presetChecklistId) {
         <div class="form-row"><label>Target *</label>
           <span id="targetWrap"><select name="target_id" required>${window.__assignEquipOptions}</select></span>
         </div>
-        <div class="form-row"><label>Assignee</label>
-          <select name="assignee_id">
-            <option value="">— open assignment (anyone with execute_checklist) —</option>
-            ${users.filter(u=>u.status==='Active').map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+        <div class="form-row"><label>Executor (Initiator) *</label>
+          <select name="assignee_id" required>
+            ${executors.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>Reviewer (Engineering) *</label>
+          <select name="reviewer_id" required>
+            ${reviewers.map(u => `<option value="${u.id}" ${u.id===initRevId?'selected':''}>${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>Approver (QA) *</label>
+          <select name="approver_id" required>
+            ${approvers.map(u => `<option value="${u.id}" ${u.id===initAppId?'selected':''}>${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
           </select>
         </div>
         <div class="form-row"><label>Frequency</label>
           <select name="frequency_id"><option value="">— one-off —</option>${freqs.map(f => `<option value="${f.id}">${escapeHtml(f.name)} (every ${f.days} d)</option>`).join('')}</select>
         </div>
         <div class="form-row"><label>Due Date</label><input name="due_date" type="date" /></div>
-        <div class="form-row" style="grid-template-columns:1fr;"><label>Notes</label><textarea name="notes" placeholder="Optional context for the assignee"></textarea></div>
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Notes</label><textarea name="notes" placeholder="Optional context for the executor"></textarea></div>
+        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Workflow: Executor performs → Reviewer (Engineering) passes → Approver (QA) signs off.</p>
       `,
       onSubmit: async (data) => {
         await api('POST','/api/assignments', {
           checklist_id: Number(data.checklist_id),
           target_type: data.target_type,
           target_id: data.target_id,
-          assignee_id: data.assignee_id ? Number(data.assignee_id) : null,
+          assignee_id: Number(data.assignee_id),
+          reviewer_id: Number(data.reviewer_id),
+          approver_id: Number(data.approver_id),
           frequency_id: data.frequency_id ? Number(data.frequency_id) : null,
           due_date: data.due_date || null,
           notes: data.notes || ''
         });
-        toast('Checklist assigned. Assignee notified.', 'success');
+        toast('PM activity assigned. Executor notified.', 'success');
         if ($('page-tasks').classList.contains('active')) loadTasks(CURRENT_TASKS_TAB);
       }
     });
   } catch (e) { toast(e.message,'error'); }
 }
 
-// ----- Checklist workflow actions -----
+// Build a Set of user IDs whose role grants any of the given activity codes.
+function usersWithActivity(users, roles, ...activityCodes) {
+  const codes = new Set(activityCodes);
+  const okRoles = new Set(roles.filter(r => (r.permissions || []).some(p => codes.has(p))).map(r => r.id));
+  return new Set(users.filter(u => u.status === 'Active' && okRoles.has(u.role_id)).map(u => u.id));
+}
+
+// ----- Checklist (template) workflow actions -----
 async function openSubmitChecklistModal(checklistId) {
   try {
-    const users = await api('GET','/api/users');
-    const reviewers = users.filter(u => u.status === 'Active');
+    const [users, roles] = await Promise.all([api('GET','/api/users'), api('GET','/api/roles')]);
+    const reviewerSet = usersWithActivity(users, roles, 'review_checklist');
+    const approverSet = usersWithActivity(users, roles, 'approve_checklist');
+    const reviewers   = users.filter(u => reviewerSet.has(u.id));
+    const approvers   = users.filter(u => approverSet.has(u.id));
+    if (reviewers.length === 0 || approvers.length === 0) {
+      toast('No users with review_checklist / approve_checklist permission. Configure a role first.', 'error');
+      return;
+    }
     openModal({
       title: 'Submit Checklist for Review',
       body: `
-        <p style="font-size:12px; color:var(--muted); margin-top:0;">Pick a reviewer and a final approver. The reviewer is notified first; once they pass it, the approver is notified.</p>
-        <div class="form-row"><label>Reviewer *</label>
+        <p style="font-size:12px; color:var(--muted); margin-top:0;">Pick a reviewer (Engineering Manager) and a final approver (QA). Reviewer is notified first; once they pass it, the approver is notified.</p>
+        <div class="form-row"><label>Reviewer (Engineering) *</label>
           <select name="reviewer_id" required>
             ${reviewers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
           </select>
         </div>
-        <div class="form-row"><label>Approver *</label>
+        <div class="form-row"><label>Approver (QA) *</label>
           <select name="approver_id" required>
-            ${reviewers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+            ${approvers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
           </select>
         </div>
       `,
@@ -1720,11 +1798,20 @@ async function openAssignment(assignmentId) {
     const a = await api('GET', `/api/assignments/${assignmentId}`);
     const cl = a.checklist;
     const existing = a.response_data || {};
-    const editable = (a.status !== 'Completed') && (
-      a.assignee_id === CURRENT_USER.id ||
-      CURRENT_USER.is_admin ||
-      (!a.assignee_id && can('execute_checklist'))
-    );
+    const userId = CURRENT_USER.id;
+
+    // Determine roles
+    const amExecutor = a.assignee_id === userId || (!a.assignee_id && can('execute_checklist'));
+    const amReviewer = a.reviewer_id === userId;
+    const amApprover = a.approver_id === userId;
+    const amAdmin    = CURRENT_USER.is_admin;
+
+    // Editable matrix
+    const executorEditable = (a.status === 'Pending' || a.status === 'In Progress') && (amExecutor || amAdmin);
+    const reviewerActing   = a.status === 'Pending Review' && (amReviewer || amAdmin);
+    const approverActing   = a.status === 'Pending Approval' && (amApprover || amAdmin);
+    const formEditable     = executorEditable;
+
     const sectionsHtml = (cl?.sections || []).map((s, si) => `
       <div style="margin: 10px 0 6px; padding: 8px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
         <strong>${si+1}. ${escapeHtml(s.name)}</strong>
@@ -1734,7 +1821,7 @@ async function openAssignment(assignmentId) {
         ${s.questions.map((q, qi) => {
           const val = existing[`q_${q.id}`] ?? '';
           let inp = '';
-          const dis = editable ? '' : 'disabled';
+          const dis = formEditable ? '' : 'disabled';
           if (q.qtype === 'number')        inp = `<input type="number" name="q_${q.id}" min="${q.min_value ?? ''}" max="${q.max_value ?? ''}" value="${escapeHtml(val)}" ${q.required?'required':''} ${dis}/>${q.unit?` <span style='color:var(--muted); font-size:11px;'>${escapeHtml(q.unit)}</span>`:''}`;
           else if (q.qtype === 'checkbox') inp = `<label><input type="checkbox" name="q_${q.id}" ${val?'checked':''} ${dis}/> Yes</label>`;
           else if (q.qtype === 'yesno')    inp = `<select name="q_${q.id}" ${q.required?'required':''} ${dis}><option value="">—</option><option ${val==='Yes'?'selected':''}>Yes</option><option ${val==='No'?'selected':''}>No</option></select>`;
@@ -1747,36 +1834,122 @@ async function openAssignment(assignmentId) {
       </ul>`).join('');
 
     const banner = `
-      <div class="row-gap" style="font-size:12px; margin-bottom: 12px;">
+      <div class="row-gap" style="font-size:12px; margin-bottom: 8px;">
         ${statusPill(a.status)}
         ${a.target_id ? `<span class="pill brown">${escapeHtml(a.target_type)}: ${escapeHtml(a.target_id)}${a.target_label?' · '+escapeHtml(a.target_label):''}</span>` : ''}
-        ${a.due_date ? `<span class="pill brown">Due: ${escapeHtml(a.due_date)}</span>` : ''}
+        ${a.due_date  ? `<span class="pill brown">Due: ${escapeHtml(a.due_date)}</span>` : ''}
         ${a.frequency ? `<span class="pill brown">${escapeHtml(a.frequency)}</span>` : ''}
-        <span class="pill brown">Assignee: ${escapeHtml(a.assignee_name || '— open —')}</span>
-        <span class="pill brown">Assigned by: ${escapeHtml(a.assigned_by_name || '')}</span>
-      </div>`;
-    const notesBox = editable
+      </div>
+      <div style="font-size:12px; color:var(--muted); margin-bottom:12px;">
+        Executor <strong>${escapeHtml(a.assignee_name || '— open —')}</strong>
+        &nbsp;→&nbsp; Reviewer <strong>${escapeHtml(a.reviewer_name || '—')}</strong>
+        &nbsp;→&nbsp; Approver <strong>${escapeHtml(a.approver_name || '—')}</strong>
+        &nbsp;·&nbsp; Assigned by ${escapeHtml(a.assigned_by_name || '')}
+      </div>
+      ${a.rejection_reason ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fdecec; border-left:3px solid var(--red); border-radius:6px; font-size:12px;"><strong>Returned for rework:</strong> ${escapeHtml(a.rejection_reason)}</div>` : ''}`;
+
+    // Signatures so far
+    const sigCard = (label, sig, ts) => sig
+      ? `<div style="padding:6px 10px; background:var(--cream-100); border-radius:6px; font-size:11px; min-width:160px;">
+          <div style="color:var(--muted); text-transform:uppercase; letter-spacing:1px;">${label}</div>
+          <div style="font-weight:600;">${escapeHtml(sig)}</div>
+          ${ts ? `<div style="color:var(--muted);">${escapeHtml(ts)}</div>` : ''}
+         </div>`
+      : '';
+    const sigsHtml = (a.executor_sig || a.reviewer_sig || a.approver_sig) ? `
+      <hr class="sep" />
+      <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1px; margin-bottom:6px;">Signatures</div>
+      <div class="row-gap">
+        ${sigCard('Executor', a.executor_sig, a.submitted_at)}
+        ${sigCard('Reviewer', a.reviewer_sig, a.reviewed_at)}
+        ${sigCard('Approver', a.approver_sig, a.approved_at)}
+      </div>` : '';
+
+    const notesBox = formEditable
       ? `<div class="form-row" style="grid-template-columns:1fr;"><label>Notes</label><textarea name="__notes" placeholder="Observations / remarks">${escapeHtml(a.notes || '')}</textarea></div>`
-      : (a.notes ? `<div style="color:var(--muted); font-size:12px; margin-top:8px;"><strong>Notes:</strong> ${escapeHtml(a.notes)}</div>` : '');
+      : (a.notes ? `<div style="color:var(--muted); font-size:12px; margin-top:8px;"><strong>Executor notes:</strong> ${escapeHtml(a.notes)}</div>` : '');
+
+    // Action buttons by stage
+    const acts = [];
+    if (formEditable) {
+      acts.push(`<button type="button" class="btn ghost" onclick="saveAssignmentProgress('${a.assignment_id}')">💾 Save Progress</button>`);
+      acts.push(`<button type="button" class="btn primary" onclick="submitAssignmentForReview('${a.assignment_id}')">Submit for Review →</button>`);
+    }
+    if (reviewerActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentReviewDecision('${a.assignment_id}','approve')">✓ Pass Review</button>`);
+      acts.push(`<button type="button" class="btn ghost"   onclick="assignmentReviewDecision('${a.assignment_id}','reject')">✗ Reject</button>`);
+    }
+    if (approverActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentApproveDecision('${a.assignment_id}','approve')">✓ Approve &amp; Close</button>`);
+      acts.push(`<button type="button" class="btn ghost"   onclick="assignmentApproveDecision('${a.assignment_id}','reject')">✗ Reject</button>`);
+    }
+    const actionsHtml = acts.join(' ');
 
     openModal({
       title: `Assignment ${a.assignment_id} — ${escapeHtml(cl?.name || '')}`,
-      width: 760,
-      body: `${banner}${sectionsHtml}${notesBox}`,
-      submitLabel: a.status === 'Pending' ? 'Start &amp; Save' : 'Complete &amp; Sign',
-      hideDefaultSubmit: !editable,
-      onSubmit: async (data) => {
-        const resp = {};
-        Object.entries(data).forEach(([k,v]) => { if (k.startsWith('q_')) resp[k] = v; });
-        document.querySelectorAll('input[type="checkbox"][name^="q_"]').forEach(cb => { resp[cb.name] = cb.checked; });
-        await api('PUT', `/api/assignments/${assignmentId}/complete`, {
-          response_data: resp, notes: data['__notes'] || ''
-        });
-        toast(`Assignment ${assignmentId} completed.`, 'success');
-        loadTasks(CURRENT_TASKS_TAB);
-        refreshNotifBadge();
-      }
+      width: 780,
+      body: `${banner}${sectionsHtml}${notesBox}${sigsHtml}`,
+      actions: actionsHtml,
+      hideDefaultSubmit: true,
     });
+  } catch (e) { toast(e.message,'error'); }
+}
+
+// ---- Executor actions ----
+function _collectAssignmentResponses() {
+  const resp = {};
+  document.querySelectorAll('input[name^="q_"], select[name^="q_"], textarea[name^="q_"]').forEach(el => {
+    if (el.type === 'checkbox') resp[el.name] = el.checked;
+    else                        resp[el.name] = el.value;
+  });
+  const notes = (document.querySelector('textarea[name="__notes"]') || {}).value || '';
+  return { response_data: resp, notes };
+}
+async function saveAssignmentProgress(assignmentId) {
+  try {
+    const payload = _collectAssignmentResponses();
+    await api('PUT', `/api/assignments/${assignmentId}/save`, payload);
+    toast('Progress saved.', 'success');
+  } catch (e) { toast(e.message,'error'); }
+}
+async function submitAssignmentForReview(assignmentId) {
+  try {
+    const payload = _collectAssignmentResponses();
+    await api('PUT', `/api/assignments/${assignmentId}/submit`, payload);
+    toast('Submitted for review.', 'success');
+    closeModal();
+    loadTasks(CURRENT_TASKS_TAB);
+    refreshNotifBadge();
+  } catch (e) { toast(e.message,'error'); }
+}
+
+// ---- Reviewer / Approver actions ----
+async function assignmentReviewDecision(assignmentId, decision) {
+  let reason = null;
+  if (decision === 'reject') {
+    reason = prompt('Reason for rejection (will be shown to the executor):');
+    if (!reason) return;
+  }
+  try {
+    await api('PUT', `/api/assignments/${assignmentId}/review`, { decision, reason });
+    toast(decision === 'approve' ? 'Review passed — sent to approver.' : 'Returned to executor for rework.', 'success');
+    closeModal();
+    loadTasks(CURRENT_TASKS_TAB);
+    refreshNotifBadge();
+  } catch (e) { toast(e.message,'error'); }
+}
+async function assignmentApproveDecision(assignmentId, decision) {
+  let reason = null;
+  if (decision === 'reject') {
+    reason = prompt('Reason for rejection (will be shown to executor + reviewer):');
+    if (!reason) return;
+  }
+  try {
+    await api('PUT', `/api/assignments/${assignmentId}/approve`, { decision, reason });
+    toast(decision === 'approve' ? 'Approved & closed.' : 'Returned to executor for rework.', 'success');
+    closeModal();
+    loadTasks(CURRENT_TASKS_TAB);
+    refreshNotifBadge();
   } catch (e) { toast(e.message,'error'); }
 }
 
