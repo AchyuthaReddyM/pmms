@@ -419,7 +419,11 @@
           <div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px; align-items:end;">
             <div>
               <label style="font-size:11px; color:var(--muted); text-transform:uppercase;">Scan / Enter Equipment ID</label>
-              <input id="pmStatusScan" type="text" placeholder="e.g., EQ-AHU-12 (then press Enter)" />
+              <div style="display:flex; gap:6px;">
+                <input id="pmStatusScan" type="text" placeholder="e.g., EQ-AHU-12 (then press Enter)" style="flex:1;" />
+                <button class="btn dark" type="button" onclick="openQrCameraScanner()" title="Scan QR code with camera" style="white-space:nowrap;">📷 Scan</button>
+              </div>
+              <p style="font-size:10px; color:var(--muted); margin:4px 0 0;">Tap 📷 Scan to use the device camera. Requires HTTPS (works on Render) and camera permission.</p>
             </div>
             <div>
               <label style="font-size:11px; color:var(--muted); text-transform:uppercase;">…or pick from list</label>
@@ -566,6 +570,8 @@
 <!-- Toast container -->
 <div id="toastBox"></div>
 
+<!-- html5-qrcode powers the camera-based equipment-ID scanner on the PM Status page -->
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

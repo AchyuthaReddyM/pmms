@@ -1289,7 +1289,15 @@ function openModal({ title, body, onSubmit, submitLabel='Save', width=520, actio
     }
   });
 }
-function closeModal() { $('modalHost').innerHTML = ''; }
+function closeModal() {
+  // If a QR scanner is running in the modal, stop the camera stream first.
+  if (window.__pmsScanner) {
+    try { window.__pmsScanner.stop().catch(()=>{}); } catch (e) {}
+    try { window.__pmsScanner.clear(); } catch (e) {}
+    window.__pmsScanner = null;
+  }
+  $('modalHost').innerHTML = '';
+}
 
 // ===========================================================
 // GLOBAL SEARCH (simple, jumps to first match)
@@ -2389,6 +2397,90 @@ async function loadPmStatusPage() {
     // Clear any previous result
     $('pmStatusResult').innerHTML = '<div class="card"><p style="color:var(--muted); margin:0;">Scan an Equipment ID barcode (Enter to confirm) or pick from the dropdown to load its current PM status.</p></div>';
   } catch (e) { toast(e.message, 'error'); }
+}
+
+async function openQrCameraScanner() {
+  if (typeof Html5Qrcode === 'undefined') {
+    toast('Camera scanner failed to load. Refresh the page and try again.', 'error');
+    return;
+  }
+  // Quick check for getUserMedia availability + secure context
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    toast('This device / browser does not expose a camera API.', 'error');
+    return;
+  }
+  if (window.isSecureContext === false) {
+    toast('Camera access requires HTTPS. Use the Render URL (not http://) or localhost.', 'error');
+    return;
+  }
+
+  openModal({
+    title: 'Scan Equipment QR / Barcode',
+    width: 480,
+    body: `
+      <p style="color:var(--muted); font-size:12px; margin:0 0 8px;">Point the back camera at the QR code or barcode on the equipment. Decoding happens automatically.</p>
+      <div id="qrReader" style="width:100%; max-width:420px; margin:0 auto; border:1px solid var(--border); border-radius:8px; overflow:hidden;"></div>
+      <p id="qrScanStatus" style="color:var(--muted); font-size:11px; margin-top:8px; min-height:18px;">Starting camera…</p>
+      <p style="font-size:11px; color:var(--muted); margin:4px 0 0;">No QR sticker? Close this and type the Equipment ID by hand.</p>
+    `,
+    hideDefaultSubmit: true,
+  });
+
+  // Boot the scanner after the modal is in the DOM.
+  setTimeout(async () => {
+    let scanner;
+    try {
+      scanner = new Html5Qrcode('qrReader', { verbose: false });
+    } catch (e) {
+      const s = document.getElementById('qrScanStatus');
+      if (s) s.innerHTML = `<span style="color:var(--red);">${escapeHtml(e.message || 'Failed to initialise scanner')}</span>`;
+      return;
+    }
+    window.__pmsScanner = scanner;
+
+    const onSuccess = (decodedText) => {
+      // Strip the seeded "QR:" prefix if present.
+      let id = String(decodedText || '').trim();
+      if (/^QR:/i.test(id)) id = id.slice(3);
+      // Stop the camera, close modal, run lookup.
+      scanner.stop().catch(()=>{}).finally(() => {
+        window.__pmsScanner = null;
+        closeModal();
+        const input = $('pmStatusScan');
+        if (input) input.value = id;
+        toast(`Scanned: ${id}`, 'success');
+        fetchPmStatus(id);
+      });
+    };
+    const onScanError = () => { /* fired ~constantly until a code is found; ignore */ };
+
+    try {
+      await scanner.start(
+        { facingMode: 'environment' },
+        { fps: 10, qrbox: { width: 260, height: 260 } },
+        onSuccess,
+        onScanError
+      );
+      const s = document.getElementById('qrScanStatus');
+      if (s) s.textContent = 'Camera ready — align the code inside the box.';
+    } catch (e) {
+      // Try front camera as a fallback (some laptops only have a front cam)
+      try {
+        await scanner.start(
+          { facingMode: 'user' },
+          { fps: 10, qrbox: { width: 260, height: 260 } },
+          onSuccess,
+          onScanError
+        );
+        const s = document.getElementById('qrScanStatus');
+        if (s) s.textContent = 'Front camera active. Align the code inside the box.';
+      } catch (e2) {
+        const s = document.getElementById('qrScanStatus');
+        if (s) s.innerHTML = `<span style="color:var(--red);">Camera unavailable: ${escapeHtml((e2 && e2.message) || String(e2))}</span>` +
+          `<br/><span style="color:var(--muted);">Check the browser's site permissions (camera) and that nothing else is using the camera.</span>`;
+      }
+    }
+  }, 80);
 }
 
 function pmStatusColor(status) {
