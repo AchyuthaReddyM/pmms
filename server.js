@@ -382,6 +382,125 @@ app.put('/api/equipment/:equipment_id', requireAuth, requireRole('System Adminis
 });
 
 // =============================================================
+// EQUIPMENT PM STATUS — read-only, auto-computed from assignment workflow
+// =============================================================
+//   Completed   → latest assignment Completed AND within tolerance
+//   Under PM    → latest assignment is Pending / In Progress / Pending Review / Pending Approval
+//   Rejected    → latest assignment is Rejected
+//   Out of PM   → no assignment, OR latest Completed but past (next_due + tolerance), OR latest is Rejected/stale and past due
+app.get('/api/equipment/:equipment_id/pm-status', requireAuth, (req, res) => {
+  const eqId = req.params.equipment_id;
+  const eq = db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(eqId);
+  if (!eq) return res.status(404).json({ error: 'Equipment not found' });
+
+  // Walk Equipment → Area → Location → Block → Plant
+  const chain = db.prepare(`
+    SELECT a.area_id, a.name AS area_name,
+           l.location_id, l.description AS location_name,
+           b.block_id, b.name AS block_name,
+           p.plant_id, p.unit_number, p.name AS plant_name
+    FROM equipment e
+    LEFT JOIN areas a     ON a.area_id     = e.area_id
+    LEFT JOIN locations l ON l.location_id = a.location_id
+    LEFT JOIN blocks b    ON b.block_id    = l.block_id
+    LEFT JOIN plants p    ON p.plant_id    = b.plant_id
+    WHERE e.equipment_id = ?
+  `).get(eqId) || {};
+
+  // Latest assignment for this equipment (any status)
+  const latest = db.prepare(`
+    SELECT ca.*, f.name AS frequency_name, f.days AS frequency_days, f.tolerance_days,
+           u.name AS assignee_name
+    FROM checklist_assignments ca
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    LEFT JOIN users u ON u.id = ca.assignee_id
+    WHERE ca.target_type='equipment' AND ca.target_id=?
+    ORDER BY ca.id DESC
+    LIMIT 1
+  `).get(eqId);
+
+  // Most recent COMPLETED assignment — for last execution date + computed next due
+  const lastCompleted = db.prepare(`
+    SELECT ca.completed_at, f.days AS frequency_days, f.tolerance_days
+    FROM checklist_assignments ca
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    WHERE ca.target_type='equipment' AND ca.target_id=? AND ca.status='Completed'
+    ORDER BY datetime(ca.completed_at) DESC
+    LIMIT 1
+  `).get(eqId);
+
+  // Compute next due date
+  let nextDue = null;
+  if (lastCompleted && lastCompleted.completed_at && lastCompleted.frequency_days) {
+    const d = new Date(lastCompleted.completed_at);
+    d.setDate(d.getDate() + Number(lastCompleted.frequency_days));
+    nextDue = d.toISOString().slice(0, 10);
+  } else if (latest) {
+    nextDue = latest.due_date || latest.effective_date || null;
+  }
+
+  // Determine status
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const toleranceDays = (lastCompleted?.tolerance_days ?? latest?.tolerance_days ?? 0);
+  const dueWithTolerance = (dateStr) => {
+    if (!dateStr) return null;
+    const d = new Date(dateStr); d.setDate(d.getDate() + Number(toleranceDays || 0));
+    return d;
+  };
+
+  let status = 'Out of PM Schedule';
+  let reason = null;
+
+  if (!latest) {
+    status = 'Out of PM Schedule';
+    reason = 'No PM has ever been assigned to this equipment.';
+  } else if (latest.status === 'Rejected') {
+    status = 'Preventive Maintenance Rejected';
+    reason = latest.rejection_reason || 'PM execution was rejected.';
+  } else if (['Pending','In Progress','Pending Review','Pending Approval'].includes(latest.status)) {
+    // Active assignment: Under PM, unless it's overdue past tolerance — then Out of Schedule.
+    const dt = dueWithTolerance(latest.due_date || latest.effective_date);
+    if (dt && today > dt && latest.status === 'Pending') {
+      status = 'Out of PM Schedule';
+      reason = 'PM was not assigned/started within the scheduled date + tolerance window.';
+    } else {
+      status = 'Under Preventive Maintenance';
+      reason = `Current step: ${latest.status}`;
+    }
+  } else if (latest.status === 'Completed') {
+    const dt = dueWithTolerance(nextDue);
+    if (dt && today > dt) {
+      status = 'Out of PM Schedule';
+      reason = 'Last PM was completed but the next due date + tolerance has lapsed without a new assignment.';
+    } else {
+      status = 'Preventive Maintenance Completed';
+      reason = `Last execution ${lastCompleted.completed_at}.`;
+    }
+  }
+
+  res.json({
+    plant_id: chain.plant_id || null,
+    plant_name: chain.plant_name || null,
+    unit_number: chain.unit_number || null,
+    block_name: chain.block_name || null,
+    location_name: chain.location_name || null,
+    area_name: chain.area_name || null,
+    equipment_id: eq.equipment_id,
+    equipment_name: eq.name,
+    equipment_description: [eq.make, eq.model, eq.capacity].filter(Boolean).join(' / ') || eq.name,
+    pm_number: latest ? latest.assignment_id : null,
+    frequency: latest ? latest.frequency_name : null,
+    assignee_name: latest ? latest.assignee_name : null,
+    last_execution_date: lastCompleted ? lastCompleted.completed_at : null,
+    next_due_date: nextDue,
+    current_status: status,
+    reason,
+    latest_assignment_id: latest ? latest.assignment_id : null,
+    latest_assignment_status: latest ? latest.status : null,
+  });
+});
+
+// =============================================================
 // USERS
 // =============================================================
 app.get('/api/users', requireAuth, (req, res) => {

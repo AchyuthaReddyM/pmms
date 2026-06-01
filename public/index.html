@@ -77,6 +77,7 @@
       <div class="nav-section">Operations</div>
       <a data-page="execution"><span class="ico">🛠️</span> PM Execution</a>
       <a data-page="tasks"><span class="ico">📌</span> My Tasks</a>
+      <a data-page="pmstatus"><span class="ico">📍</span> PM Status</a>
       <a data-page="calendar"><span class="ico">🗓️</span> Calendar</a>
       <a data-page="breakdown"><span class="ico">🚨</span> Breakdown</a>
 
@@ -407,6 +408,26 @@
           <div class="card"><span class="pill red">Expired</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Past tolerance</p></div>
           <div class="card"><span class="pill blue">Escalated</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Alert to dept. head</p></div>
         </div>
+      </div>
+
+      <!-- =========== PM STATUS LABEL =========== -->
+      <div class="page" id="page-pmstatus">
+        <div class="page-head">
+          <div><h1>PM Status</h1><p>Scan or pick an Equipment ID to see its current preventive maintenance status — auto-computed from the PM workflow.</p></div>
+        </div>
+        <div class="card">
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:14px; align-items:end;">
+            <div>
+              <label style="font-size:11px; color:var(--muted); text-transform:uppercase;">Scan / Enter Equipment ID</label>
+              <input id="pmStatusScan" type="text" placeholder="e.g., EQ-AHU-12 (then press Enter)" />
+            </div>
+            <div>
+              <label style="font-size:11px; color:var(--muted); text-transform:uppercase;">…or pick from list</label>
+              <select id="pmStatusSelect"><option value="">— select equipment —</option></select>
+            </div>
+          </div>
+        </div>
+        <div id="pmStatusResult" style="margin-top:16px;"></div>
       </div>
 
       <!-- =========== CALENDAR =========== -->

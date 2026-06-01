@@ -98,8 +98,8 @@ function onLoggedIn() {
 }
 
 // ---------- Routing ----------
-const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','execution','tasks','calendar','breakdown','reports','audit','compliance','about'];
-const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', execution:'PM Execution', tasks:'My Tasks', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
+const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','execution','tasks','pmstatus','calendar','breakdown','reports','audit','compliance','about'];
+const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', execution:'PM Execution', tasks:'My Tasks', pmstatus:'PM Status', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
 
 function goto(name) {
   PAGES.forEach(p => $('page-'+p)?.classList.toggle('active', p === name));
@@ -117,6 +117,7 @@ function goto(name) {
     assignments: loadAssignmentsPage,
     execution: loadPmList,
     tasks: () => loadTasks('inbox'),
+    pmstatus: loadPmStatusPage,
     calendar: loadCalendar,
     breakdown: loadBreakdowns,
     audit: () => loadAudit(100),
@@ -2361,6 +2362,82 @@ async function assignmentApproveDecision(assignmentId, decision) {
     loadTasks(CURRENT_TASKS_TAB);
     refreshNotifBadge();
   } catch (e) { toast(e.message,'error'); }
+}
+
+// ===========================================================
+// PM STATUS LABEL
+// ===========================================================
+async function loadPmStatusPage() {
+  try {
+    const equipment = await api('GET','/api/equipment');
+    const sel = $('pmStatusSelect');
+    if (sel) {
+      sel.innerHTML = '<option value="">— select equipment —</option>' +
+        equipment.map(e => `<option value="${escapeHtml(e.equipment_id)}">${escapeHtml(e.equipment_id)} · ${escapeHtml(e.name)}</option>`).join('');
+      sel.onchange = () => { if (sel.value) fetchPmStatus(sel.value); };
+    }
+    const scan = $('pmStatusScan');
+    if (scan) {
+      scan.onkeydown = (ev) => {
+        if (ev.key === 'Enter') {
+          ev.preventDefault();
+          const v = (scan.value || '').trim();
+          if (v) fetchPmStatus(v);
+        }
+      };
+    }
+    // Clear any previous result
+    $('pmStatusResult').innerHTML = '<div class="card"><p style="color:var(--muted); margin:0;">Scan an Equipment ID barcode (Enter to confirm) or pick from the dropdown to load its current PM status.</p></div>';
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function pmStatusColor(status) {
+  if (status === 'Preventive Maintenance Completed') return 'green';
+  if (status === 'Under Preventive Maintenance')     return 'blue';
+  if (status === 'Preventive Maintenance Rejected')  return 'red';
+  return 'amber'; // Out of PM Schedule
+}
+
+async function fetchPmStatus(equipmentId) {
+  try {
+    const s = await api('GET', `/api/equipment/${encodeURIComponent(equipmentId)}/pm-status`);
+    const colorClass = pmStatusColor(s.current_status);
+    const fld = (label, val) => `
+      <div style="padding:10px 12px; background:var(--cream-100); border-radius:6px;">
+        <div style="font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:1px;">${escapeHtml(label)}</div>
+        <div style="font-size:13px; font-weight:600; margin-top:3px;">${val == null || val === '' ? '—' : escapeHtml(String(val))}</div>
+      </div>`;
+
+    $('pmStatusResult').innerHTML = `
+      <div class="card" style="border-left:4px solid var(--brand);">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom: 14px;">
+          <div>
+            <div style="font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:1px;">Current PM Status</div>
+            <div style="font-size:20px; font-weight:700; margin-top:4px;">
+              <span class="pill ${colorClass}" style="font-size:13px; padding:6px 12px;">${escapeHtml(s.current_status)}</span>
+            </div>
+            ${s.reason ? `<div style="color:var(--muted); font-size:12px; margin-top:6px;">${escapeHtml(s.reason)}</div>` : ''}
+          </div>
+          ${s.latest_assignment_id
+            ? `<button class="btn ghost sm" onclick="goto('tasks'); setTimeout(() => openAssignment('${escapeHtml(s.latest_assignment_id)}'), 200);">Open PM ${escapeHtml(s.latest_assignment_id)} →</button>`
+            : ''}
+        </div>
+        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px;">
+          ${fld('Plant Name', s.plant_name ? `${s.plant_name}${s.unit_number?` (${s.unit_number})`:''}` : null)}
+          ${fld('Equipment ID', s.equipment_id)}
+          ${fld('Equipment Description', s.equipment_description)}
+          ${fld('PM Number', s.pm_number)}
+          ${fld('Frequency', s.frequency)}
+          ${fld('Assigned User', s.assignee_name)}
+          ${fld('Last Execution Date', s.last_execution_date)}
+          ${fld('Next Due Date', s.next_due_date)}
+          ${fld('Block / Location / Area', [s.block_name, s.location_name, s.area_name].filter(Boolean).join(' · '))}
+        </div>
+        <p style="font-size:11px; color:var(--muted); margin:12px 0 0;">Status is auto-computed from the PM workflow and cannot be edited manually.</p>
+      </div>`;
+  } catch (e) {
+    $('pmStatusResult').innerHTML = `<div class="card" style="border-left:4px solid var(--red);"><strong style="color:var(--red);">${escapeHtml(e.message)}</strong></div>`;
+  }
 }
 
 // ===========================================================
