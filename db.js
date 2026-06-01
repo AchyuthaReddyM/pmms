@@ -173,6 +173,7 @@ function createSchema() {
     -- Only Approved checklists can be assigned. Initiator -> Reviewer -> Approver workflow.
     CREATE TABLE IF NOT EXISTS checklists (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT UNIQUE,
       name TEXT NOT NULL,
       description TEXT,
       group_id INTEGER REFERENCES checklist_groups(id),
@@ -180,6 +181,7 @@ function createSchema() {
       version TEXT NOT NULL DEFAULT 'v1.0',
       status TEXT NOT NULL DEFAULT 'Draft',
       fields_json TEXT,
+      required_fields_json TEXT,
       created_by INTEGER REFERENCES users(id),
       reviewer_id INTEGER REFERENCES users(id),
       approver_id INTEGER REFERENCES users(id),
@@ -188,6 +190,13 @@ function createSchema() {
       approved_at TEXT,
       rejection_reason TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Each checklist may be associated with one or more frequencies (Weekly + Monthly + Quarterly)
+    CREATE TABLE IF NOT EXISTS checklist_frequencies (
+      checklist_id INTEGER NOT NULL REFERENCES checklists(id) ON DELETE CASCADE,
+      frequency_id INTEGER NOT NULL REFERENCES frequencies(id),
+      PRIMARY KEY (checklist_id, frequency_id)
     );
 
     -- New structured checklist: sections (a.k.a. "checkpoint groups")
@@ -528,7 +537,9 @@ function seed() {
     { id: 'q5', type: 'text',     label: 'Lubricant batch ID', required:true },
     { id: 'q6', type: 'text',     label: 'Remarks', required:false },
   ]);
-  ins("INSERT INTO checklists(name,group_id,version,fields_json,status) VALUES (?,?,?,?,'Approved')").run('FBD Monthly Mechanical',1,'v3.2',fbdChecklist);
+  const chkFbd = ins("INSERT INTO checklists(code,name,group_id,version,fields_json,status) VALUES (?,?,?,?,?,'Approved')").run('CHK-FBD-01','FBD Monthly Mechanical',1,'v3.2',fbdChecklist).lastInsertRowid;
+  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(chkFbd, 'Monthly');
+  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(chkFbd, 'Quarterly');
 
   const rmgChecklist = JSON.stringify([
     { id: 'q1', type: 'dropdown', label: 'Power isolation done', options:['Yes','No'], required:true },
@@ -536,7 +547,8 @@ function seed() {
     { id: 'q3', type: 'dropdown', label: 'Impeller condition', options:['OK','Worn'], required:true },
     { id: 'q4', type: 'text',     label: 'Remarks', required:false },
   ]);
-  ins("INSERT INTO checklists(name,group_id,version,fields_json,status) VALUES (?,?,?,?,'Approved')").run('RMG Weekly Electrical',2,'v2.1',rmgChecklist);
+  const chkRmg = ins("INSERT INTO checklists(code,name,group_id,version,fields_json,status) VALUES (?,?,?,?,?,'Approved')").run('CHK-RMG-01','RMG Weekly Electrical',2,'v2.1',rmgChecklist).lastInsertRowid;
+  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(chkRmg, 'Weekly');
 
   const ahuChecklist = JSON.stringify([
     { id: 'q1', type: 'dropdown', label: 'Filter status', options:['OK','Replace'], required:true },
@@ -544,17 +556,23 @@ function seed() {
     { id: 'q3', type: 'number',   label: 'Supply air flow (CFM)', min:0, max:20000, required:true },
     { id: 'q4', type: 'text',     label: 'Remarks', required:false },
   ]);
-  ins("INSERT INTO checklists(name,group_id,version,fields_json,status) VALUES (?,?,?,?,'Approved')").run('AHU Quarterly HVAC',4,'v1.4',ahuChecklist);
+  const chkAhuQ = ins("INSERT INTO checklists(code,name,group_id,version,fields_json,status) VALUES (?,?,?,?,?,'Approved')").run('CHK-AHU-Q','AHU Quarterly HVAC',4,'v1.4',ahuChecklist).lastInsertRowid;
+  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(chkAhuQ, 'Quarterly');
 
   // ---- Structured (new) checklist sample: AHU Monthly Inspection ----
   const adminId = db.prepare("SELECT id FROM users WHERE user_id='admin'").get().id;
   const ahuCatId = db.prepare("SELECT id FROM pm_categories WHERE name='HVAC'").get().id;
   const reviewerId = db.prepare("SELECT id FROM users WHERE user_id='rmehta'").get().id;
   const approverId = db.prepare("SELECT id FROM users WHERE user_id='siyer'").get().id;
-  const clRes = ins(`INSERT INTO checklists(name,description,group_id,category_id,version,status,created_by,reviewer_id,approver_id,submitted_at,reviewed_at,approved_at)
-                     VALUES (?,?,?,?,?,?,?,?,?, datetime('now','-3 days'), datetime('now','-2 days'), datetime('now','-1 day'))`)
-    .run('AHU Monthly Inspection (v2)', 'Structured monthly AHU inspection with grouped checkpoints.', 4, ahuCatId, 'v2.0', 'Approved', adminId, reviewerId, approverId);
+  // Required fields the AHU checklist expects executors to record
+  const ahuReqd = JSON.stringify(['area','equipment','capacity_make','spares','validation_by','corrective','external_report']);
+  const clRes = ins(`INSERT INTO checklists(code,name,description,group_id,category_id,version,status,required_fields_json,created_by,reviewer_id,approver_id,submitted_at,reviewed_at,approved_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?, datetime('now','-3 days'), datetime('now','-2 days'), datetime('now','-1 day'))`)
+    .run('CHK-AHU-M','AHU Monthly Inspection (v2)', 'Structured monthly AHU inspection with grouped checkpoints.', 4, ahuCatId, 'v2.0', 'Approved', ahuReqd, adminId, reviewerId, approverId);
   const ahuCl = clRes.lastInsertRowid;
+  // Allowed frequencies: Monthly + Quarterly
+  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(ahuCl, 'Monthly');
+  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(ahuCl, 'Quarterly');
 
   const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
   const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,position) VALUES (?,?,?,?,?,?,?,?,?)`);
@@ -641,6 +659,7 @@ function initAndSeed(force=false) {
       DROP TABLE IF EXISTS checklist_assignments;
       DROP TABLE IF EXISTS checklist_questions;
       DROP TABLE IF EXISTS checklist_sections;
+      DROP TABLE IF EXISTS checklist_frequencies;
       DROP TABLE IF EXISTS checklists;
       DROP TABLE IF EXISTS checklist_groups;
       DROP TABLE IF EXISTS pm_categories;

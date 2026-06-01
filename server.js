@@ -503,10 +503,15 @@ app.put('/api/users/:user_id/password', requireAuth, requireActivity('manage_use
 // =============================================================
 app.get('/api/frequencies', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM frequencies ORDER BY days').all()));
 app.get('/api/pm-categories', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM pm_categories ORDER BY name').all()));
-app.get('/api/checklist-groups', requireAuth, (req,res) => res.json(db.prepare(`
-  SELECT cg.id, cg.name, cg.department_id, COALESCE(d.name, cg.department) AS department
-  FROM checklist_groups cg LEFT JOIN departments d ON d.id = cg.department_id
-  ORDER BY cg.name`).all()));
+app.get('/api/checklist-groups', requireAuth, (req,res) => {
+  const { active } = req.query;
+  // Active is the only status used in seed; we don't have a status column on groups yet,
+  // so 'active' parameter is accepted for forward-compat and simply returns all groups for now.
+  res.json(db.prepare(`
+    SELECT cg.id, cg.name, cg.department_id, COALESCE(d.name, cg.department) AS department
+    FROM checklist_groups cg LEFT JOIN departments d ON d.id = cg.department_id
+    ORDER BY cg.name`).all());
+});
 
 app.post('/api/checklist-groups', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
   const { name, department_id } = req.body || {};
@@ -554,17 +559,25 @@ app.get('/api/checklists', requireAuth, (req,res) => {
   if (status)      { where.push('cl.status = ?');      args.push(status); }
   if (category_id) { where.push('cl.category_id = ?'); args.push(Number(category_id)); }
   if (group_id)    { where.push('cl.group_id = ?');    args.push(Number(group_id)); }
-  res.json(db.prepare(`
-    SELECT cl.id, cl.name, cl.group_id, cl.category_id, cl.version, cl.status,
+  const rows = db.prepare(`
+    SELECT cl.id, cl.code, cl.name, cl.group_id, cl.category_id, cl.version, cl.status,
            cl.reviewer_id, cl.approver_id, cl.created_by,
+           cg.name AS group_name,
            cb.name AS created_by_name, rv.name AS reviewer_name, ap.name AS approver_name
     FROM checklists cl
+    LEFT JOIN checklist_groups cg ON cg.id = cl.group_id
     LEFT JOIN users cb ON cb.id = cl.created_by
     LEFT JOIN users rv ON rv.id = cl.reviewer_id
     LEFT JOIN users ap ON ap.id = cl.approver_id
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY cl.id
-  `).all(...args));
+  `).all(...args);
+  // Attach the list of allowed frequencies for each checklist (lightweight).
+  const freqMap = {};
+  db.prepare(`SELECT cf.checklist_id, f.id, f.name FROM checklist_frequencies cf JOIN frequencies f ON f.id = cf.frequency_id`).all()
+    .forEach(r => { (freqMap[r.checklist_id] = freqMap[r.checklist_id] || []).push({ id: r.id, name: r.name }); });
+  rows.forEach(r => { r.frequencies = freqMap[r.id] || []; });
+  res.json(rows);
 });
 app.get('/api/checklists/:id', requireAuth, (req,res) => {
   const row = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
@@ -1058,12 +1071,15 @@ app.delete('/api/pm-categories/:id', requireAuth, requireActivity('manage_pm_cat
 function loadChecklistFull(id) {
   const cl = db.prepare(`
     SELECT cl.*, d.name AS dept_name, cg.name AS group_name, pc.name AS category_name,
-           u.name AS created_by_name
+           u.name AS created_by_name,
+           rv.name AS reviewer_name, ap.name AS approver_name
     FROM checklists cl
     LEFT JOIN checklist_groups cg ON cg.id = cl.group_id
     LEFT JOIN departments d ON d.id = cg.department_id
     LEFT JOIN pm_categories pc ON pc.id = cl.category_id
-    LEFT JOIN users u ON u.id = cl.created_by
+    LEFT JOIN users u  ON u.id  = cl.created_by
+    LEFT JOIN users rv ON rv.id = cl.reviewer_id
+    LEFT JOIN users ap ON ap.id = cl.approver_id
     WHERE cl.id = ?`).get(id);
   if (!cl) return null;
   const sections = db.prepare('SELECT * FROM checklist_sections WHERE checklist_id=? ORDER BY position, id').all(id);
@@ -1080,6 +1096,12 @@ function loadChecklistFull(id) {
     try { cl.legacy_fields = JSON.parse(cl.fields_json); } catch(e) {}
   }
   delete cl.fields_json;
+  try { cl.required_fields = cl.required_fields_json ? JSON.parse(cl.required_fields_json) : []; } catch(e) { cl.required_fields = []; }
+  delete cl.required_fields_json;
+  cl.frequencies = db.prepare(`SELECT f.id, f.name, f.days, f.tolerance_days
+                               FROM checklist_frequencies cf JOIN frequencies f ON f.id = cf.frequency_id
+                               WHERE cf.checklist_id = ?
+                               ORDER BY f.days`).all(id);
   return cl;
 }
 
@@ -1089,13 +1111,48 @@ app.get('/api/checklists/:id/full', requireAuth, (req, res) => {
   res.json(cl);
 });
 
+// Allowed standard "Required Field" keys for execution-side capture.
+const REQUIRED_FIELD_KEYS = ['area','equipment','capacity_make','spares','validation_by','corrective','external_report'];
+
+function validateChecklistCore({ code, name }, { codeRequired = true } = {}) {
+  if (codeRequired || code !== undefined && code !== null && code !== '') {
+    if (!code) return 'Checklist ID is required';
+    if (!/^[A-Za-z0-9_\-]{2,50}$/.test(code)) return 'Checklist ID must be 2-50 alphanumeric characters (letters, digits, - and _ allowed)';
+  }
+  if (!name || name.length < 3 || name.length > 300) return 'Checklist Name must be 3-300 characters';
+  return null;
+}
+
+function saveChecklistFrequencies(checklistId, frequencyIds) {
+  db.prepare('DELETE FROM checklist_frequencies WHERE checklist_id=?').run(checklistId);
+  if (!Array.isArray(frequencyIds)) return;
+  const ins = db.prepare('INSERT OR IGNORE INTO checklist_frequencies(checklist_id, frequency_id) VALUES (?,?)');
+  for (const fid of frequencyIds) {
+    if (!fid) continue;
+    const f = db.prepare("SELECT id FROM frequencies WHERE id=? AND status='Active'").get(fid);
+    if (f) ins.run(checklistId, f.id);
+  }
+}
+
 app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (req, res) => {
-  const { name, description, group_id, category_id, version, sections } = req.body || {};
-  if (!name) return res.status(400).json({ error: 'name required' });
-  const r = db.prepare(`INSERT INTO checklists(name,description,group_id,category_id,version,status,created_by)
-                        VALUES (?,?,?,?,?,?,?)`)
-    .run(name, description || '', group_id || null, category_id || null, version || 'v1.0', 'Draft', req.user.id);
+  const { code, name, description, group_id, category_id, version, sections, required_fields, frequency_ids } = req.body || {};
+  const err = validateChecklistCore({ code, name });
+  if (err) return res.status(400).json({ error: err });
+  if (!group_id) return res.status(400).json({ error: 'PM Checklist Group is required' });
+  const grp = db.prepare('SELECT id FROM checklist_groups WHERE id=?').get(group_id);
+  if (!grp) return res.status(400).json({ error: 'Unknown checklist group' });
+  if (db.prepare('SELECT 1 FROM checklists WHERE code=?').get(code)) {
+    return res.status(409).json({ error: `Checklist ID "${code}" already exists` });
+  }
+  // Sanitize required_fields to known keys
+  const reqd = Array.isArray(required_fields)
+    ? required_fields.filter(k => REQUIRED_FIELD_KEYS.includes(k))
+    : [];
+  const r = db.prepare(`INSERT INTO checklists(code,name,description,group_id,category_id,version,status,required_fields_json,created_by)
+                        VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(code, name, description || '', group_id || null, category_id || null, version || 'v1.0', 'Draft', JSON.stringify(reqd), req.user.id);
   const newId = r.lastInsertRowid;
+  saveChecklistFrequencies(newId, frequency_ids);
   if (Array.isArray(sections)) {
     const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
     const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,position) VALUES (?,?,?,?,?,?,?,?,?)`);
@@ -1114,21 +1171,38 @@ app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (
 });
 
 app.put('/api/checklists/:id', requireAuth, requireActivity('manage_checklists'), (req, res) => {
-  const { name, description, group_id, category_id, version, status, sections } = req.body || {};
+  const { code, name, description, group_id, category_id, version, status, sections, required_fields, frequency_ids } = req.body || {};
   const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
   if (!cl) return res.status(404).json({ error: 'Not found' });
   // Only allow content edits while in Draft / Rejected. Approved checklists are locked.
-  if (!['Draft','Rejected'].includes(cl.status) && (sections || name || description)) {
+  if (!['Draft','Rejected'].includes(cl.status) && (sections || name || description || code)) {
     return res.status(409).json({ error: `Cannot edit checklist in status "${cl.status}". Bump the version or push back to Draft.` });
   }
+  if (code !== undefined && code !== null && code !== '' && code !== cl.code) {
+    if (!/^[A-Za-z0-9_\-]{2,50}$/.test(code)) return res.status(400).json({ error: 'Checklist ID must be 2-50 alphanumeric characters' });
+    if (db.prepare('SELECT 1 FROM checklists WHERE code=? AND id!=?').get(code, req.params.id)) {
+      return res.status(409).json({ error: `Checklist ID "${code}" already exists` });
+    }
+  }
+  if (name !== undefined && (name.length < 3 || name.length > 300)) {
+    return res.status(400).json({ error: 'Checklist Name must be 3-300 characters' });
+  }
+  let reqdJson = null;
+  if (Array.isArray(required_fields)) {
+    reqdJson = JSON.stringify(required_fields.filter(k => REQUIRED_FIELD_KEYS.includes(k)));
+  }
   db.prepare(`UPDATE checklists SET
+      code=COALESCE(?,code),
       name=COALESCE(?,name),
       description=COALESCE(?,description),
       group_id=COALESCE(?,group_id),
       category_id=COALESCE(?,category_id),
       version=COALESCE(?,version),
-      status=COALESCE(?,status)
-    WHERE id=?`).run(name, description, group_id, category_id, version, status, req.params.id);
+      status=COALESCE(?,status),
+      required_fields_json=COALESCE(?,required_fields_json)
+    WHERE id=?`).run(code, name, description, group_id, category_id, version, status, reqdJson, req.params.id);
+
+  if (Array.isArray(frequency_ids)) saveChecklistFrequencies(req.params.id, frequency_ids);
 
   // If sections payload provided, replace structured content (idempotent overwrite).
   if (Array.isArray(sections)) {

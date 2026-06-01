@@ -778,9 +778,10 @@ async function loadChecklists() {
       ? '<tr class="empty-row"><td colspan="5">No checklists yet — click "+ New Checklist" to create one.</td></tr>'
       : rows.map(c => `
       <tr>
-        <td>${c.id}</td>
+        <td><code style="font-size:11px;">${escapeHtml(c.code || ('#'+c.id))}</code></td>
         <td><strong>${escapeHtml(c.name)}</strong>
-          <div style="color:var(--muted); font-size:11px;">by ${escapeHtml(c.created_by_name || '—')}${c.reviewer_name?` · rev. ${escapeHtml(c.reviewer_name)}`:''}${c.approver_name?` · app. ${escapeHtml(c.approver_name)}`:''}</div>
+          <div style="color:var(--muted); font-size:11px;">${escapeHtml(c.group_name || '—')} · by ${escapeHtml(c.created_by_name || '—')}${c.reviewer_name?` · rev. ${escapeHtml(c.reviewer_name)}`:''}${c.approver_name?` · app. ${escapeHtml(c.approver_name)}`:''}</div>
+          ${c.frequencies && c.frequencies.length ? `<div style="margin-top:3px;">${c.frequencies.map(f => `<span class="pill brown" style="font-size:9px; margin-right:3px;">${escapeHtml(f.name)}</span>`).join('')}</div>` : ''}
         </td>
         <td>${escapeHtml(c.version)}</td>
         <td>${statusPill(c.status)}</td>
@@ -794,7 +795,7 @@ async function previewChecklist(id) {
   try {
     const cl = await api('GET', `/api/checklists/${id}/full`);
     CURRENT_CHECKLIST_ID = id;
-    $('checklistPreviewTitle').innerHTML = `${escapeHtml(cl.name)} <span style="color:var(--muted); font-size:13px;">${escapeHtml(cl.version)}</span> ${statusPill(cl.status)}`;
+    $('checklistPreviewTitle').innerHTML = `<code style="font-size:12px; color:var(--muted);">${escapeHtml(cl.code || ('#'+cl.id))}</code> ${escapeHtml(cl.name)} <span style="color:var(--muted); font-size:13px;">${escapeHtml(cl.version)}</span> ${statusPill(cl.status)}`;
 
     // Build workflow action buttons based on status + permissions
     const isAuthor   = cl.created_by === CURRENT_USER.id;
@@ -820,6 +821,14 @@ async function previewChecklist(id) {
     }
     $('checklistPreviewActions').innerHTML = buttons.join(' ');
 
+    // Frequencies + Required fields banner
+    const freqsHtml = cl.frequencies && cl.frequencies.length
+      ? `<div style="margin-top:4px;">Frequencies: ${cl.frequencies.map(f => `<span class="pill brown" style="font-size:10px; margin-right:3px;">${escapeHtml(f.name)}</span>`).join('')}</div>`
+      : '';
+    const reqLabelMap = Object.fromEntries(REQUIRED_FIELD_DEFS.map(rf => [rf.key, rf.label]));
+    const reqdHtml = cl.required_fields && cl.required_fields.length
+      ? `<div style="margin-top:4px;">Required Fields: ${cl.required_fields.map(k => `<span class="pill blue" style="font-size:10px; margin-right:3px;">${escapeHtml(reqLabelMap[k] || k)}</span>`).join('')}</div>`
+      : '';
     // Workflow info banner
     const wf = `
       <div style="margin:8px 0 12px; padding:8px 12px; background:var(--cream-100); border-radius:6px; font-size:12px;">
@@ -831,6 +840,7 @@ async function previewChecklist(id) {
         ${cl.reviewed_at ? `<div style="color:var(--muted);">Reviewed ${escapeHtml(cl.reviewed_at)}</div>` : ''}
         ${cl.approved_at ? `<div style="color:var(--muted);">Approved ${escapeHtml(cl.approved_at)}</div>` : ''}
         ${cl.rejection_reason ? `<div style="color:var(--red); margin-top:3px;"><strong>Rejected:</strong> ${escapeHtml(cl.rejection_reason)}</div>` : ''}
+        ${freqsHtml}${reqdHtml}
       </div>`;
 
     let html = wf;
@@ -1564,14 +1574,29 @@ async function deleteActivity(id) {
 // ===========================================================
 // CHECKLIST BUILDER
 // ===========================================================
+// Standard "Required Fields" that the checklist designer can toggle on, captured at execution.
+const REQUIRED_FIELD_DEFS = [
+  { key:'area',             label:'Area ID & Area Name',               auto: true,  desc:'Auto-populated from the assigned equipment' },
+  { key:'equipment',        label:'Equipment ID & Equipment Name',     auto: true,  desc:'Auto-populated from the assignment' },
+  { key:'capacity_make',    label:'Capacity & Make / Location',        auto: true,  desc:'Auto-populated from the equipment record' },
+  { key:'spares',           label:'Spares Utilized',                   auto: false, desc:'Executor lists spares used' },
+  { key:'validation_by',    label:'Validation Performed By',           auto: false, desc:'Name / signature of validator' },
+  { key:'corrective',       label:'Corrective Action',                 auto: false, desc:'Describes any corrective action taken' },
+  { key:'external_report',  label:'External Service Report',           auto: false, desc:'Reference / notes for an external service report' },
+];
+
 async function openChecklistBuilder(existingId) {
   try {
-    const [groups, cats] = await Promise.all([
-      api('GET','/api/checklist-groups'),
+    const [groups, cats, freqs] = await Promise.all([
+      api('GET','/api/checklist-groups?active=1'),
       api('GET','/api/pm-categories'),
+      api('GET','/api/frequencies'),
     ]);
+    const activeFreqs = freqs.filter(f => (f.status || 'Active') === 'Active');
     let cl = null;
     if (existingId) cl = await api('GET', `/api/checklists/${existingId}/full`);
+    const existingFreqIds = new Set(((cl && cl.frequencies) || []).map(f => f.id));
+    const existingReqd    = new Set(((cl && cl.required_fields) || []));
     // Seed initial sections data
     let sections = (cl && cl.sections && cl.sections.length)
       ? cl.sections.map(s => ({
@@ -1585,15 +1610,51 @@ async function openChecklistBuilder(existingId) {
       : [{ name:'Section 1', description:'', questions:[{ label:'', qtype:'text', options:'', required:true, min_value:null, max_value:null, unit:'' }] }];
 
     const renderBuilder = () => `
-      <div class="form-row"><label>Checklist Name *</label><input name="name" value="${escapeHtml(cl?.name || '')}" required /></div>
-      <div class="form-row"><label>Version</label><input name="version" value="${escapeHtml(cl?.version || 'v1.0')}" /></div>
-      <div class="form-row"><label>Check List Group</label>
-        <select name="group_id"><option value="">—</option>${groups.map(g => `<option value="${g.id}" ${cl && cl.group_id===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}</select>
+      <div class="form-row"><label>PM Checklist Group *</label>
+        <select name="group_id" required>
+          <option value="">— select group —</option>
+          ${groups.map(g => `<option value="${g.id}" ${cl && cl.group_id===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}
+        </select>
       </div>
+      <div class="form-row"><label>Checklist ID *</label>
+        <input name="code" value="${escapeHtml(cl?.code || '')}" required minlength="2" maxlength="50" pattern="[A-Za-z0-9_\\-]{2,50}"
+               placeholder="e.g., CHK-AHU-M (2-50 alphanumeric, - and _ allowed)" />
+      </div>
+      <div class="form-row"><label>Checklist Name *</label>
+        <input name="name" value="${escapeHtml(cl?.name || '')}" required minlength="3" maxlength="300" placeholder="3-300 characters" />
+      </div>
+      <div class="form-row"><label>Version</label><input name="version" value="${escapeHtml(cl?.version || 'v1.0')}" /></div>
       <div class="form-row"><label>Maintenance Category</label>
         <select name="category_id"><option value="">—</option>${cats.map(c => `<option value="${c.id}" ${cl && cl.category_id===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}</select>
       </div>
       <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(cl?.description || '')}</textarea></div>
+
+      <div class="form-row" style="grid-template-columns:1fr;">
+        <label>Frequency * <span style="color:var(--muted); font-weight:400; font-size:11px;">(check all that apply)</span></label>
+        <div id="cbFreqs" style="display:flex; flex-wrap:wrap; gap:8px 14px;">
+          ${activeFreqs.map(f => `
+            <label style="display:inline-flex; align-items:center; gap:5px; font-size:13px;">
+              <input type="checkbox" class="cb-freq" value="${f.id}" ${existingFreqIds.has(f.id)?'checked':''} />
+              ${escapeHtml(f.name)} <span style="color:var(--muted); font-size:11px;">(${f.days}d)</span>
+            </label>`).join('')}
+        </div>
+      </div>
+
+      <div class="form-row" style="grid-template-columns:1fr;">
+        <label>Required Fields <span style="color:var(--muted); font-weight:400; font-size:11px;">(configurable execution fields)</span></label>
+        <div id="cbReqd" style="display:flex; flex-direction:column; gap:4px;">
+          ${REQUIRED_FIELD_DEFS.map(rf => `
+            <label style="display:flex; align-items:flex-start; gap:6px; font-size:13px; padding:3px 0;">
+              <input type="checkbox" class="cb-reqd" value="${rf.key}" ${existingReqd.has(rf.key)?'checked':''} style="margin-top:3px;" />
+              <span>
+                <strong>${escapeHtml(rf.label)}</strong>
+                ${rf.auto ? '<span class="pill blue" style="font-size:9px; margin-left:5px;">AUTO</span>' : ''}
+                <div style="color:var(--muted); font-size:11px;">${escapeHtml(rf.desc)}</div>
+              </span>
+            </label>`).join('')}
+        </div>
+      </div>
+
       <hr class="sep" />
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <strong>Sections &amp; Questions</strong>
@@ -1685,12 +1746,19 @@ async function openChecklistBuilder(existingId) {
             required: q.required, min_value: q.min_value, max_value: q.max_value, unit: q.unit
           }))
         })).filter(s => s.questions.length > 0);
+        const freqIds = Array.from(document.querySelectorAll('.cb-freq:checked')).map(c => Number(c.value));
+        const reqdKeys = Array.from(document.querySelectorAll('.cb-reqd:checked')).map(c => c.value);
+        if (!data.group_id) throw new Error('PM Checklist Group is required');
+        if (freqIds.length === 0) throw new Error('Pick at least one Frequency');
         const payload = {
+          code: data.code,
           name: data.name, version: data.version || 'v1.0',
           description: data.description || '',
           group_id: data.group_id ? Number(data.group_id) : null,
           category_id: data.category_id ? Number(data.category_id) : null,
-          sections: built
+          sections: built,
+          required_fields: reqdKeys,
+          frequency_ids: freqIds,
         };
         if (existingId) await api('PUT', `/api/checklists/${existingId}`, payload);
         else            await api('POST','/api/checklists', payload);
@@ -2108,6 +2176,48 @@ async function openAssignment(assignmentId) {
     const approverActing   = a.status === 'Pending Approval' && (amApprover || amAdmin);
     const formEditable     = executorEditable;
 
+    // Fetch equipment context for auto-populated Required Fields when target is equipment.
+    let eqCtx = null;
+    if (a.target_type === 'equipment' && a.target_id) {
+      try { eqCtx = await api('GET', `/api/equipment/${a.target_id}`); } catch (e) {}
+    }
+    // Build Required Fields block based on the checklist's enabled keys.
+    const requiredKeys = (cl && cl.required_fields) || [];
+    const rfLabelMap = Object.fromEntries(REQUIRED_FIELD_DEFS.map(rf => [rf.key, rf]));
+    const autoVal = (key) => {
+      if (!eqCtx && key === 'area') return '';
+      switch (key) {
+        case 'area':          return eqCtx ? `${eqCtx.area_id || ''}` : '';
+        case 'equipment':     return eqCtx ? `${eqCtx.equipment_id} · ${eqCtx.name}` : '';
+        case 'capacity_make': return eqCtx ? [eqCtx.capacity, eqCtx.make, eqCtx.model].filter(Boolean).join(' / ') : '';
+        default: return '';
+      }
+    };
+    const rfDis = formEditable ? '' : 'disabled';
+    const rfHtml = requiredKeys.length ? `
+      <div style="margin: 4px 0 8px; padding: 8px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
+        <strong>Required Fields</strong>
+        <div style="color:var(--muted); font-size:11px;">Configurable execution fields enabled on this checklist.</div>
+      </div>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px 16px; margin-bottom:12px;">
+        ${requiredKeys.map(key => {
+          const def = rfLabelMap[key];
+          if (!def) return '';
+          if (def.auto) {
+            const v = autoVal(key);
+            return `<div>
+              <div style="font-size:11px; color:var(--muted); text-transform:uppercase;">${escapeHtml(def.label)}</div>
+              <input type="text" name="rf_${key}" value="${escapeHtml(v)}" readonly style="background:var(--cream-100);" />
+            </div>`;
+          }
+          const v = existing[`rf_${key}`] ?? '';
+          return `<div>
+            <div style="font-size:11px; color:var(--muted); text-transform:uppercase;">${escapeHtml(def.label)}</div>
+            <input type="text" name="rf_${key}" value="${escapeHtml(v)}" ${rfDis} placeholder="${escapeHtml(def.desc)}" />
+          </div>`;
+        }).join('')}
+      </div>` : '';
+
     const sectionsHtml = (cl?.sections || []).map((s, si) => `
       <div style="margin: 10px 0 6px; padding: 8px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
         <strong>${si+1}. ${escapeHtml(s.name)}</strong>
@@ -2185,7 +2295,7 @@ async function openAssignment(assignmentId) {
     openModal({
       title: `Assignment ${a.assignment_id} — ${escapeHtml(cl?.name || '')}`,
       width: 780,
-      body: `${banner}${sectionsHtml}${notesBox}${sigsHtml}`,
+      body: `${banner}${rfHtml}${sectionsHtml}${notesBox}${sigsHtml}`,
       actions: actionsHtml,
       hideDefaultSubmit: true,
     });
@@ -2195,7 +2305,10 @@ async function openAssignment(assignmentId) {
 // ---- Executor actions ----
 function _collectAssignmentResponses() {
   const resp = {};
-  document.querySelectorAll('input[name^="q_"], select[name^="q_"], textarea[name^="q_"]').forEach(el => {
+  document.querySelectorAll(
+    'input[name^="q_"], select[name^="q_"], textarea[name^="q_"], ' +
+    'input[name^="rf_"], select[name^="rf_"], textarea[name^="rf_"]'
+  ).forEach(el => {
     if (el.type === 'checkbox') resp[el.name] = el.checked;
     else                        resp[el.name] = el.value;
   });
