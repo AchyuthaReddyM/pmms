@@ -98,8 +98,8 @@ function onLoggedIn() {
 }
 
 // ---------- Routing ----------
-const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','execution','tasks','pmstatus','calendar','breakdown','reports','audit','compliance','about'];
-const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', execution:'PM Execution', tasks:'My Tasks', pmstatus:'PM Status', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
+const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','execution','tasks','pmstatus','expired','calendar','breakdown','reports','audit','compliance','about'];
+const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', execution:'PM Execution', tasks:'My Tasks', pmstatus:'PM Status', expired:'Expired Equipment', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
 
 function goto(name) {
   PAGES.forEach(p => $('page-'+p)?.classList.toggle('active', p === name));
@@ -118,6 +118,7 @@ function goto(name) {
     execution: loadPmList,
     tasks: () => loadTasks('inbox'),
     pmstatus: loadPmStatusPage,
+    expired: loadExpiredPage,
     calendar: loadCalendar,
     breakdown: loadBreakdowns,
     audit: () => loadAudit(100),
@@ -223,7 +224,7 @@ function statusPill(status) {
     'Inactive':'gray','Under Review':'amber','Locked':'amber','Validation':'amber',
     'Under Maintenance':'red',
     // Checklist workflow states
-    'Draft':'gray','Pending Review':'amber','Pending Approval':'amber','Rejected':'red'
+    'Draft':'gray','Pending Review':'amber','Pending Approval':'amber','Rejected':'red','Expired':'red'
   };
   return `<span class="pill ${map[status] || 'gray'}">${escapeHtml(status)}</span>`;
 }
@@ -2302,7 +2303,12 @@ async function openAssignment(assignmentId) {
         &nbsp;→&nbsp; Approver <strong>${escapeHtml(a.approver_name || '—')}</strong>
         &nbsp;·&nbsp; Assigned by ${escapeHtml(a.assigned_by_name || '')}
       </div>
-      ${a.rejection_reason ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fdecec; border-left:3px solid var(--red); border-radius:6px; font-size:12px;"><strong>Returned for rework:</strong> ${escapeHtml(a.rejection_reason)}</div>` : ''}`;
+      ${a.rejection_reason ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fdecec; border-left:3px solid var(--red); border-radius:6px; font-size:12px;"><strong>Returned for rework:</strong> ${escapeHtml(a.rejection_reason)}</div>` : ''}
+      ${a.pnc_number ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fff5e6; border-left:3px solid #c77b00; border-radius:6px; font-size:12px;">
+        <strong>Re-assignment from Expired</strong>
+        <div style="margin-top:3px;">PNC: <strong>${escapeHtml(a.pnc_number)}</strong> · Exception: <strong>${escapeHtml(a.exception_number || '')}</strong></div>
+        ${a.exception_description ? `<div style="color:var(--muted); margin-top:3px;">${escapeHtml(a.exception_description)}</div>` : ''}
+      </div>` : ''}`;
 
     // Signatures so far
     const sigCard = (label, sig, ts) => sig
@@ -2570,6 +2576,102 @@ async function fetchPmStatus(equipmentId) {
   } catch (e) {
     $('pmStatusResult').innerHTML = `<div class="card" style="border-left:4px solid var(--red);"><strong style="color:var(--red);">${escapeHtml(e.message)}</strong></div>`;
   }
+}
+
+// ===========================================================
+// EXPIRED EQUIPMENT ASSIGNMENT
+// ===========================================================
+async function loadExpiredPage() {
+  try {
+    const { rows, flipped } = await api('GET', '/api/assignments/expired');
+    if (flipped > 0) toast(`${flipped} assignment(s) just expired and moved to this list.`, 'success');
+    $('expiredBody').innerHTML = (!rows || rows.length === 0)
+      ? '<tr class="empty-row"><td colspan="8" style="text-align:center; padding:18px;">🎉 No expired equipment — everything is on schedule.</td></tr>'
+      : rows.map(a => `<tr>
+          <td><strong>${escapeHtml(a.assignment_id)}</strong>${a.checklist_name?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_name)} (${escapeHtml(a.checklist_version || '')})</div>`:''}</td>
+          <td>${escapeHtml(a.plant_name || '—')}${a.unit_number ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.unit_number)}</div>` : ''}</td>
+          <td><strong>${escapeHtml(a.target_id || '—')}</strong></td>
+          <td>${escapeHtml(a.equipment_description || '—')}</td>
+          <td>${escapeHtml(a.frequency || '—')}</td>
+          <td>${escapeHtml(a.due_date || '—')}${a.expired_at?`<div style="color:var(--red); font-size:11px;">expired ${escapeHtml(a.expired_at)}</div>`:''}</td>
+          <td>${statusPill('Expired')}</td>
+          <td><button class="btn primary sm" onclick='openReassignExpiredModal(${escapeHtml(JSON.stringify(a))})'>Re-assign</button></td>
+        </tr>`).join('');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function openReassignExpiredModal(assignment) {
+  try {
+    const [users, roles] = await Promise.all([api('GET','/api/users'), api('GET','/api/roles')]);
+    const executorSet = usersWithActivity(users, roles, 'execute_checklist','execute_pm');
+    const reviewerSet = usersWithActivity(users, roles, 'review_pm','review_checklist');
+    const approverSet = usersWithActivity(users, roles, 'approve_pm','approve_checklist');
+    const executors = users.filter(u => executorSet.has(u.id));
+    const reviewers = users.filter(u => reviewerSet.has(u.id));
+    const approvers = users.filter(u => approverSet.has(u.id));
+    if (executors.length === 0) { toast('No users with execute permission.','error'); return; }
+
+    const todayStr = new Date().toISOString().slice(0,10);
+
+    openModal({
+      title: `Re-assign Expired PM — ${escapeHtml(assignment.assignment_id)}`,
+      width: 600,
+      body: `
+        <div class="row-gap" style="font-size:12px; margin-bottom: 14px;">
+          ${statusPill('Expired')}
+          <span class="pill brown">${escapeHtml(assignment.target_id)} · ${escapeHtml(assignment.equipment_description || '')}</span>
+          ${assignment.plant_name ? `<span class="pill brown">${escapeHtml(assignment.plant_name)}${assignment.unit_number?' · '+escapeHtml(assignment.unit_number):''}</span>` : ''}
+          ${assignment.due_date ? `<span class="pill brown">Original due: ${escapeHtml(assignment.due_date)}</span>` : ''}
+          ${assignment.frequency ? `<span class="pill brown">${escapeHtml(assignment.frequency)}</span>` : ''}
+        </div>
+        <p style="font-size:12px; color:var(--muted); margin-top:0;">This PM crossed its post-tolerance window. The fields below are mandatory before the re-assignment can be saved.</p>
+
+        <div style="background:#fdecec; border-left:3px solid var(--red); padding:8px 12px; border-radius:6px; margin-bottom:14px;">
+          <strong style="font-size:12px;">Exception Details</strong>
+          <div class="form-row" style="margin-top:6px;"><label>PNC Number *</label><input name="pnc_number" required placeholder="Plant Non-Conformance reference" /></div>
+          <div class="form-row"><label>Exception Number *</label><input name="exception_number" required placeholder="Exception / deviation log #" /></div>
+          <div class="form-row" style="grid-template-columns:1fr;"><label>Other Description *</label><textarea name="exception_description" required placeholder="Reason for the delay + justification for the re-assignment" rows="2"></textarea></div>
+        </div>
+
+        <div class="form-row"><label>Executor *</label>
+          <select name="assignee_id" required>
+            <option value="">— select executor —</option>
+            ${executors.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>Reviewer (Engineering)</label>
+          <select name="reviewer_id">
+            <option value="">— keep original (${escapeHtml(assignment.reviewer_name || '—')}) —</option>
+            ${reviewers.map(u => `<option value="${u.id}" ${u.id===assignment.reviewer_id?'selected':''}>${escapeHtml(u.name)} — ${escapeHtml(u.role)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>Approver (QA)</label>
+          <select name="approver_id">
+            <option value="">— keep original (${escapeHtml(assignment.approver_name || '—')}) —</option>
+            ${approvers.map(u => `<option value="${u.id}" ${u.id===assignment.approver_id?'selected':''}>${escapeHtml(u.name)} — ${escapeHtml(u.role)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>New Effective Date</label><input name="effective_date" type="date" value="${todayStr}" /></div>
+        <div class="form-row"><label>New Due Date</label><input name="due_date" type="date" /></div>
+      `,
+      submitLabel: 'Re-assign Now',
+      onSubmit: async (data) => {
+        await api('PUT', `/api/assignments/${assignment.assignment_id}/reassign`, {
+          assignee_id: Number(data.assignee_id),
+          reviewer_id: data.reviewer_id ? Number(data.reviewer_id) : null,
+          approver_id: data.approver_id ? Number(data.approver_id) : null,
+          pnc_number: data.pnc_number,
+          exception_number: data.exception_number,
+          exception_description: data.exception_description,
+          effective_date: data.effective_date || null,
+          due_date: data.due_date || null,
+        });
+        toast(`Expired PM ${assignment.assignment_id} re-assigned.`, 'success');
+        loadExpiredPage();
+        refreshNotifBadge();
+      }
+    });
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 // ===========================================================

@@ -454,6 +454,9 @@ app.get('/api/equipment/:equipment_id/pm-status', requireAuth, (req, res) => {
   if (!latest) {
     status = 'Out of PM Schedule';
     reason = 'No PM has ever been assigned to this equipment.';
+  } else if (latest.status === 'Expired') {
+    status = 'Out of PM Schedule';
+    reason = 'PM crossed its post-tolerance window and is awaiting re-assignment with exception details.';
   } else if (latest.status === 'Rejected') {
     status = 'Preventive Maintenance Rejected';
     reason = latest.rejection_reason || 'PM execution was rejected.';
@@ -1727,6 +1730,137 @@ app.put('/api/assignments/:assignment_id/approve', requireAuth, requireActivity(
     }
     audit(req.user, 'APPROVE', 'Assignment', req.params.assignment_id, `Final approval — assignment closed`);
   }
+  res.json({ ok: true });
+});
+
+// =============================================================
+// EXPIRED EQUIPMENT — auto-detect + re-assign workflow
+// =============================================================
+// Lifecycle: Pending/In Progress/Pending Review/Pending Approval
+//            -> Expired (auto when today > due_date + tolerance, or effective + freq.days + tolerance)
+//            -> Pending (via re-assign with PNC + Exception + Description)
+function markExpiredAssignments() {
+  const rows = db.prepare(`
+    SELECT ca.assignment_id, ca.due_date, ca.effective_date, ca.status,
+           f.days AS freq_days, f.tolerance_days
+    FROM checklist_assignments ca
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    WHERE ca.status IN ('Pending','In Progress','Pending Review','Pending Approval')
+  `).all();
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const today = new Date(todayStr);
+  const upd = db.prepare("UPDATE checklist_assignments SET status='Expired', expired_at=datetime('now') WHERE assignment_id=?");
+  let n = 0;
+  for (const a of rows) {
+    const tol = Number(a.tolerance_days || 0);
+    let expireBy = null;
+    if (a.due_date) {
+      const d = new Date(a.due_date);
+      d.setDate(d.getDate() + tol);
+      expireBy = d;
+    } else if (a.effective_date && a.freq_days) {
+      const d = new Date(a.effective_date);
+      d.setDate(d.getDate() + Number(a.freq_days) + tol);
+      expireBy = d;
+    }
+    if (expireBy && today > expireBy) {
+      upd.run(a.assignment_id);
+      n++;
+    }
+  }
+  return n;
+}
+
+app.get('/api/assignments/expired', requireAuth, (req, res) => {
+  const flipped = markExpiredAssignments();
+  const rows = db.prepare(`
+    SELECT ca.assignment_id, ca.checklist_id, ca.target_id,
+           ca.assignee_id, ca.reviewer_id, ca.approver_id,
+           ca.frequency_id, ca.effective_date, ca.due_date, ca.status,
+           ca.pnc_number, ca.exception_number, ca.exception_description,
+           ca.expired_at, ca.reassigned_at,
+           cl.name AS checklist_name, cl.version AS checklist_version,
+           f.name AS frequency,
+           e.name AS equipment_name, e.make, e.model, e.capacity,
+           a.area_id, a.name AS area_name,
+           l.location_id, l.description AS location_name,
+           b.block_id, b.name AS block_name,
+           p.plant_id, p.unit_number, p.name AS plant_name,
+           u.name AS assignee_name,
+           rv.name AS reviewer_name, ap.name AS approver_name
+    FROM checklist_assignments ca
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    LEFT JOIN equipment e   ON e.equipment_id = ca.target_id
+    LEFT JOIN areas a       ON a.area_id      = e.area_id
+    LEFT JOIN locations l   ON l.location_id  = a.location_id
+    LEFT JOIN blocks b      ON b.block_id     = l.block_id
+    LEFT JOIN plants p      ON p.plant_id     = b.plant_id
+    LEFT JOIN users u   ON u.id   = ca.assignee_id
+    LEFT JOIN users rv  ON rv.id  = ca.reviewer_id
+    LEFT JOIN users ap  ON ap.id  = ca.approver_id
+    WHERE ca.target_type='equipment' AND ca.status='Expired'
+    ORDER BY date(ca.due_date) ASC, ca.id ASC
+  `).all();
+  // Synthesised "equipment_description"
+  rows.forEach(r => {
+    r.equipment_description = [r.make, r.model, r.capacity].filter(Boolean).join(' / ') || r.equipment_name || '—';
+  });
+  res.json({ flipped, rows });
+});
+
+app.put('/api/assignments/:assignment_id/reassign', requireAuth, requireActivity('assign_checklist'), (req, res) => {
+  const { assignee_id, reviewer_id, approver_id, pnc_number, exception_number, exception_description, effective_date, due_date } = req.body || {};
+  if (!pnc_number || !pnc_number.trim()) return res.status(400).json({ error: 'PNC Number is required to re-assign an expired PM' });
+  if (!exception_number || !exception_number.trim()) return res.status(400).json({ error: 'Exception Number is required' });
+  if (!exception_description || !exception_description.trim()) return res.status(400).json({ error: 'Other Description is required' });
+  if (!assignee_id) return res.status(400).json({ error: 'Executor (assignee_id) is required' });
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Expired') return res.status(409).json({ error: `Cannot re-assign from status "${a.status}". Only Expired assignments are re-assignable.` });
+
+  const u = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
+  if (!u) return res.status(400).json({ error: 'Unknown assignee_id' });
+
+  // Validate reviewer + approver. Default to the originals if not provided.
+  const finalRev = reviewer_id || a.reviewer_id;
+  const finalApp = approver_id || a.approver_id;
+  if (!finalRev || !finalApp) return res.status(400).json({ error: 'Reviewer and Approver must be set' });
+  if (finalRev === finalApp) return res.status(400).json({ error: 'Reviewer and Approver must be different users' });
+  if (finalRev === u.id || finalApp === u.id) return res.status(400).json({ error: 'Executor cannot also be their own reviewer or approver' });
+
+  db.prepare(`UPDATE checklist_assignments SET
+      status='Pending',
+      assignee_id=?,
+      reviewer_id=?,
+      approver_id=?,
+      pnc_number=?,
+      exception_number=?,
+      exception_description=?,
+      effective_date=COALESCE(?,effective_date),
+      due_date=COALESCE(?,due_date),
+      reassigned_at=datetime('now'),
+      reassigned_by=?,
+      -- clear stale execution state from the previous run
+      response_data=NULL,
+      executor_sig=NULL, reviewer_sig=NULL, approver_sig=NULL,
+      submitted_at=NULL, reviewed_at=NULL, approved_at=NULL,
+      started_at=NULL, completed_at=NULL,
+      rejection_reason=NULL
+    WHERE assignment_id=?`)
+    .run(u.id, finalRev, finalApp,
+         pnc_number.trim(), exception_number.trim(), exception_description.trim(),
+         effective_date || null, due_date || null,
+         req.user.id, req.params.assignment_id);
+
+  notify(u.id,
+    'Expired PM re-assigned to you',
+    `${req.params.assignment_id} re-assigned by ${req.user.name}. Exception ${exception_number.trim()} (PNC ${pnc_number.trim()}).`,
+    'assignment',
+    `/assignments/${req.params.assignment_id}`);
+
+  audit(req.user, 'REASSIGN', 'Assignment', req.params.assignment_id,
+    `Re-assigned expired PM to ${u.name} (PNC ${pnc_number.trim()}, Exception ${exception_number.trim()})`);
   res.json({ ok: true });
 });
 

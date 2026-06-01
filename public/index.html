@@ -78,6 +78,7 @@
       <a data-page="execution"><span class="ico">🛠️</span> PM Execution</a>
       <a data-page="tasks"><span class="ico">📌</span> My Tasks</a>
       <a data-page="pmstatus"><span class="ico">📍</span> PM Status</a>
+      <a data-page="expired"><span class="ico">⚠️</span> Expired Equipment</a>
       <a data-page="calendar"><span class="ico">🗓️</span> Calendar</a>
       <a data-page="breakdown"><span class="ico">🚨</span> Breakdown</a>
 
@@ -408,6 +409,32 @@
           <div class="card"><span class="pill red">Expired</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Past tolerance</p></div>
           <div class="card"><span class="pill blue">Escalated</span><p style="color:var(--muted); margin:8px 0 0; font-size:12px;">Alert to dept. head</p></div>
         </div>
+      </div>
+
+      <!-- =========== EXPIRED EQUIPMENT ASSIGNMENT =========== -->
+      <div class="page" id="page-expired">
+        <div class="page-head">
+          <div><h1>Expired Equipment Assignment</h1><p>PM activities that crossed their due date plus post-tolerance window. Re-assign with PNC and Exception details to put them back into execution.</p></div>
+          <div class="actions">
+            <button class="btn ghost" onclick="loadExpiredPage()">🔄 Refresh</button>
+          </div>
+        </div>
+        <div class="card">
+          <table class="tbl">
+            <thead><tr>
+              <th>Assignment</th>
+              <th>Plant</th>
+              <th>Equipment ID</th>
+              <th>Equipment Description</th>
+              <th>Frequency</th>
+              <th>Due Date</th>
+              <th>Current Status</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="expiredBody"></tbody>
+          </table>
+        </div>
+        <p style="font-size:11px; color:var(--muted); margin-top:12px;">Equipment automatically moves to this list when the PM crosses its scheduled date plus the post-tolerance window. The transition is detected on every refresh and on every PM Status / Calendar page view.</p>
       </div>
 
       <!-- =========== PM STATUS LABEL =========== -->

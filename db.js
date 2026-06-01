@@ -248,6 +248,13 @@ function createSchema() {
       reviewer_sig TEXT,
       approver_sig TEXT,
       rejection_reason TEXT,
+      -- Expired-PM re-assignment metadata (mandatory when re-assigning from 'Expired')
+      pnc_number TEXT,
+      exception_number TEXT,
+      exception_description TEXT,
+      expired_at TEXT,
+      reassigned_at TEXT,
+      reassigned_by INTEGER REFERENCES users(id),
       assigned_by INTEGER REFERENCES users(id),
       assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
       started_at TEXT,
@@ -642,6 +649,16 @@ function seed() {
          'AHU Monthly Inspection (v2) for EQ-AHU-12 is due ' + fmt(addDays(today,3)) + '.',
          'assignment',
          '/assignments/CA-001');
+
+  // CA-002 — a deliberately-overdue assignment to populate the Expired Equipment module.
+  // EQ-AHU-08 had a Monthly PM scheduled 45 days ago that was never picked up — tolerance long crossed.
+  ins(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,effective_date,due_date,status,expired_at,assigned_by)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?, datetime('now','-7 days'), ?)`)
+    .run('CA-002', ahuCl, 'equipment', 'EQ-AHU-08',
+         null, u('rmehta'), u('qaapprove'),
+         db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
+         fmt(addDays(today, -45)), fmt(addDays(today, -38)),
+         'Expired', u('siyer'));
 
   // Breakdowns
   const insBd = ins('INSERT INTO breakdowns(bd_id,equipment_id,reported_by,severity,status,description) VALUES (?,?,?,?,?,?)');
