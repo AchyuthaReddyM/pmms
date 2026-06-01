@@ -2582,10 +2582,12 @@ async function fetchPmStatus(equipmentId) {
 // EXPIRED EQUIPMENT ASSIGNMENT
 // ===========================================================
 async function loadExpiredPage() {
+  const body = $('expiredBody');
+  if (body) body.innerHTML = '<tr class="empty-row"><td colspan="8" style="text-align:center; padding:18px; color:var(--muted);">Loading…</td></tr>';
   try {
     const { rows, flipped } = await api('GET', '/api/assignments/expired');
     if (flipped > 0) toast(`${flipped} assignment(s) just expired and moved to this list.`, 'success');
-    $('expiredBody').innerHTML = (!rows || rows.length === 0)
+    body.innerHTML = (!rows || rows.length === 0)
       ? '<tr class="empty-row"><td colspan="8" style="text-align:center; padding:18px;">🎉 No expired equipment — everything is on schedule.</td></tr>'
       : rows.map(a => `<tr>
           <td><strong>${escapeHtml(a.assignment_id)}</strong>${a.checklist_name?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_name)} (${escapeHtml(a.checklist_version || '')})</div>`:''}</td>
@@ -2597,7 +2599,10 @@ async function loadExpiredPage() {
           <td>${statusPill('Expired')}</td>
           <td><button class="btn primary sm" onclick='openReassignExpiredModal(${escapeHtml(JSON.stringify(a))})'>Re-assign</button></td>
         </tr>`).join('');
-  } catch (e) { toast(e.message, 'error'); }
+  } catch (e) {
+    toast(e.message, 'error');
+    if (body) body.innerHTML = `<tr class="empty-row"><td colspan="8" style="text-align:center; padding:18px; color:var(--red);">Couldn't load expired equipment: ${escapeHtml(e.message)}</td></tr>`;
+  }
 }
 
 async function openReassignExpiredModal(assignment) {

@@ -1906,6 +1906,16 @@ app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.ht
 // 404 for unknown API paths only
 app.use('/api', (req, res) => res.status(404).json({ error: 'API route not found' }));
 
+// JSON error handler — any thrown / next(err) in /api routes ends up here.
+// Without this, Express renders an HTML stack trace which the client parses as "HTTP 500".
+app.use('/api', (err, req, res, next) => {
+  console.error(`[api error] ${req.method} ${req.originalUrl}: ${err.message}`);
+  if (err.stack) console.error(err.stack);
+  if (res.headersSent) return next(err);
+  const msg = err && err.message ? err.message : 'Internal server error';
+  res.status(500).json({ error: msg });
+});
+
 app.listen(PORT, '0.0.0.0', () => {
   const env = process.env.NODE_ENV || 'development';
   console.log('==========================================');

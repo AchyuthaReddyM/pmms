@@ -677,6 +677,81 @@ function seed() {
   insA.run('S. Iyer','APPROVE','PM','PM-2607','PM approved for execution');
 }
 
+// Schema migration: when an existing DB file is missing columns that newer code expects,
+// add them in-place so SELECTs don't blow up with "no such column".
+// (CREATE TABLE IF NOT EXISTS only creates the table; it doesn't reconcile columns.)
+function migrateSchema() {
+  function cols(table) {
+    try { return db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name); }
+    catch (e) { return []; }
+  }
+  function addColIfMissing(table, col, ddl) {
+    const existing = cols(table);
+    if (existing.length === 0) return; // table doesn't exist yet — createSchema will handle it
+    if (!existing.includes(col)) {
+      try {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
+        console.log(`[db] migration: added ${table}.${col}`);
+      } catch (e) {
+        console.error(`[db] migration failed for ${table}.${col}:`, e.message);
+      }
+    }
+  }
+  // plants
+  addColIfMissing('plants', 'unit_number', 'TEXT');
+  // users
+  addColIfMissing('users', 'employee_id', 'TEXT');
+  addColIfMissing('users', 'phone', 'TEXT');
+  addColIfMissing('users', 'role_id', 'INTEGER');
+  addColIfMissing('users', 'department_id', 'INTEGER');
+  // locations
+  addColIfMissing('locations', 'formulation_id', 'INTEGER');
+  // areas (added new "name" column without dropping legacy area_type)
+  addColIfMissing('areas', 'name', 'TEXT');
+  // equipment (split make_model -> make + model)
+  addColIfMissing('equipment', 'make', 'TEXT');
+  addColIfMissing('equipment', 'model', 'TEXT');
+  // checklist_groups
+  addColIfMissing('checklist_groups', 'department_id', 'INTEGER');
+  // checklists
+  addColIfMissing('checklists', 'code', 'TEXT');
+  addColIfMissing('checklists', 'description', 'TEXT');
+  addColIfMissing('checklists', 'category_id', 'INTEGER');
+  addColIfMissing('checklists', 'required_fields_json', 'TEXT');
+  addColIfMissing('checklists', 'created_by', 'INTEGER');
+  addColIfMissing('checklists', 'reviewer_id', 'INTEGER');
+  addColIfMissing('checklists', 'approver_id', 'INTEGER');
+  addColIfMissing('checklists', 'submitted_at', 'TEXT');
+  addColIfMissing('checklists', 'reviewed_at', 'TEXT');
+  addColIfMissing('checklists', 'approved_at', 'TEXT');
+  addColIfMissing('checklists', 'rejection_reason', 'TEXT');
+  // checklist_questions
+  addColIfMissing('checklist_questions', 'frequencies_json', 'TEXT');
+  // checklist_assignments (added a lot across rounds)
+  addColIfMissing('checklist_assignments', 'target_type', 'TEXT');
+  addColIfMissing('checklist_assignments', 'target_id', 'TEXT');
+  addColIfMissing('checklist_assignments', 'reviewer_id', 'INTEGER');
+  addColIfMissing('checklist_assignments', 'approver_id', 'INTEGER');
+  addColIfMissing('checklist_assignments', 'effective_date', 'TEXT');
+  addColIfMissing('checklist_assignments', 'executor_sig', 'TEXT');
+  addColIfMissing('checklist_assignments', 'reviewer_sig', 'TEXT');
+  addColIfMissing('checklist_assignments', 'approver_sig', 'TEXT');
+  addColIfMissing('checklist_assignments', 'rejection_reason', 'TEXT');
+  addColIfMissing('checklist_assignments', 'submitted_at', 'TEXT');
+  addColIfMissing('checklist_assignments', 'reviewed_at', 'TEXT');
+  addColIfMissing('checklist_assignments', 'approved_at', 'TEXT');
+  addColIfMissing('checklist_assignments', 'pnc_number', 'TEXT');
+  addColIfMissing('checklist_assignments', 'exception_number', 'TEXT');
+  addColIfMissing('checklist_assignments', 'exception_description', 'TEXT');
+  addColIfMissing('checklist_assignments', 'expired_at', 'TEXT');
+  addColIfMissing('checklist_assignments', 'reassigned_at', 'TEXT');
+  addColIfMissing('checklist_assignments', 'reassigned_by', 'INTEGER');
+  // frequencies / pm_categories — status column was added later
+  addColIfMissing('frequencies', 'status', "TEXT NOT NULL DEFAULT 'Active'");
+  addColIfMissing('pm_categories', 'status', "TEXT NOT NULL DEFAULT 'Active'");
+  addColIfMissing('pm_categories', 'description', 'TEXT');
+}
+
 function initAndSeed(force=false) {
   if (force) {
     db.exec(`
@@ -706,6 +781,7 @@ function initAndSeed(force=false) {
     `);
   }
   createSchema();
+  migrateSchema();
   seed();
 }
 
