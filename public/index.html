@@ -72,6 +72,7 @@
       <a data-page="settings"><span class="ico">🛡️</span> Admin Settings</a>
       <a data-page="pmconfig"><span class="ico">⚙️</span> PM Configuration</a>
       <a data-page="checklist"><span class="ico">📋</span> Checklists</a>
+      <a data-page="assignments"><span class="ico">🎯</span> Checklist Assignment</a>
 
       <div class="nav-section">Operations</div>
       <a data-page="execution"><span class="ico">🛠️</span> PM Execution</a>
@@ -270,10 +271,10 @@
             </table>
           </div>
           <div class="card">
-            <div class="card-head"><h3>Engineering Function</h3>
+            <div class="card-head"><h3>Check List Group</h3>
               <button class="btn primary sm" onclick="openGroupModal()">+ Add</button></div>
             <table class="tbl">
-              <thead><tr><th>Function</th><th>Department</th><th></th></tr></thead>
+              <thead><tr><th>Group</th><th>Department</th><th></th></tr></thead>
               <tbody id="groupBody"></tbody>
             </table>
           </div>
@@ -321,6 +322,36 @@
             </div>
             <div id="checklistPreviewBody"></div>
           </div>
+        </div>
+      </div>
+
+      <!-- =========== CHECKLIST ASSIGNMENT (manager view) =========== -->
+      <div class="page" id="page-assignments">
+        <div class="page-head">
+          <div><h1>Checklist Assignment</h1><p>Assign approved checklists to equipment for PM activities — by Block, Location, Area, Equipment, Category and Frequency.</p></div>
+          <div class="actions">
+            <button class="btn primary" onclick="openAssignChecklistModal()">+ New Assignment</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head" style="gap:8px;">
+            <h3 style="margin:0;">All Assignments</h3>
+            <select id="assnFilterStatus" onchange="loadAssignmentsPage()" style="margin-left:auto;">
+              <option value="">All Statuses</option>
+              <option>Pending</option><option>In Progress</option>
+              <option>Pending Review</option><option>Pending Approval</option>
+              <option>Completed</option><option>Rejected</option>
+            </select>
+          </div>
+          <table class="tbl">
+            <thead><tr>
+              <th>ID</th><th>Checklist</th><th>Equipment</th>
+              <th>Executor</th><th>Reviewer</th><th>Approver</th>
+              <th>Frequency</th><th>Effective</th><th>Due</th>
+              <th>Status</th><th></th>
+            </tr></thead>
+            <tbody id="assignmentsListBody"></tbody>
+          </table>
         </div>
       </div>
 

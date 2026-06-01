@@ -98,8 +98,8 @@ function onLoggedIn() {
 }
 
 // ---------- Routing ----------
-const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','execution','tasks','calendar','breakdown','reports','audit','compliance','about'];
-const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', execution:'PM Execution', tasks:'My Tasks', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
+const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','execution','tasks','calendar','breakdown','reports','audit','compliance','about'];
+const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', execution:'PM Execution', tasks:'My Tasks', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
 
 function goto(name) {
   PAGES.forEach(p => $('page-'+p)?.classList.toggle('active', p === name));
@@ -114,8 +114,9 @@ function goto(name) {
     settings: () => loadSettings('departments'),
     pmconfig: loadPmConfig,
     checklist: loadChecklists,
+    assignments: loadAssignmentsPage,
     execution: loadPmList,
-    tasks: () => loadTasks('mine'),
+    tasks: () => loadTasks('inbox'),
     calendar: loadCalendar,
     breakdown: loadBreakdowns,
     audit: () => loadAudit(100),
@@ -291,8 +292,9 @@ const MASTER_DEFS = {
   },
   equipment: {
     api: '/api/equipment',
-    head: ['Equipment ID','Name','Make / Model','Serial','Capacity','Area','Status','QR'],
-    row: r => [r.equipment_id, r.name, r.make_model, r.serial, r.capacity, r.area_id, statusPill(r.status), `<span title="${escapeHtml(r.qr_code)}">▣</span>`],
+    head: ['Equipment ID','Name','Make / Model','Serial','Capacity','Area','Status','QR','Actions'],
+    row: r => [r.equipment_id, r.name, r.make_model, r.serial, r.capacity, r.area_id, statusPill(r.status), `<span title="${escapeHtml(r.qr_code)}">▣</span>`,
+               `<button class="btn ghost sm" onclick="openAssignChecklistModal(null, '${escapeHtml(r.equipment_id)}')">🎯 Assign</button>`],
     canAdd: true,
     addFields: [
       { id:'name', label:'Equipment Name', required:true },
@@ -571,9 +573,9 @@ async function openGroupModal(existing) {
   let depts = [];
   try { depts = await api('GET','/api/departments'); } catch (e) {}
   openModal({
-    title: existing ? `Edit Engineering Function — ${escapeHtml(g.name)}` : 'Add Engineering Function',
+    title: existing ? `Edit Check List Group — ${escapeHtml(g.name)}` : 'Add Check List Group',
     body: `
-      <div class="form-row"><label>Engineering Function *</label><input name="name" value="${escapeHtml(g.name)}" required placeholder="e.g. Mechanical / Electrical / HVAC / Water Systems" /></div>
+      <div class="form-row"><label>Check List Group *</label><input name="name" value="${escapeHtml(g.name)}" required placeholder="e.g. Mechanical / Electrical / HVAC / Water Systems" /></div>
       <div class="form-row"><label>Department</label>
         <select name="department_id">
           <option value="">— none —</option>
@@ -1440,7 +1442,7 @@ async function openChecklistBuilder(existingId) {
     const renderBuilder = () => `
       <div class="form-row"><label>Checklist Name *</label><input name="name" value="${escapeHtml(cl?.name || '')}" required /></div>
       <div class="form-row"><label>Version</label><input name="version" value="${escapeHtml(cl?.version || 'v1.0')}" /></div>
-      <div class="form-row"><label>Engineering Function</label>
+      <div class="form-row"><label>Check List Group</label>
         <select name="group_id"><option value="">—</option>${groups.map(g => `<option value="${g.id}" ${cl && cl.group_id===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}</select>
       </div>
       <div class="form-row"><label>Maintenance Category</label>
@@ -1574,6 +1576,32 @@ function actionableForUser(a) {
   return null;
 }
 
+// ----- Checklist Assignment manager view (dedicated module) -----
+async function loadAssignmentsPage() {
+  try {
+    const filter = ($('assnFilterStatus') || {}).value || '';
+    const url = filter ? `/api/assignments?status=${encodeURIComponent(filter)}` : '/api/assignments';
+    const rows = await api('GET', url);
+    const body = $('assignmentsListBody');
+    if (!body) return;
+    body.innerHTML = rows.length === 0
+      ? '<tr class="empty-row"><td colspan="11">No assignments yet — click "+ New Assignment" to create one.</td></tr>'
+      : rows.map(a => `<tr>
+          <td><strong>${escapeHtml(a.assignment_id)}</strong></td>
+          <td>${escapeHtml(a.checklist_name || '')}<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_version || '')}</div></td>
+          <td>${escapeHtml(a.target_id || '')}${a.target_label ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.target_label)}</div>` : ''}</td>
+          <td>${escapeHtml(a.assignee_name || '— open —')}</td>
+          <td>${escapeHtml(a.reviewer_name || '—')}</td>
+          <td>${escapeHtml(a.approver_name || '—')}</td>
+          <td>${escapeHtml(a.frequency || '—')}</td>
+          <td>${escapeHtml(a.effective_date || '—')}</td>
+          <td>${escapeHtml(a.due_date || '—')}</td>
+          <td>${statusPill(a.status)}</td>
+          <td><button class="btn ghost sm" onclick="openAssignment('${escapeHtml(a.assignment_id)}')">Open</button></td>
+        </tr>`).join('');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
 async function loadTasks(tab) {
   CURRENT_TASKS_TAB = tab;
   document.querySelectorAll('#tasksTabs button').forEach(b => b.classList.toggle('active', b.dataset.tt === tab));
@@ -1607,7 +1635,7 @@ async function loadTasks(tab) {
   } catch (e) { toast(e.message,'error'); }
 }
 
-async function openAssignChecklistModal(presetChecklistId) {
+async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
   try {
     const [checklists, users, roles, freqs, cats, blocks, locations, areas, equipment] = await Promise.all([
       api('GET','/api/checklists?status=Approved'),
@@ -1806,11 +1834,34 @@ async function openAssignChecklistModal(presetChecklistId) {
           notes: data.notes || ''
         });
         toast('PM activity assigned. Executor notified.', 'success');
-        if ($('page-tasks').classList.contains('active')) loadTasks(CURRENT_TASKS_TAB);
+        if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+        if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
       }
     });
     // After the modal is in the DOM, sync reviewer/approver defaults for the initial checklist
-    setTimeout(() => window.__asnSyncReviewerApprover(), 50);
+    setTimeout(() => {
+      window.__asnSyncReviewerApprover();
+      // If pre-set equipment was passed (e.g. from Masters → Equipment row), walk the chain back
+      // and pre-select Block → Location → Area → Equipment.
+      if (presetEquipmentId) {
+        const eq = equipment.find(e => e.equipment_id === presetEquipmentId);
+        if (eq) {
+          const area = areas.find(a => a.area_id === eq.area_id);
+          const loc  = area && locations.find(l => l.location_id === area.location_id);
+          const blk  = loc  && blocks.find(b => b.block_id === loc.block_id);
+          if (blk) {
+            const bSel = document.getElementById('asnBlockSel'); bSel.value = blk.block_id; window.__asnOnBlock();
+          }
+          if (loc) {
+            const lSel = document.getElementById('asnLocSel'); lSel.value = loc.location_id; window.__asnOnLoc();
+          }
+          if (area) {
+            const aSel = document.getElementById('asnAreaSel'); aSel.value = area.area_id; window.__asnOnArea();
+          }
+          const eSel = document.getElementById('asnEqSel'); eSel.value = eq.equipment_id; window.__asnOnEq();
+        }
+      }
+    }, 50);
   } catch (e) { toast(e.message,'error'); }
 }
 
