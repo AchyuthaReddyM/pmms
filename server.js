@@ -1206,7 +1206,9 @@ function loadChecklistFull(id) {
     const qs = db.prepare('SELECT * FROM checklist_questions WHERE section_id=? ORDER BY position, id').all(s.id);
     for (const q of qs) {
       try { q.options = q.options_json ? JSON.parse(q.options_json) : null; } catch(e) { q.options = null; }
+      try { q.frequencies = q.frequencies_json ? JSON.parse(q.frequencies_json) : []; } catch(e) { q.frequencies = []; }
       delete q.options_json;
+      delete q.frequencies_json;
     }
     s.questions = qs;
   }
@@ -1274,14 +1276,17 @@ app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (
   saveChecklistFrequencies(newId, frequency_ids);
   if (Array.isArray(sections)) {
     const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
-    const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,position) VALUES (?,?,?,?,?,?,?,?,?)`);
+    const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,frequencies_json,position) VALUES (?,?,?,?,?,?,?,?,?,?)`);
     sections.forEach((s, sIdx) => {
       const sId = insSec.run(newId, s.name || `Section ${sIdx+1}`, s.description || '', sIdx+1).lastInsertRowid;
       (s.questions || []).forEach((q, qIdx) => {
+        const freqsJson = Array.isArray(q.frequencies) && q.frequencies.length
+          ? JSON.stringify(q.frequencies.map(Number).filter(Boolean))
+          : null;
         insQ.run(sId, q.label || 'Question', q.qtype || 'text',
                  q.options ? JSON.stringify(q.options) : null,
                  q.required ? 1 : 0,
-                 q.min_value ?? null, q.max_value ?? null, q.unit || null, qIdx+1);
+                 q.min_value ?? null, q.max_value ?? null, q.unit || null, freqsJson, qIdx+1);
       });
     });
   }
@@ -1327,14 +1332,17 @@ app.put('/api/checklists/:id', requireAuth, requireActivity('manage_checklists')
   if (Array.isArray(sections)) {
     db.prepare('DELETE FROM checklist_sections WHERE checklist_id=?').run(req.params.id);
     const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
-    const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,position) VALUES (?,?,?,?,?,?,?,?,?)`);
+    const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,frequencies_json,position) VALUES (?,?,?,?,?,?,?,?,?,?)`);
     sections.forEach((s, sIdx) => {
       const sId = insSec.run(req.params.id, s.name || `Section ${sIdx+1}`, s.description || '', sIdx+1).lastInsertRowid;
       (s.questions || []).forEach((q, qIdx) => {
+        const freqsJson = Array.isArray(q.frequencies) && q.frequencies.length
+          ? JSON.stringify(q.frequencies.map(Number).filter(Boolean))
+          : null;
         insQ.run(sId, q.label || 'Question', q.qtype || 'text',
                  q.options ? JSON.stringify(q.options) : null,
                  q.required ? 1 : 0,
-                 q.min_value ?? null, q.max_value ?? null, q.unit || null, qIdx+1);
+                 q.min_value ?? null, q.max_value ?? null, q.unit || null, freqsJson, qIdx+1);
       });
     });
   }

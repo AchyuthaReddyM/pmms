@@ -844,6 +844,8 @@ async function previewChecklist(id) {
         ${freqsHtml}${reqdHtml}
       </div>`;
 
+    // Map for rendering per-question frequency chips in the preview.
+    const freqNameMap = Object.fromEntries(((cl.frequencies) || []).map(f => [f.id, f.name]));
     let html = wf;
     if (cl.sections && cl.sections.length) {
       html += cl.sections.map((s, si) => `
@@ -851,12 +853,17 @@ async function previewChecklist(id) {
           <div style="font-weight:600;">${si+1}. ${escapeHtml(s.name)}</div>
           ${s.description ? `<div style="color:var(--muted); font-size:12px; margin-top:2px;">${escapeHtml(s.description)}</div>` : ''}
         </div>
-        <ul class="checklist">${s.questions.map((q, qi) => `
-          <li><div class="chk-num">${si+1}.${qi+1}</div>
+        <ul class="checklist">${s.questions.map((q, qi) => {
+          const freqChips = (q.frequencies && q.frequencies.length)
+            ? q.frequencies.map(id => `<span class="pill brown" style="font-size:9px; margin-right:3px;">${escapeHtml(freqNameMap[id] || ('#'+id))}</span>`).join('')
+            : '<em style="font-size:10px; color:var(--muted);">applies to all frequencies</em>';
+          return `<li><div class="chk-num">${si+1}.${qi+1}</div>
             <div class="chk-body">
               <div class="chk-title">${escapeHtml(q.label)}${q.required?' *':''}</div>
               <div class="chk-meta">Type: ${escapeHtml(q.qtype)}${q.options?' · {'+q.options.join('/')+'}':''}${q.min_value!=null?` · range ${q.min_value}–${q.max_value}${q.unit?' '+q.unit:''}`:''}</div>
-            </div></li>`).join('')}</ul>`).join('');
+              <div style="margin-top:3px;">${freqChips}</div>
+            </div></li>`;
+        }).join('')}</ul>`).join('');
     } else if (cl.legacy_fields) {
       html += '<ul class="checklist">' + cl.legacy_fields.map((f, i) => `
         <li><div class="chk-num">${i+1}</div>
@@ -1613,10 +1620,11 @@ async function openChecklistBuilder(existingId) {
           questions: (s.questions || []).map(q => ({
             label: q.label, qtype: q.qtype,
             options: q.options ? q.options.join('|') : '',
-            required: !!q.required, min_value: q.min_value, max_value: q.max_value, unit: q.unit || ''
+            required: !!q.required, min_value: q.min_value, max_value: q.max_value, unit: q.unit || '',
+            frequencies: Array.isArray(q.frequencies) ? q.frequencies.slice() : []
           }))
         }))
-      : [{ name:'Section 1', description:'', questions:[{ label:'', qtype:'text', options:'', required:true, min_value:null, max_value:null, unit:'' }] }];
+      : [{ name:'Section 1', description:'', questions:[{ label:'', qtype:'text', options:'', required:true, min_value:null, max_value:null, unit:'', frequencies: [] }] }];
 
     const renderBuilder = () => `
       <div class="form-row"><label>PM Checklist Group *</label>
@@ -1685,16 +1693,33 @@ async function openChecklistBuilder(existingId) {
         </div>
         <button type="button" class="btn ghost sm" onclick="__cbAddQ(${si})" style="margin-top:6px;">+ Add Question</button>
       </div>`;
-    const renderQuestion = (q, si, qi) => `
-      <div class="cb-q" data-qidx="${qi}" style="display:grid; grid-template-columns: 2fr 1fr 1.5fr auto auto; gap:6px; align-items:center; padding:5px 0;">
-        <input class="cb-qlabel" placeholder="Question label" value="${escapeHtml(q.label)}" />
-        <select class="cb-qtype">
-          ${['text','number','dropdown','checkbox','yesno'].map(t => `<option value="${t}" ${t===q.qtype?'selected':''}>${t}</option>`).join('')}
-        </select>
-        <input class="cb-qopts" placeholder="opt1 | opt2 (for dropdown)" value="${escapeHtml(q.options || '')}" />
-        <label style="font-size:11px; display:flex; gap:3px; align-items:center;"><input type="checkbox" class="cb-qreq" ${q.required?'checked':''} /> req</label>
-        <button type="button" class="btn ghost sm" onclick="__cbDelQ(${si}, ${qi})">×</button>
-      </div>`;
+    const renderQuestion = (q, si, qi) => {
+      // Per-question frequency chips. Empty q.frequencies means "applies to all" → render all as checked.
+      const allTicked = !q.frequencies || q.frequencies.length === 0;
+      const chips = activeFreqs.map(f => {
+        const checked = allTicked || q.frequencies.includes(f.id);
+        return `<label style="display:inline-flex; align-items:center; gap:3px; font-size:10px; padding:2px 7px; background:${checked?'var(--cream-100)':'transparent'}; border:1px solid var(--border); border-radius:10px; cursor:pointer;">
+          <input type="checkbox" class="cb-qfreq" value="${f.id}" ${checked?'checked':''} style="margin:0;" onchange="this.parentElement.style.background = this.checked ? 'var(--cream-100)' : 'transparent';" />
+          ${escapeHtml(f.name)}
+        </label>`;
+      }).join(' ');
+      return `
+        <div class="cb-q" data-qidx="${qi}" style="padding:7px 0; border-bottom:1px dashed var(--border);">
+          <div style="display:grid; grid-template-columns: 2fr 1fr 1.5fr auto auto; gap:6px; align-items:center;">
+            <input class="cb-qlabel" placeholder="Question label" value="${escapeHtml(q.label)}" />
+            <select class="cb-qtype">
+              ${['text','number','dropdown','checkbox','yesno'].map(t => `<option value="${t}" ${t===q.qtype?'selected':''}>${t}</option>`).join('')}
+            </select>
+            <input class="cb-qopts" placeholder="opt1 | opt2 (for dropdown)" value="${escapeHtml(q.options || '')}" />
+            <label style="font-size:11px; display:flex; gap:3px; align-items:center;"><input type="checkbox" class="cb-qreq" ${q.required?'checked':''} /> req</label>
+            <button type="button" class="btn ghost sm" onclick="__cbDelQ(${si}, ${qi})">×</button>
+          </div>
+          <div style="display:flex; gap:5px; align-items:center; flex-wrap:wrap; margin-top:5px; padding-left:2px;">
+            <span style="font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px;">Applies to:</span>
+            ${chips}
+          </div>
+        </div>`;
+    };
 
     // Make helpers globally callable for inline onclick
     window.__cbReadDOM = () => {
@@ -1706,12 +1731,17 @@ async function openChecklistBuilder(existingId) {
           questions: []
         };
         secEl.querySelectorAll('.cb-q').forEach(qEl => {
+          const chipBoxes = qEl.querySelectorAll('.cb-qfreq');
+          const ticked = Array.from(chipBoxes).filter(c => c.checked).map(c => Number(c.value));
+          // If every chip is ticked, treat as "applies to all" → store empty array.
+          const freqs = (chipBoxes.length > 0 && ticked.length === chipBoxes.length) ? [] : ticked;
           const q = {
             label: qEl.querySelector('.cb-qlabel').value,
             qtype: qEl.querySelector('.cb-qtype').value,
             options: qEl.querySelector('.cb-qopts').value,
             required: qEl.querySelector('.cb-qreq').checked,
-            min_value: null, max_value: null, unit: ''
+            min_value: null, max_value: null, unit: '',
+            frequencies: freqs
           };
           sec.questions.push(q);
         });
@@ -1721,7 +1751,7 @@ async function openChecklistBuilder(existingId) {
     };
     window.__cbAddSection = () => {
       sections = window.__cbReadDOM();
-      sections.push({ name:`Section ${sections.length+1}`, description:'', questions:[{label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:''}] });
+      sections.push({ name:`Section ${sections.length+1}`, description:'', questions:[{label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:'', frequencies:[]}] });
       $('cbSections').innerHTML = sections.map((s, si) => renderSection(s, si)).join('');
     };
     window.__cbDelSection = (si) => {
@@ -1731,13 +1761,13 @@ async function openChecklistBuilder(existingId) {
     };
     window.__cbAddQ = (si) => {
       sections = window.__cbReadDOM();
-      sections[si].questions.push({ label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:'' });
+      sections[si].questions.push({ label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:'', frequencies:[] });
       $('cbSections').innerHTML = sections.map((s, si) => renderSection(s, si)).join('');
     };
     window.__cbDelQ = (si, qi) => {
       sections = window.__cbReadDOM();
       sections[si].questions.splice(qi, 1);
-      if (sections[si].questions.length === 0) sections[si].questions.push({ label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:'' });
+      if (sections[si].questions.length === 0) sections[si].questions.push({ label:'', qtype:'text', options:'', required:false, min_value:null, max_value:null, unit:'', frequencies:[] });
       $('cbSections').innerHTML = sections.map((s, si) => renderSection(s, si)).join('');
     };
 
@@ -1752,7 +1782,8 @@ async function openChecklistBuilder(existingId) {
           questions: s.questions.filter(q => q.label.trim()).map(q => ({
             label: q.label, qtype: q.qtype,
             options: q.qtype === 'dropdown' ? q.options.split('|').map(x => x.trim()).filter(Boolean) : null,
-            required: q.required, min_value: q.min_value, max_value: q.max_value, unit: q.unit
+            required: q.required, min_value: q.min_value, max_value: q.max_value, unit: q.unit,
+            frequencies: q.frequencies || []
           }))
         })).filter(s => s.questions.length > 0);
         const freqIds = Array.from(document.querySelectorAll('.cb-freq:checked')).map(c => Number(c.value));
@@ -2227,7 +2258,16 @@ async function openAssignment(assignmentId) {
         }).join('')}
       </div>` : '';
 
-    const sectionsHtml = (cl?.sections || []).map((s, si) => `
+    // Filter checklist questions to those applicable to THIS assignment's frequency.
+    // A question with empty `frequencies` array applies to all frequencies the checklist allows.
+    const asnFreqId = a.frequency_id;
+    const filteredSections = (cl?.sections || [])
+      .map(s => ({
+        ...s,
+        questions: (s.questions || []).filter(q => !q.frequencies || q.frequencies.length === 0 || (asnFreqId && q.frequencies.includes(asnFreqId)))
+      }))
+      .filter(s => s.questions.length > 0);
+    const sectionsHtml = filteredSections.map((s, si) => `
       <div style="margin: 10px 0 6px; padding: 8px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
         <strong>${si+1}. ${escapeHtml(s.name)}</strong>
         ${s.description ? `<div style="color:var(--muted); font-size:12px;">${escapeHtml(s.description)}</div>` : ''}

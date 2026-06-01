@@ -209,6 +209,8 @@ function createSchema() {
     );
 
     -- Questions / checkpoints under a section
+    -- frequencies_json: JSON array of frequency IDs this checkpoint applies to.
+    -- Empty / NULL = applies to ALL frequencies the parent checklist allows.
     CREATE TABLE IF NOT EXISTS checklist_questions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       section_id INTEGER NOT NULL REFERENCES checklist_sections(id) ON DELETE CASCADE,
@@ -219,6 +221,7 @@ function createSchema() {
       min_value REAL,
       max_value REAL,
       unit TEXT,
+      frequencies_json TEXT,
       position INTEGER NOT NULL DEFAULT 0
     );
 
@@ -575,27 +578,35 @@ function seed() {
   ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(ahuCl, 'Quarterly');
 
   const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
-  const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,position) VALUES (?,?,?,?,?,?,?,?,?)`);
+  const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,frequencies_json,position) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+
+  // Frequency IDs we'll use for tagging seeded checkpoints.
+  const monthlyId   = db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id;
+  const quarterlyId = db.prepare("SELECT id FROM frequencies WHERE name='Quarterly'").get().id;
+  const ALL_FREQS = null;                                                   // applies to every allowed frequency on this checklist
+  const Q_ONLY    = JSON.stringify([quarterlyId]);                          // Quarterly only
+  const M_AND_Q   = JSON.stringify([monthlyId, quarterlyId]);               // both Monthly and Quarterly
 
   const sec1 = insSec.run(ahuCl, 'Pre-Inspection Safety', 'Lock-out, tag-out and PPE verification', 1).lastInsertRowid;
-  insQ.run(sec1, 'Equipment isolated and locked out',     'yesno',    null, 1, null, null, null, 1);
-  insQ.run(sec1, 'PPE worn (gloves, goggles)',            'checkbox', null, 1, null, null, null, 2);
-  insQ.run(sec1, 'Permit-to-work number',                 'text',     null, 1, null, null, null, 3);
+  insQ.run(sec1, 'Equipment isolated and locked out',     'yesno',    null, 1, null, null, null, ALL_FREQS, 1);
+  insQ.run(sec1, 'PPE worn (gloves, goggles)',            'checkbox', null, 1, null, null, null, ALL_FREQS, 2);
+  insQ.run(sec1, 'Permit-to-work number',                 'text',     null, 1, null, null, null, ALL_FREQS, 3);
 
   const sec2 = insSec.run(ahuCl, 'Filters & Coils', 'Visual + measurement checks on filters', 2).lastInsertRowid;
-  insQ.run(sec2, 'Pre-filter condition',                  'dropdown', JSON.stringify(['OK','Dirty','Replace']), 1, null, null, null, 1);
-  insQ.run(sec2, 'HEPA filter condition',                 'dropdown', JSON.stringify(['OK','Replace']),         1, null, null, null, 2);
-  insQ.run(sec2, 'Differential pressure across filter',   'number',   null, 1, 0, 500, 'Pa', 3);
-  insQ.run(sec2, 'Cooling coil cleanliness',              'dropdown', JSON.stringify(['Clean','Acceptable','Dirty']), 1, null, null, null, 4);
+  insQ.run(sec2, 'Pre-filter condition',                  'dropdown', JSON.stringify(['OK','Dirty','Replace']),       1, null, null, null, M_AND_Q, 1);
+  insQ.run(sec2, 'HEPA filter condition (full inspection)','dropdown', JSON.stringify(['OK','Replace']),               1, null, null, null, Q_ONLY,  2);
+  insQ.run(sec2, 'Differential pressure across filter',   'number',   null, 1, 0, 500, 'Pa', M_AND_Q, 3);
+  insQ.run(sec2, 'Cooling coil cleanliness (deep check)', 'dropdown', JSON.stringify(['Clean','Acceptable','Dirty']), 1, null, null, null, Q_ONLY,  4);
 
   const sec3 = insSec.run(ahuCl, 'Blower & Motor', 'Mechanical + electrical health of blower assembly', 3).lastInsertRowid;
-  insQ.run(sec3, 'Belt tension OK',                       'yesno',    null, 1, null, null, null, 1);
-  insQ.run(sec3, 'Motor current draw',                    'number',   null, 1, 0, 100, 'A', 2);
-  insQ.run(sec3, 'Bearing temperature',                   'number',   null, 1, 0, 120, '°C', 3);
-  insQ.run(sec3, 'Unusual noise / vibration?',            'yesno',    null, 1, null, null, null, 4);
+  insQ.run(sec3, 'Belt tension OK',                       'yesno',    null, 1, null, null, null, M_AND_Q, 1);
+  insQ.run(sec3, 'Motor current draw',                    'number',   null, 1, 0, 100, 'A',     M_AND_Q, 2);
+  insQ.run(sec3, 'Bearing temperature',                   'number',   null, 1, 0, 120, '°C',    M_AND_Q, 3);
+  insQ.run(sec3, 'Unusual noise / vibration?',            'yesno',    null, 1, null, null, null, M_AND_Q, 4);
+  insQ.run(sec3, 'Thermal imaging of motor windings',     'text',     null, 1, null, null, null, Q_ONLY,  5);
 
   const sec4 = insSec.run(ahuCl, 'Sign-off', 'Technician notes and signatures', 4).lastInsertRowid;
-  insQ.run(sec4, 'Remarks / observations',                'text',     null, 0, null, null, null, 1);
+  insQ.run(sec4, 'Remarks / observations',                'text',     null, 0, null, null, null, ALL_FREQS, 1);
 
   // PM Schedules — mix of statuses for a populated dashboard
   const u = (uid) => db.prepare('SELECT id FROM users WHERE user_id=?').get(uid).id;
