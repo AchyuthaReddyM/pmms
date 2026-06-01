@@ -211,23 +211,31 @@ app.get('/api/plants', requireAuth, (req, res) => {
   res.json(db.prepare('SELECT * FROM plants ORDER BY plant_id').all());
 });
 app.post('/api/plants', requireAuth, requireRole('System Administrator'), (req, res) => {
-  const { name, location } = req.body;
+  const { name, location, unit_number, version } = req.body || {};
   if (!name) return res.status(400).json({ error: 'Name required' });
   const plant_id = nextId('PL-', 'plants', 'plant_id');
-  db.prepare('INSERT INTO plants(plant_id,name,location) VALUES (?,?,?)').run(plant_id, name, location || '');
-  audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}" created`);
+  db.prepare('INSERT INTO plants(plant_id,unit_number,name,location,version) VALUES (?,?,?,?,?)')
+    .run(plant_id, unit_number || null, name, location || '', version || null);
+  audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}"${unit_number?` (${unit_number})`:''} at ${location || '-'}`);
   res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(plant_id));
 });
 app.put('/api/plants/:plant_id', requireAuth, requireRole('System Administrator'), (req, res) => {
-  const { name, location, status } = req.body;
+  const { name, unit_number, location, version, status } = req.body || {};
   const before = db.prepare('SELECT * FROM plants WHERE plant_id=?').get(req.params.plant_id);
   if (!before) return res.status(404).json({ error: 'Not found' });
-  db.prepare('UPDATE plants SET name=COALESCE(?,name), location=COALESCE(?,location), status=COALESCE(?,status), modified_at=datetime(\'now\') WHERE plant_id=?')
-    .run(name, location, status, req.params.plant_id);
+  db.prepare(`UPDATE plants SET
+      unit_number=COALESCE(?,unit_number),
+      name=COALESCE(?,name),
+      location=COALESCE(?,location),
+      version=COALESCE(?,version),
+      status=COALESCE(?,status),
+      modified_at=datetime('now')
+    WHERE plant_id=?`).run(unit_number, name, location, version, status, req.params.plant_id);
   const changes = [];
-  if (name && name !== before.name)         changes.push(`name "${before.name}" -> "${name}"`);
-  if (location && location !== before.location) changes.push(`location "${before.location||'-'}" -> "${location}"`);
-  if (status && status !== before.status)   changes.push(`status "${before.status}" -> "${status}"`);
+  if (name && name !== before.name)                       changes.push(`name "${before.name}" -> "${name}"`);
+  if (unit_number && unit_number !== before.unit_number)  changes.push(`unit "${before.unit_number||'-'}" -> "${unit_number}"`);
+  if (location && location !== before.location)           changes.push(`location "${before.location||'-'}" -> "${location}"`);
+  if (status && status !== before.status)                 changes.push(`status "${before.status}" -> "${status}"`);
   audit(req.user, 'UPDATE', 'Plant', req.params.plant_id, changes.length ? changes.join('; ') : 'Plant touched');
   res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(req.params.plant_id));
 });
@@ -269,21 +277,37 @@ app.put('/api/formulations/:formulation_id', requireAuth, requireActivity('manag
 });
 
 // LOCATIONS
-app.get('/api/locations', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM locations ORDER BY location_id').all()));
+app.get('/api/locations', requireAuth, (req,res) => res.json(db.prepare(`
+  SELECT l.*, f.name AS formulation_name
+  FROM locations l
+  LEFT JOIN formulations f ON f.id = l.formulation_id
+  ORDER BY l.location_id
+`).all()));
 app.post('/api/locations', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { block_id, description } = req.body || {};
+  const { block_id, description, formulation_id } = req.body || {};
   if (!block_id) return res.status(400).json({ error: 'block_id required' });
   const block = db.prepare('SELECT name FROM blocks WHERE block_id=?').get(block_id);
   if (!block) return res.status(400).json({ error: 'Unknown block_id' });
+  let formName = null;
+  if (formulation_id) {
+    const f = db.prepare('SELECT name FROM formulations WHERE id=?').get(formulation_id);
+    if (!f) return res.status(400).json({ error: 'Unknown formulation_id' });
+    formName = f.name;
+  }
   const location_id = nextId('LOC-', 'locations', 'location_id');
-  db.prepare('INSERT INTO locations(location_id,block_id,description) VALUES (?,?,?)').run(location_id, block_id, description || '');
-  audit(req.user, 'CREATE', 'Location', location_id, `"${description || location_id}" under block ${block_id} (${block.name})`);
+  db.prepare('INSERT INTO locations(location_id,block_id,description,formulation_id) VALUES (?,?,?,?)')
+    .run(location_id, block_id, description || '', formulation_id || null);
+  audit(req.user, 'CREATE', 'Location', location_id, `"${description || location_id}" under block ${block_id} (${block.name})${formName?` [${formName}]`:''}`);
   res.json(db.prepare('SELECT * FROM locations WHERE location_id=?').get(location_id));
 });
 app.put('/api/locations/:location_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { block_id, description, status } = req.body || {};
-  const r = db.prepare('UPDATE locations SET block_id=COALESCE(?,block_id), description=COALESCE(?,description), status=COALESCE(?,status) WHERE location_id=?')
-    .run(block_id, description, status, req.params.location_id);
+  const { block_id, description, formulation_id, status } = req.body || {};
+  const r = db.prepare(`UPDATE locations SET
+      block_id=COALESCE(?,block_id),
+      description=COALESCE(?,description),
+      formulation_id=COALESCE(?,formulation_id),
+      status=COALESCE(?,status)
+    WHERE location_id=?`).run(block_id, description, formulation_id, status, req.params.location_id);
   if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
   audit(req.user, 'UPDATE', 'Location', req.params.location_id, 'Location modified');
   res.json(db.prepare('SELECT * FROM locations WHERE location_id=?').get(req.params.location_id));
@@ -292,19 +316,22 @@ app.put('/api/locations/:location_id', requireAuth, requireActivity('manage_plan
 // AREAS
 app.get('/api/areas', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM areas ORDER BY area_id').all()));
 app.post('/api/areas', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { location_id, area_type } = req.body || {};
+  // Accept both 'name' (new) and 'area_type' (legacy) from the client.
+  const { location_id, name, area_type } = req.body || {};
+  const areaName = name || area_type;
   if (!location_id) return res.status(400).json({ error: 'location_id required' });
   const loc = db.prepare('SELECT description FROM locations WHERE location_id=?').get(location_id);
   if (!loc) return res.status(400).json({ error: 'Unknown location_id' });
   const area_id = nextId('AR-', 'areas', 'area_id');
-  db.prepare('INSERT INTO areas(area_id,location_id,area_type) VALUES (?,?,?)').run(area_id, location_id, area_type || '');
-  audit(req.user, 'CREATE', 'Area', area_id, `"${area_type || '—'}" under location ${location_id}`);
+  db.prepare('INSERT INTO areas(area_id,location_id,name) VALUES (?,?,?)').run(area_id, location_id, areaName || '');
+  audit(req.user, 'CREATE', 'Area', area_id, `"${areaName || '—'}" under location ${location_id} (${loc.description})`);
   res.json(db.prepare('SELECT * FROM areas WHERE area_id=?').get(area_id));
 });
 app.put('/api/areas/:area_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { location_id, area_type, status } = req.body || {};
-  const r = db.prepare('UPDATE areas SET location_id=COALESCE(?,location_id), area_type=COALESCE(?,area_type), status=COALESCE(?,status) WHERE area_id=?')
-    .run(location_id, area_type, status, req.params.area_id);
+  const { location_id, name, area_type, status } = req.body || {};
+  const areaName = name || area_type;
+  const r = db.prepare('UPDATE areas SET location_id=COALESCE(?,location_id), name=COALESCE(?,name), status=COALESCE(?,status) WHERE area_id=?')
+    .run(location_id, areaName, status, req.params.area_id);
   if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
   audit(req.user, 'UPDATE', 'Area', req.params.area_id, 'Area modified');
   res.json(db.prepare('SELECT * FROM areas WHERE area_id=?').get(req.params.area_id));
@@ -318,26 +345,37 @@ app.get('/api/equipment/:equipment_id', requireAuth, (req,res) => {
   res.json(row);
 });
 app.post('/api/equipment', requireAuth, requireRole('System Administrator','Engineering'), (req, res) => {
-  const { name, make_model, serial, capacity, area_id, status } = req.body;
+  let { name, make, model, make_model, serial, capacity, area_id, status } = req.body || {};
   if (!name) return res.status(400).json({ error: 'Name required' });
+  // Backwards compat: if legacy make_model passed, split into make/model.
+  if (!make && !model && make_model) {
+    const parts = String(make_model).split('/').map(s => s.trim());
+    make = parts[0] || ''; model = parts.slice(1).join(' / ');
+  }
   const eid = nextId('EQ-', 'equipment', 'equipment_id');
-  db.prepare(`INSERT INTO equipment(equipment_id,name,make_model,serial,capacity,area_id,status,qr_code)
-              VALUES (?,?,?,?,?,?,?,?)`)
-    .run(eid, name, make_model||'', serial||'', capacity||'', area_id||'', status||'Active', `QR:${eid}`);
-  audit(req.user, 'CREATE', 'Equipment', eid, `Registered: ${name}`);
+  db.prepare(`INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,status,qr_code)
+              VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(eid, name, make||'', model||'', serial||'', capacity||'', area_id||'', status||'Active', `QR:${eid}`);
+  audit(req.user, 'CREATE', 'Equipment', eid, `Registered: ${name} — ${make||'—'} ${model||''}${serial?` (SN ${serial})`:''}${area_id?` @ ${area_id}`:''}`);
   res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(eid));
 });
 app.put('/api/equipment/:equipment_id', requireAuth, requireRole('System Administrator','Engineering'), (req, res) => {
-  const f = req.body;
+  const f = req.body || {};
+  // Backwards compat for legacy make_model
+  if (!f.make && !f.model && f.make_model) {
+    const parts = String(f.make_model).split('/').map(s => s.trim());
+    f.make = parts[0] || ''; f.model = parts.slice(1).join(' / ');
+  }
   const r = db.prepare(`UPDATE equipment SET
       name=COALESCE(?,name),
-      make_model=COALESCE(?,make_model),
+      make=COALESCE(?,make),
+      model=COALESCE(?,model),
       serial=COALESCE(?,serial),
       capacity=COALESCE(?,capacity),
       area_id=COALESCE(?,area_id),
       status=COALESCE(?,status)
     WHERE equipment_id=?`)
-    .run(f.name, f.make_model, f.serial, f.capacity, f.area_id, f.status, req.params.equipment_id);
+    .run(f.name, f.make, f.model, f.serial, f.capacity, f.area_id, f.status, req.params.equipment_id);
   if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
   audit(req.user, 'UPDATE', 'Equipment', req.params.equipment_id, 'Equipment modified');
   res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(req.params.equipment_id));

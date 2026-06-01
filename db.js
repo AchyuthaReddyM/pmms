@@ -88,9 +88,10 @@ function createSchema() {
     CREATE TABLE IF NOT EXISTS plants (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       plant_id TEXT UNIQUE NOT NULL,
+      unit_number TEXT,
       name TEXT NOT NULL,
       location TEXT,
-      version TEXT NOT NULL DEFAULT 'v1.0',
+      version TEXT,
       status TEXT NOT NULL DEFAULT 'Active',
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       modified_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -118,6 +119,7 @@ function createSchema() {
       location_id TEXT UNIQUE NOT NULL,
       block_id TEXT NOT NULL,
       description TEXT,
+      formulation_id INTEGER REFERENCES formulations(id),
       status TEXT NOT NULL DEFAULT 'Active'
     );
 
@@ -125,7 +127,7 @@ function createSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       area_id TEXT UNIQUE NOT NULL,
       location_id TEXT NOT NULL,
-      area_type TEXT,
+      name TEXT,
       status TEXT NOT NULL DEFAULT 'Active'
     );
 
@@ -133,7 +135,8 @@ function createSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       equipment_id TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
-      make_model TEXT,
+      make TEXT,
+      model TEXT,
       serial TEXT,
       capacity TEXT,
       area_id TEXT,
@@ -434,10 +437,10 @@ function seed() {
 
   const ins = (sql) => db.prepare(sql);
 
-  ins('INSERT INTO plants(plant_id,name,location,version,status) VALUES (?,?,?,?,?)').run('PL-001','Hyderabad Formulations Plant','Hyderabad, IN','v3.1','Active');
-  ins('INSERT INTO plants(plant_id,name,location,version,status) VALUES (?,?,?,?,?)').run('PL-002','Visakhapatnam API Plant','Vizag, IN','v2.4','Active');
-  ins('INSERT INTO plants(plant_id,name,location,version,status) VALUES (?,?,?,?,?)').run('PL-003','Baddi Solid Dosage','Baddi, HP','v1.7','Under Review');
-  ins('INSERT INTO plants(plant_id,name,location,version,status) VALUES (?,?,?,?,?)').run('PL-004','R&D Pilot Plant','Bangalore, IN','v1.0','Inactive');
+  ins('INSERT INTO plants(plant_id,unit_number,name,location,version,status) VALUES (?,?,?,?,?,?)').run('PL-001','Unit-1','Hyderabad Formulations Plant','Hyderabad, IN','v3.1','Active');
+  ins('INSERT INTO plants(plant_id,unit_number,name,location,version,status) VALUES (?,?,?,?,?,?)').run('PL-002','Unit-2','Visakhapatnam API Plant','Vizag, IN','v2.4','Active');
+  ins('INSERT INTO plants(plant_id,unit_number,name,location,version,status) VALUES (?,?,?,?,?,?)').run('PL-003','Unit-3','Baddi Solid Dosage','Baddi, HP','v1.7','Under Review');
+  ins('INSERT INTO plants(plant_id,unit_number,name,location,version,status) VALUES (?,?,?,?,?,?)').run('PL-004','R&D-Unit','R&D Pilot Plant','Bangalore, IN',null,'Inactive');
 
   const blocks = [
     ['BLK-001','PL-001','Block-A · Granulation'],
@@ -447,21 +450,26 @@ function seed() {
   ];
   for (const b of blocks) ins('INSERT INTO blocks(block_id,plant_id,name) VALUES (?,?,?)').run(...b);
 
+  // Formulation types — used optionally in Location Master to distinguish OSD vs Injectable etc.
   const forms = [
-    ['FRM-001','Tablets — Immediate Release','Production'],
-    ['FRM-002','Capsules — Hard Gel','Production'],
-    ['FRM-003','Oral Solutions','Production'],
-    ['FRM-004','Injectables — Sterile','Production'],
+    ['FRM-001','OSD',           'Production'],
+    ['FRM-002','Injectable',    'Production'],
+    ['FRM-003','Softgel',       'Production'],
+    ['FRM-004','Bag Filling',   'Production'],
+    ['FRM-005','Others',        'Production'],
   ];
   for (const f of forms) ins('INSERT INTO formulations(formulation_id,name,department) VALUES (?,?,?)').run(...f);
 
+  // Locations may optionally link to a formulation (OSD vs Injectable etc.)
+  const osdId = db.prepare("SELECT id FROM formulations WHERE name='OSD'").get().id;
+  const injId = db.prepare("SELECT id FROM formulations WHERE name='Injectable'").get().id;
   const locs = [
-    ['LOC-001','BLK-001','Granulation Room 1'],
-    ['LOC-002','BLK-001','Sifting Area'],
-    ['LOC-003','BLK-002','Compression Hall'],
-    ['LOC-004','BLK-003','Coating Room'],
+    ['LOC-001','BLK-001','Granulation Room 1', osdId],
+    ['LOC-002','BLK-001','Sifting Area',       osdId],
+    ['LOC-003','BLK-002','Compression Hall',   osdId],
+    ['LOC-004','BLK-003','Coating Room',       osdId],
   ];
-  for (const l of locs) ins('INSERT INTO locations(location_id,block_id,description) VALUES (?,?,?)').run(...l);
+  for (const l of locs) ins('INSERT INTO locations(location_id,block_id,description,formulation_id) VALUES (?,?,?,?)').run(...l);
 
   const areas = [
     ['AR-001','LOC-001','Classified — Grade D'],
@@ -469,18 +477,19 @@ function seed() {
     ['AR-003','LOC-002','Black Area'],
     ['AR-004','LOC-004','Classified — Grade D'],
   ];
-  for (const a of areas) ins('INSERT INTO areas(area_id,location_id,area_type) VALUES (?,?,?)').run(...a);
+  for (const a of areas) ins('INSERT INTO areas(area_id,location_id,name) VALUES (?,?,?)').run(...a);
 
+  // [equipment_id, name, make, model, serial, capacity, area_id, status]
   const equipment = [
-    ['EQ-RMG-02','Rapid Mixer Granulator','Gansons / RMG-300','SN-7841-A','300 L','AR-001','Active'],
-    ['EQ-FBD-04','Fluid Bed Dryer',       'Gansons / FBD-200','SN-9012-B','200 kg','AR-001','Active'],
-    ['EQ-TBP-02','Tablet Press',          'Cadmach / CMD-27', 'SN-4451-C','27 stations','AR-002','Under Maintenance'],
-    ['EQ-AHU-12','Air Handling Unit',     'Caryaire / AHU-15K','SN-2266-D','15,000 CFM','AR-004','Active'],
-    ['EQ-CMP-03','Air Compressor',        'Atlas Copco / GA-90','SN-3380-E','90 kW','AR-003','Active'],
-    ['EQ-CAP-01','Capsule Filler',        'ACG / AF-90T',     'SN-1188-F','90,000 caps/hr','AR-002','Validation'],
-    ['EQ-AHU-08','Air Handling Unit (8)', 'Caryaire / AHU-10K','SN-7799-G','10,000 CFM','AR-004','Active'],
+    ['EQ-RMG-02','Rapid Mixer Granulator','Gansons','RMG-300','SN-7841-A','300 L','AR-001','Active'],
+    ['EQ-FBD-04','Fluid Bed Dryer',       'Gansons','FBD-200','SN-9012-B','200 kg','AR-001','Active'],
+    ['EQ-TBP-02','Tablet Press',          'Cadmach','CMD-27', 'SN-4451-C','27 stations','AR-002','Under Maintenance'],
+    ['EQ-AHU-12','Air Handling Unit',     'Caryaire','AHU-15K','SN-2266-D','15,000 CFM','AR-004','Active'],
+    ['EQ-CMP-03','Air Compressor',        'Atlas Copco','GA-90','SN-3380-E','90 kW','AR-003','Active'],
+    ['EQ-CAP-01','Capsule Filler',        'ACG','AF-90T',     'SN-1188-F','90,000 caps/hr','AR-002','Validation'],
+    ['EQ-AHU-08','Air Handling Unit (8)', 'Caryaire','AHU-10K','SN-7799-G','10,000 CFM','AR-004','Active'],
   ];
-  const eqIns = ins('INSERT INTO equipment(equipment_id,name,make_model,serial,capacity,area_id,status,qr_code) VALUES (?,?,?,?,?,?,?,?)');
+  const eqIns = ins('INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,status,qr_code) VALUES (?,?,?,?,?,?,?,?,?)');
   for (const e of equipment) eqIns.run(...e, `QR:${e[0]}`);
 
   const freqs = [

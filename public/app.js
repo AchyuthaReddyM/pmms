@@ -237,18 +237,19 @@ function severityPill(s) {
 const MASTER_DEFS = {
   plants: {
     api: '/api/plants',
-    head: ['Plant ID','Name','Location','Version','Status','Modified'],
-    row: r => [r.plant_id, r.name, r.location, r.version, statusPill(r.status), r.modified_at],
+    head: ['Plant ID','Unit Number','Name','Location','Status','Modified'],
+    row: r => [r.plant_id, r.unit_number || '—', r.name, r.location, statusPill(r.status), r.modified_at],
     canAdd: true,
     addFields: [
-      { id:'name', label:'Name', required:true },
-      { id:'location', label:'Location' },
+      { id:'name', label:'Plant Name', required:true },
+      { id:'unit_number', label:'Unit Number', placeholder:'e.g., Unit-1' },
+      { id:'location', label:'Plant Location' },
     ],
     create: (data) => api('POST','/api/plants',data),
   },
   blocks: {
     api: '/api/blocks',
-    head: ['Block ID','Plant','Name','Status'],
+    head: ['Block ID','Plant','Block Name','Status'],
     row: r => [r.block_id, r.plant_id, r.name, statusPill(r.status)],
     canAdd: true,
     addFields: [
@@ -263,48 +264,41 @@ const MASTER_DEFS = {
     row: r => [r.formulation_id, r.name, r.department, statusPill(r.status)],
     canAdd: true,
     addFields: [
-      { id:'name', label:'Name', required:true },
+      { id:'name', label:'Name', required:true, placeholder:'e.g., OSD, Injectable, Softgel, Bag Filling, Others' },
       { id:'department', label:'Department', type:'remoteSelect', source:'/api/departments', valueKey:'name', labelFn:r => r.name },
     ],
     create: (data) => api('POST','/api/formulations',data),
   },
   locations: {
     api: '/api/locations',
-    head: ['Location ID','Block','Description','Status'],
-    row: r => [r.location_id, r.block_id, r.description, statusPill(r.status)],
+    head: ['Location ID','Block','Location Name','Formulation','Status'],
+    row: r => [r.location_id, r.block_id, r.description, r.formulation_name || '—', statusPill(r.status)],
     canAdd: true,
     addFields: [
       { id:'block_id', label:'Block', required:true, type:'remoteSelect', source:'/api/blocks', valueKey:'block_id', labelFn:r => `${r.block_id} · ${r.name}` },
-      { id:'description', label:'Description', required:true, placeholder:'e.g., Granulation Room 1' },
+      { id:'description', label:'Location Name', required:true, placeholder:'e.g., Filling-1, GRN-01, Comp-01' },
+      { id:'formulation_id', label:'Formulation (optional)', type:'remoteSelect', source:'/api/formulations', valueKey:'id', labelFn:r => r.name },
     ],
-    create: (data) => api('POST','/api/locations',data),
+    create: (data) => api('POST','/api/locations', {
+      block_id: data.block_id,
+      description: data.description,
+      formulation_id: data.formulation_id ? Number(data.formulation_id) : null
+    }),
   },
   areas: {
     api: '/api/areas',
-    head: ['Area ID','Location','Area Type','Status'],
-    row: r => [r.area_id, r.location_id, r.area_type, statusPill(r.status)],
+    head: ['Area ID','Location','Area Name','Status'],
+    row: r => [r.area_id, r.location_id, r.name || r.area_type || '—', statusPill(r.status)],
     canAdd: true,
-    addFields: [
-      { id:'location_id', label:'Location', required:true, type:'remoteSelect', source:'/api/locations', valueKey:'location_id', labelFn:r => `${r.location_id} · ${r.description}` },
-      { id:'area_type', label:'Area Type', required:true, placeholder:'e.g., Classified — Grade D' },
-    ],
-    create: (data) => api('POST','/api/areas',data),
+    customAdd: () => openAreaModal(),
   },
   equipment: {
     api: '/api/equipment',
-    head: ['Equipment ID','Name','Make / Model','Serial','Capacity','Area','Status','QR','Actions'],
-    row: r => [r.equipment_id, r.name, r.make_model, r.serial, r.capacity, r.area_id, statusPill(r.status), `<span title="${escapeHtml(r.qr_code)}">▣</span>`,
+    head: ['Equipment ID','Equipment Name','Make','Model','Serial','Area','Status','QR','Actions'],
+    row: r => [r.equipment_id, r.name, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status), `<span title="${escapeHtml(r.qr_code)}">▣</span>`,
                `<button class="btn ghost sm" onclick="openAssignChecklistModal(null, '${escapeHtml(r.equipment_id)}')">🎯 Assign</button>`],
     canAdd: true,
-    addFields: [
-      { id:'name', label:'Equipment Name', required:true },
-      { id:'make_model', label:'Make / Model' },
-      { id:'serial', label:'Serial Number' },
-      { id:'capacity', label:'Capacity' },
-      { id:'area_id', label:'Area', type:'remoteSelect', source:'/api/areas', valueKey:'area_id', labelFn:r => `${r.area_id} · ${r.area_type}` },
-      { id:'status', label:'Status', type:'select', options:['Active','Inactive','Under Maintenance','Validation'] },
-    ],
-    create: (data) => api('POST','/api/equipment',data),
+    customAdd: () => openEquipmentModal(),
   },
 };
 let CURRENT_MASTER = 'plants';
@@ -328,6 +322,8 @@ document.querySelectorAll('#masterTabs button').forEach(b => b.addEventListener(
 async function openMasterAddModal() {
   const def = MASTER_DEFS[CURRENT_MASTER];
   if (!def.canAdd) return;
+  // If a master defines its own modal, defer to it.
+  if (typeof def.customAdd === 'function') return def.customAdd();
   // Pre-load any remote select options
   const remoteData = {};
   for (const f of def.addFields) {
@@ -360,6 +356,155 @@ async function openMasterAddModal() {
       loadMasters(CURRENT_MASTER);
     }
   });
+}
+
+// ----- Custom Area Master modal (cascading Block -> Location) -----
+async function openAreaModal() {
+  try {
+    const [blocks, locations] = await Promise.all([
+      api('GET','/api/blocks'),
+      api('GET','/api/locations'),
+    ]);
+    window.__armOnBlock = () => {
+      const sel = document.getElementById('armBlockSel');
+      const b = blocks.find(x => x.block_id === sel.value);
+      document.getElementById('armBlockDesc').textContent = b ? b.name : '—';
+      const matching = locations.filter(l => l.block_id === sel.value);
+      const locSel = document.getElementById('armLocSel');
+      locSel.innerHTML = '<option value="">— select location —</option>' +
+        matching.map(l => `<option value="${escapeHtml(l.location_id)}">${escapeHtml(l.location_id)}</option>`).join('');
+      document.getElementById('armLocDesc').textContent = '—';
+    };
+    window.__armOnLoc = () => {
+      const sel = document.getElementById('armLocSel');
+      const l = locations.find(x => x.location_id === sel.value);
+      document.getElementById('armLocDesc').textContent = l ? l.description : '—';
+    };
+    openModal({
+      title: 'Add Area',
+      width: 560,
+      body: `
+        <div class="form-row"><label>Block ID *</label>
+          <div>
+            <select id="armBlockSel" name="block_id" required onchange="window.__armOnBlock()">
+              <option value="">— select block —</option>
+              ${blocks.map(b => `<option value="${escapeHtml(b.block_id)}">${escapeHtml(b.block_id)}</option>`).join('')}
+            </select>
+            <div id="armBlockDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+          </div>
+        </div>
+        <div class="form-row"><label>Location ID *</label>
+          <div>
+            <select id="armLocSel" name="location_id" required onchange="window.__armOnLoc()">
+              <option value="">— select block first —</option>
+            </select>
+            <div id="armLocDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+          </div>
+        </div>
+        <div class="form-row"><label>Area Name *</label>
+          <input name="name" required placeholder="e.g., Classified — Grade D" />
+        </div>
+        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Area ID is auto-generated (AR-NNN).</p>
+      `,
+      onSubmit: async (data) => {
+        if (!data.location_id) throw new Error('Please select a Location');
+        await api('POST','/api/areas', { location_id: data.location_id, name: data.name });
+        toast('Area created.', 'success');
+        loadMasters('areas');
+      }
+    });
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ----- Custom Equipment Registration modal (cascading Block -> Location -> Area + Make/Model) -----
+async function openEquipmentModal(existing) {
+  try {
+    const [blocks, locations, areas] = await Promise.all([
+      api('GET','/api/blocks'),
+      api('GET','/api/locations'),
+      api('GET','/api/areas'),
+    ]);
+    window.__eqmOnBlock = () => {
+      const sel = document.getElementById('eqmBlockSel');
+      const b = blocks.find(x => x.block_id === sel.value);
+      document.getElementById('eqmBlockDesc').textContent = b ? b.name : '—';
+      const matching = locations.filter(l => l.block_id === sel.value);
+      document.getElementById('eqmLocSel').innerHTML = '<option value="">— select location —</option>' +
+        matching.map(l => `<option value="${escapeHtml(l.location_id)}">${escapeHtml(l.location_id)}</option>`).join('');
+      document.getElementById('eqmLocDesc').textContent = '—';
+      document.getElementById('eqmAreaSel').innerHTML = '<option value="">— select location first —</option>';
+      document.getElementById('eqmAreaDesc').textContent = '—';
+    };
+    window.__eqmOnLoc = () => {
+      const sel = document.getElementById('eqmLocSel');
+      const l = locations.find(x => x.location_id === sel.value);
+      document.getElementById('eqmLocDesc').textContent = l ? l.description : '—';
+      const matching = areas.filter(a => a.location_id === sel.value);
+      document.getElementById('eqmAreaSel').innerHTML = '<option value="">— select area —</option>' +
+        matching.map(a => `<option value="${escapeHtml(a.area_id)}">${escapeHtml(a.area_id)}</option>`).join('');
+      document.getElementById('eqmAreaDesc').textContent = '—';
+    };
+    window.__eqmOnArea = () => {
+      const sel = document.getElementById('eqmAreaSel');
+      const a = areas.find(x => x.area_id === sel.value);
+      document.getElementById('eqmAreaDesc').textContent = a ? (a.name || a.area_type || '—') : '—';
+    };
+
+    openModal({
+      title: existing ? `Edit Equipment — ${escapeHtml(existing.equipment_id)}` : 'Register Equipment',
+      width: 600,
+      body: `
+        <div class="form-row"><label>Block ID *</label>
+          <div>
+            <select id="eqmBlockSel" required onchange="window.__eqmOnBlock()">
+              <option value="">— select block —</option>
+              ${blocks.map(b => `<option value="${escapeHtml(b.block_id)}">${escapeHtml(b.block_id)}</option>`).join('')}
+            </select>
+            <div id="eqmBlockDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">Block Name will appear here</div>
+          </div>
+        </div>
+        <div class="form-row"><label>Location ID *</label>
+          <div>
+            <select id="eqmLocSel" required onchange="window.__eqmOnLoc()">
+              <option value="">— select block first —</option>
+            </select>
+            <div id="eqmLocDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">Location Name will appear here</div>
+          </div>
+        </div>
+        <div class="form-row"><label>Area ID *</label>
+          <div>
+            <select id="eqmAreaSel" name="area_id" required onchange="window.__eqmOnArea()">
+              <option value="">— select location first —</option>
+            </select>
+            <div id="eqmAreaDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">Area Name will appear here</div>
+          </div>
+        </div>
+        <div class="form-row"><label>Equipment Name *</label><input name="name" required value="${escapeHtml(existing?.name || '')}" /></div>
+        <div class="form-row"><label>Make</label><input name="make" value="${escapeHtml(existing?.make || '')}" placeholder="e.g., Gansons" /></div>
+        <div class="form-row"><label>Model Number</label><input name="model" value="${escapeHtml(existing?.model || '')}" placeholder="e.g., RMG-300" /></div>
+        <div class="form-row"><label>Serial Number</label><input name="serial" value="${escapeHtml(existing?.serial || '')}" /></div>
+        <div class="form-row"><label>Capacity</label><input name="capacity" value="${escapeHtml(existing?.capacity || '')}" placeholder="(optional)" /></div>
+        <div class="form-row"><label>Status</label>
+          <select name="status">
+            ${['Active','Inactive','Under Maintenance','Validation'].map(s => `<option ${s===(existing?.status||'Active')?'selected':''}>${s}</option>`).join('')}
+          </select>
+        </div>
+        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Equipment ID is auto-generated (EQ-NNN). A QR code is created automatically.</p>
+      `,
+      onSubmit: async (data) => {
+        if (!data.area_id) throw new Error('Please select an Area');
+        const payload = {
+          name: data.name, make: data.make, model: data.model,
+          serial: data.serial, capacity: data.capacity,
+          area_id: data.area_id, status: data.status
+        };
+        if (existing) await api('PUT', `/api/equipment/${existing.equipment_id}`, payload);
+        else          await api('POST','/api/equipment', payload);
+        toast(existing ? 'Equipment updated.' : 'Equipment registered.', 'success');
+        loadMasters('equipment');
+      }
+    });
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 // ===========================================================
