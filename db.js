@@ -224,6 +224,7 @@ function createSchema() {
       reviewer_id INTEGER REFERENCES users(id),
       approver_id INTEGER REFERENCES users(id),
       frequency_id INTEGER REFERENCES frequencies(id),
+      effective_date TEXT,
       due_date TEXT,
       status TEXT NOT NULL DEFAULT 'Pending',
       response_data TEXT,
@@ -499,12 +500,13 @@ function seed() {
   ];
   for (const c of cats) ins('INSERT INTO pm_categories(name,description) VALUES (?,?)').run(...c);
 
+  // Engineering Functions (formerly "Checklist Groups") — engineering sub-functions
   const groups = [
-    ['Granulation Equipment',  deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],
-    ['Compression Machines',   deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],
-    ['Coating Equipment',      deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],
-    ['HVAC / Utilities',       deptId('HVAC'),                     'HVAC'],
-    ['Capsule Filling',        deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],
+    ['Mechanical',      deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],   // id 1
+    ['Electrical',      deptId('Engineering - Electrical'), 'Engineering - Electrical'],   // id 2
+    ['Instrumentation', deptId('Engineering - Electrical'), 'Engineering - Electrical'],   // id 3
+    ['HVAC',            deptId('HVAC'),                     'HVAC'],                       // id 4
+    ['Water Systems',   deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],   // id 5
   ];
   for (const g of groups) ins('INSERT INTO checklist_groups(name,department_id,department) VALUES (?,?,?)').run(...g);
 
@@ -525,7 +527,7 @@ function seed() {
     { id: 'q3', type: 'dropdown', label: 'Impeller condition', options:['OK','Worn'], required:true },
     { id: 'q4', type: 'text',     label: 'Remarks', required:false },
   ]);
-  ins("INSERT INTO checklists(name,group_id,version,fields_json,status) VALUES (?,?,?,?,'Approved')").run('RMG Weekly Electrical',1,'v2.1',rmgChecklist);
+  ins("INSERT INTO checklists(name,group_id,version,fields_json,status) VALUES (?,?,?,?,'Approved')").run('RMG Weekly Electrical',2,'v2.1',rmgChecklist);
 
   const ahuChecklist = JSON.stringify([
     { id: 'q1', type: 'dropdown', label: 'Filter status', options:['OK','Replace'], required:true },
@@ -592,10 +594,10 @@ function seed() {
 
   // Sample checklist assignment with notification (target = equipment)
   // Workflow: Executor snaidu -> Reviewer rmehta -> Approver qaapprove
-  ins('INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,due_date,status,assigned_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+  ins('INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,effective_date,due_date,status,assigned_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
     .run('CA-001', ahuCl, 'equipment', 'EQ-AHU-12', u('snaidu'), u('rmehta'), u('qaapprove'),
          db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
-         fmt(addDays(today, 3)), 'Pending', u('siyer'));
+         fmt(today), fmt(addDays(today, 3)), 'Pending', u('siyer'));
   ins('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
     .run(u('snaidu'),
          'New checklist assigned',

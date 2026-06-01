@@ -478,8 +478,8 @@ async function loadPmConfig() {
     $('freqBody').innerHTML = freqs.length === 0 ? '<tr class="empty-row"><td colspan="4">No frequencies</td></tr>' :
       freqs.map(f => `<tr>
         <td><strong>${escapeHtml(f.name)}</strong></td>
-        <td>${f.days} d</td>
-        <td>±${f.tolerance_days} d</td>
+        <td>${f.days}</td>
+        <td>±${f.tolerance_days}</td>
         <td style="text-align:right;">
           ${adminMode ? `<button class="btn ghost sm" onclick='openFreqModal(${escapeHtml(JSON.stringify(f))})'>Edit</button>
                          <button class="btn ghost sm" onclick="deleteFreq(${f.id})">×</button>` : ''}
@@ -523,11 +523,11 @@ async function loadPmConfig() {
 function openFreqModal(existing) {
   const f = existing || { name:'', days:'', tolerance_days:0 };
   openModal({
-    title: existing ? `Edit Frequency — ${escapeHtml(f.name)}` : 'Add Frequency',
+    title: existing ? `Edit Maintenance Frequency — ${escapeHtml(f.name)}` : 'Add Maintenance Frequency',
     body: `
-      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(f.name)}" required /></div>
-      <div class="form-row"><label>Days *</label><input name="days" type="number" min="1" value="${escapeHtml(f.days)}" required /></div>
-      <div class="form-row"><label>Tolerance (days)</label><input name="tolerance_days" type="number" min="0" value="${escapeHtml(f.tolerance_days)}" /></div>
+      <div class="form-row"><label>Maintenance Frequency *</label><input name="name" value="${escapeHtml(f.name)}" required placeholder="e.g. Monthly" /></div>
+      <div class="form-row"><label>Frequency Interval (Days) *</label><input name="days" type="number" min="1" value="${escapeHtml(f.days)}" required /></div>
+      <div class="form-row"><label>Allowed Tolerance (Days)</label><input name="tolerance_days" type="number" min="0" value="${escapeHtml(f.tolerance_days)}" /></div>
     `,
     onSubmit: async (data) => {
       const payload = { name: data.name, days: Number(data.days), tolerance_days: Number(data.tolerance_days || 0) };
@@ -547,9 +547,9 @@ async function deleteFreq(id) {
 function openCatModal(existing) {
   const c = existing || { name:'', description:'' };
   openModal({
-    title: existing ? `Edit Category — ${escapeHtml(c.name)}` : 'Add PM Category',
+    title: existing ? `Edit Maintenance Category — ${escapeHtml(c.name)}` : 'Add Maintenance Category',
     body: `
-      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(c.name)}" required /></div>
+      <div class="form-row"><label>Maintenance Category *</label><input name="name" value="${escapeHtml(c.name)}" required placeholder="e.g. Mechanical / Electrical" /></div>
       <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(c.description || '')}</textarea></div>
     `,
     onSubmit: async (data) => {
@@ -571,9 +571,9 @@ async function openGroupModal(existing) {
   let depts = [];
   try { depts = await api('GET','/api/departments'); } catch (e) {}
   openModal({
-    title: existing ? `Edit Checklist Group — ${escapeHtml(g.name)}` : 'Add Checklist Group',
+    title: existing ? `Edit Engineering Function — ${escapeHtml(g.name)}` : 'Add Engineering Function',
     body: `
-      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(g.name)}" required /></div>
+      <div class="form-row"><label>Engineering Function *</label><input name="name" value="${escapeHtml(g.name)}" required placeholder="e.g. Mechanical / Electrical / HVAC / Water Systems" /></div>
       <div class="form-row"><label>Department</label>
         <select name="department_id">
           <option value="">— none —</option>
@@ -1440,10 +1440,10 @@ async function openChecklistBuilder(existingId) {
     const renderBuilder = () => `
       <div class="form-row"><label>Checklist Name *</label><input name="name" value="${escapeHtml(cl?.name || '')}" required /></div>
       <div class="form-row"><label>Version</label><input name="version" value="${escapeHtml(cl?.version || 'v1.0')}" /></div>
-      <div class="form-row"><label>Group</label>
+      <div class="form-row"><label>Engineering Function</label>
         <select name="group_id"><option value="">—</option>${groups.map(g => `<option value="${g.id}" ${cl && cl.group_id===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}</select>
       </div>
-      <div class="form-row"><label>Category</label>
+      <div class="form-row"><label>Maintenance Category</label>
         <select name="category_id"><option value="">—</option>${cats.map(c => `<option value="${c.id}" ${cl && cl.category_id===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}</select>
       </div>
       <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(cl?.description || '')}</textarea></div>
@@ -1599,7 +1599,7 @@ async function loadTasks(tab) {
             <div style="color:var(--muted); font-size:11px;">rev: ${escapeHtml(a.reviewer_name || '—')} · app: ${escapeHtml(a.approver_name || '—')}</div>
           </td>
           <td>${escapeHtml(a.frequency || '—')}</td>
-          <td>${escapeHtml(a.due_date || '—')}</td>
+          <td>${escapeHtml(a.due_date || a.effective_date || '—')}${a.effective_date && a.due_date ? `<div style="color:var(--muted); font-size:11px;">effective ${escapeHtml(a.effective_date)}</div>` : ''}</td>
           <td>${statusPill(a.status)}</td>
           <td><button class="btn ${act?'primary':'ghost'} sm" onclick="openAssignment('${escapeHtml(a.assignment_id)}')">${a.status==='Completed'?'View':'Open'}</button></td>
         </tr>`;
@@ -1609,19 +1609,21 @@ async function loadTasks(tab) {
 
 async function openAssignChecklistModal(presetChecklistId) {
   try {
-    const [checklists, users, roles, freqs, equipment, areas] = await Promise.all([
+    const [checklists, users, roles, freqs, cats, blocks, locations, areas, equipment] = await Promise.all([
       api('GET','/api/checklists?status=Approved'),
       api('GET','/api/users'),
       api('GET','/api/roles'),
       api('GET','/api/frequencies'),
-      api('GET','/api/equipment'),
+      api('GET','/api/pm-categories'),
+      api('GET','/api/blocks'),
+      api('GET','/api/locations'),
       api('GET','/api/areas'),
+      api('GET','/api/equipment'),
     ]);
     if (checklists.length === 0) {
       toast('No approved checklists yet. A checklist must complete Review + Approval before it can be assigned.', 'error');
       return;
     }
-    // Filter sets by activity
     const executorSet = usersWithActivity(users, roles, 'execute_checklist','execute_pm');
     const reviewerSet = usersWithActivity(users, roles, 'review_pm','review_checklist');
     const approverSet = usersWithActivity(users, roles, 'approve_pm','approve_checklist');
@@ -1633,46 +1635,143 @@ async function openAssignChecklistModal(presetChecklistId) {
       toast('No users with the review/approve permission. Configure roles first.','error'); return;
     }
 
-    // Stash target choices for the inline switcher
-    window.__assignEquipOptions = equipment.map(e => `<option value="${e.equipment_id}">${e.equipment_id} · ${escapeHtml(e.name)}</option>`).join('');
-    window.__assignAreaOptions  = areas.map(a => `<option value="${a.area_id}">${a.area_id} · ${escapeHtml(a.area_type)}</option>`).join('');
-    window.__switchAssignTarget = (sel) => {
-      const wrap = document.getElementById('targetWrap');
-      const opts = sel.value === 'equipment' ? window.__assignEquipOptions : window.__assignAreaOptions;
-      wrap.innerHTML = `<select name="target_id" required>${opts}</select>`;
+    // Stash data for inline handlers
+    window.__asn = { checklists, blocks, locations, areas, equipment };
+    const checklistDefaults = {};
+    checklists.forEach(c => { checklistDefaults[c.id] = { reviewer_id: c.reviewer_id, approver_id: c.approver_id, category_id: c.category_id }; });
+
+    // Helpers as window globals so inline onchange can reach them
+    window.__asnFilterChecklists = (catId) => {
+      const sel = document.getElementById('asnChecklistSel');
+      const filtered = catId
+        ? checklists.filter(c => Number(c.category_id) === Number(catId))
+        : checklists;
+      sel.innerHTML = filtered.length === 0
+        ? '<option value="">— no approved checklists in this category —</option>'
+        : filtered.map(c => `<option value="${c.id}">${escapeHtml(c.name)} (${escapeHtml(c.version)})</option>`).join('');
+      window.__asnSyncReviewerApprover();
+    };
+    window.__asnSyncReviewerApprover = () => {
+      const sel = document.getElementById('asnChecklistSel');
+      const d = checklistDefaults[Number(sel.value)] || {};
+      const rv = document.querySelector('select[name="reviewer_id"]');
+      const ap = document.querySelector('select[name="approver_id"]');
+      if (rv && d.reviewer_id) rv.value = d.reviewer_id;
+      if (ap && d.approver_id) ap.value = d.approver_id;
+    };
+    window.__asnOnBlock = () => {
+      const sel = document.getElementById('asnBlockSel');
+      const b = blocks.find(x => x.block_id === sel.value);
+      document.getElementById('asnBlockDesc').textContent = b ? b.name : '—';
+      const matching = locations.filter(l => l.block_id === sel.value);
+      document.getElementById('asnLocSel').innerHTML = '<option value="">— select location —</option>' +
+        matching.map(l => `<option value="${escapeHtml(l.location_id)}">${escapeHtml(l.location_id)}</option>`).join('');
+      document.getElementById('asnLocDesc').textContent = '—';
+      document.getElementById('asnAreaSel').innerHTML = '<option value="">— select location first —</option>';
+      document.getElementById('asnAreaDesc').textContent = '—';
+      document.getElementById('asnEqSel').innerHTML = '<option value="">— select area first —</option>';
+      document.getElementById('asnEqDesc').textContent = '—';
+    };
+    window.__asnOnLoc = () => {
+      const sel = document.getElementById('asnLocSel');
+      const l = locations.find(x => x.location_id === sel.value);
+      document.getElementById('asnLocDesc').textContent = l ? l.description : '—';
+      const matching = areas.filter(a => a.location_id === sel.value);
+      document.getElementById('asnAreaSel').innerHTML = '<option value="">— select area —</option>' +
+        matching.map(a => `<option value="${escapeHtml(a.area_id)}">${escapeHtml(a.area_id)}</option>`).join('');
+      document.getElementById('asnAreaDesc').textContent = '—';
+      document.getElementById('asnEqSel').innerHTML = '<option value="">— select area first —</option>';
+      document.getElementById('asnEqDesc').textContent = '—';
+    };
+    window.__asnOnArea = () => {
+      const sel = document.getElementById('asnAreaSel');
+      const a = areas.find(x => x.area_id === sel.value);
+      document.getElementById('asnAreaDesc').textContent = a ? a.area_type : '—';
+      const matching = equipment.filter(e => e.area_id === sel.value);
+      document.getElementById('asnEqSel').innerHTML = '<option value="">— select equipment —</option>' +
+        matching.map(e => `<option value="${escapeHtml(e.equipment_id)}">${escapeHtml(e.equipment_id)}</option>`).join('');
+      document.getElementById('asnEqDesc').textContent = '—';
+    };
+    window.__asnOnEq = () => {
+      const sel = document.getElementById('asnEqSel');
+      const e = equipment.find(x => x.equipment_id === sel.value);
+      document.getElementById('asnEqDesc').textContent = e ? e.name : '—';
     };
 
-    // Auto-fill reviewer/approver from the checklist template when checklist is changed
-    window.__checklistDefaults = {};
-    checklists.forEach(c => { window.__checklistDefaults[c.id] = { reviewer_id: c.reviewer_id, approver_id: c.approver_id }; });
-    window.__syncAsignDefaults = (sel) => {
-      const d = window.__checklistDefaults[Number(sel.value)] || {};
-      if (d.reviewer_id) document.querySelector('select[name="reviewer_id"]').value = d.reviewer_id;
-      if (d.approver_id) document.querySelector('select[name="approver_id"]').value = d.approver_id;
-    };
+    const catRadios = cats.map(c => `
+      <label style="display:inline-flex; align-items:center; gap:4px; margin:3px 10px 3px 0; font-size:13px;">
+        <input type="radio" name="category_id" value="${c.id}" onchange="window.__asnFilterChecklists(this.value)" />
+        ${escapeHtml(c.name)}
+      </label>`).join('') + `
+      <label style="display:inline-flex; align-items:center; gap:4px; margin:3px 10px 3px 0; font-size:13px;">
+        <input type="radio" name="category_id" value="" checked onchange="window.__asnFilterChecklists(this.value)" />
+        <em>Any</em>
+      </label>`;
 
-    const initialChecklist = presetChecklistId ? checklists.find(c => c.id === presetChecklistId) : checklists[0];
-    const initRevId = initialChecklist?.reviewer_id || '';
-    const initAppId = initialChecklist?.approver_id || '';
+    const freqRadios = freqs.map(f => `
+      <label style="display:inline-flex; align-items:center; gap:4px; margin:3px 10px 3px 0; font-size:13px;">
+        <input type="radio" name="frequency_id" value="${f.id}" />
+        ${escapeHtml(f.name)} <span style="color:var(--muted); font-size:11px;">(${f.days}d)</span>
+      </label>`).join('');
+
+    const todayStr = new Date().toISOString().slice(0,10);
 
     openModal({
       title: 'Assign PM Activity',
-      width: 600,
+      width: 720,
       body: `
-        <div class="form-row"><label>Checklist (Approved) *</label>
-          <select name="checklist_id" required onchange="window.__syncAsignDefaults(this)">
+        <div class="form-row" style="grid-template-columns:1fr;">
+          <label>Maintenance Category</label>
+          <div id="asnCatRadios">${catRadios}</div>
+        </div>
+        <div class="form-row"><label>Approved Checklist *</label>
+          <select id="asnChecklistSel" name="checklist_id" required onchange="window.__asnSyncReviewerApprover()">
             ${checklists.map(c => `<option value="${c.id}" ${presetChecklistId===c.id?'selected':''}>${escapeHtml(c.name)} (${escapeHtml(c.version)})</option>`).join('')}
           </select>
         </div>
-        <div class="form-row"><label>Target Type *</label>
-          <select id="targetTypeSel" name="target_type" required onchange="window.__switchAssignTarget(this)">
-            <option value="equipment">Equipment</option>
-            <option value="area">Area</option>
-          </select>
+
+        <div class="form-row"><label>Block ID</label>
+          <div>
+            <select id="asnBlockSel" name="block_id" onchange="window.__asnOnBlock()">
+              <option value="">— select block —</option>
+              ${blocks.map(b => `<option value="${escapeHtml(b.block_id)}">${escapeHtml(b.block_id)}</option>`).join('')}
+            </select>
+            <div id="asnBlockDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+          </div>
         </div>
-        <div class="form-row"><label>Target *</label>
-          <span id="targetWrap"><select name="target_id" required>${window.__assignEquipOptions}</select></span>
+        <div class="form-row"><label>Location ID</label>
+          <div>
+            <select id="asnLocSel" name="location_id" onchange="window.__asnOnLoc()">
+              <option value="">— select block first —</option>
+            </select>
+            <div id="asnLocDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+          </div>
         </div>
+        <div class="form-row"><label>Area ID</label>
+          <div>
+            <select id="asnAreaSel" name="area_id" onchange="window.__asnOnArea()">
+              <option value="">— select location first —</option>
+            </select>
+            <div id="asnAreaDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+          </div>
+        </div>
+        <div class="form-row"><label>Equipment ID *</label>
+          <div>
+            <select id="asnEqSel" name="equipment_id" required onchange="window.__asnOnEq()">
+              <option value="">— select area first —</option>
+            </select>
+            <div id="asnEqDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+          </div>
+        </div>
+
+        <div class="form-row" style="grid-template-columns:1fr;">
+          <label>Checklist Frequency *</label>
+          <div id="asnFreqRadios">${freqRadios}</div>
+        </div>
+
+        <div class="form-row"><label>Effective Date *</label><input type="date" name="effective_date" required value="${todayStr}" /></div>
+        <div class="form-row"><label>Due Date</label><input type="date" name="due_date" /></div>
+
         <div class="form-row"><label>Executor (Initiator) *</label>
           <select name="assignee_id" required>
             ${executors.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
@@ -1680,30 +1779,29 @@ async function openAssignChecklistModal(presetChecklistId) {
         </div>
         <div class="form-row"><label>Reviewer (Engineering) *</label>
           <select name="reviewer_id" required>
-            ${reviewers.map(u => `<option value="${u.id}" ${u.id===initRevId?'selected':''}>${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+            ${reviewers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)}</option>`).join('')}
           </select>
         </div>
         <div class="form-row"><label>Approver (QA) *</label>
           <select name="approver_id" required>
-            ${approvers.map(u => `<option value="${u.id}" ${u.id===initAppId?'selected':''}>${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+            ${approvers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)}</option>`).join('')}
           </select>
         </div>
-        <div class="form-row"><label>Frequency</label>
-          <select name="frequency_id"><option value="">— one-off —</option>${freqs.map(f => `<option value="${f.id}">${escapeHtml(f.name)} (every ${f.days} d)</option>`).join('')}</select>
-        </div>
-        <div class="form-row"><label>Due Date</label><input name="due_date" type="date" /></div>
         <div class="form-row" style="grid-template-columns:1fr;"><label>Notes</label><textarea name="notes" placeholder="Optional context for the executor"></textarea></div>
         <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Workflow: Executor performs → Reviewer (Engineering) passes → Approver (QA) signs off.</p>
       `,
       onSubmit: async (data) => {
+        if (!data.frequency_id) throw new Error('Please select a Checklist Frequency');
+        if (!data.equipment_id) throw new Error('Please select an Equipment');
         await api('POST','/api/assignments', {
           checklist_id: Number(data.checklist_id),
-          target_type: data.target_type,
-          target_id: data.target_id,
+          target_type: 'equipment',
+          target_id: data.equipment_id,
           assignee_id: Number(data.assignee_id),
           reviewer_id: Number(data.reviewer_id),
           approver_id: Number(data.approver_id),
-          frequency_id: data.frequency_id ? Number(data.frequency_id) : null,
+          frequency_id: Number(data.frequency_id),
+          effective_date: data.effective_date || null,
           due_date: data.due_date || null,
           notes: data.notes || ''
         });
@@ -1711,6 +1809,8 @@ async function openAssignChecklistModal(presetChecklistId) {
         if ($('page-tasks').classList.contains('active')) loadTasks(CURRENT_TASKS_TAB);
       }
     });
+    // After the modal is in the DOM, sync reviewer/approver defaults for the initial checklist
+    setTimeout(() => window.__asnSyncReviewerApprover(), 50);
   } catch (e) { toast(e.message,'error'); }
 }
 
@@ -1837,6 +1937,7 @@ async function openAssignment(assignmentId) {
       <div class="row-gap" style="font-size:12px; margin-bottom: 8px;">
         ${statusPill(a.status)}
         ${a.target_id ? `<span class="pill brown">${escapeHtml(a.target_type)}: ${escapeHtml(a.target_id)}${a.target_label?' · '+escapeHtml(a.target_label):''}</span>` : ''}
+        ${a.effective_date ? `<span class="pill brown">Effective: ${escapeHtml(a.effective_date)}</span>` : ''}
         ${a.due_date  ? `<span class="pill brown">Due: ${escapeHtml(a.due_date)}</span>` : ''}
         ${a.frequency ? `<span class="pill brown">${escapeHtml(a.frequency)}</span>` : ''}
       </div>

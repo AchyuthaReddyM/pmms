@@ -510,18 +510,21 @@ app.delete('/api/checklist-groups/:id', requireAuth, requireActivity('manage_pm_
   res.json({ ok: true });
 });
 app.get('/api/checklists', requireAuth, (req,res) => {
-  const { status } = req.query;
-  const where = status ? 'WHERE cl.status = ?' : '';
-  const args = status ? [status] : [];
+  const { status, category_id, group_id } = req.query;
+  const where = [];
+  const args = [];
+  if (status)      { where.push('cl.status = ?');      args.push(status); }
+  if (category_id) { where.push('cl.category_id = ?'); args.push(Number(category_id)); }
+  if (group_id)    { where.push('cl.group_id = ?');    args.push(Number(group_id)); }
   res.json(db.prepare(`
-    SELECT cl.id, cl.name, cl.group_id, cl.version, cl.status,
+    SELECT cl.id, cl.name, cl.group_id, cl.category_id, cl.version, cl.status,
            cl.reviewer_id, cl.approver_id, cl.created_by,
            cb.name AS created_by_name, rv.name AS reviewer_name, ap.name AS approver_name
     FROM checklists cl
     LEFT JOIN users cb ON cb.id = cl.created_by
     LEFT JOIN users rv ON rv.id = cl.reviewer_id
     LEFT JOIN users ap ON ap.id = cl.approver_id
-    ${where}
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY cl.id
   `).all(...args));
 });
@@ -1231,7 +1234,8 @@ app.get('/api/assignments', requireAuth, (req, res) => {
   const sql = `
     SELECT ca.id, ca.assignment_id, ca.checklist_id, ca.target_type, ca.target_id,
            ca.assignee_id, ca.reviewer_id, ca.approver_id, ca.frequency_id,
-           ca.due_date, ca.status, ca.notes, ca.assigned_at, ca.started_at,
+           ca.effective_date, ca.due_date,
+           ca.status, ca.notes, ca.assigned_at, ca.started_at,
            ca.submitted_at, ca.reviewed_at, ca.approved_at, ca.completed_at,
            ca.rejection_reason,
            cl.name AS checklist_name, cl.version AS checklist_version,
@@ -1285,7 +1289,7 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
 });
 
 app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (req, res) => {
-  const { checklist_id, target_type, target_id, assignee_id, reviewer_id, approver_id, frequency_id, due_date, notes } = req.body || {};
+  const { checklist_id, target_type, target_id, assignee_id, reviewer_id, approver_id, frequency_id, effective_date, due_date, notes } = req.body || {};
   if (!checklist_id || !target_type || !target_id) {
     return res.status(400).json({ error: 'checklist_id, target_type and target_id required' });
   }
@@ -1329,9 +1333,9 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
   if (!rv || !ap) return res.status(400).json({ error: 'Unknown reviewer/approver' });
 
   const aid = nextAssignmentId();
-  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,due_date,notes,status,assigned_by)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(aid, checklist_id, target_type, target_id, assignee.id, rv.id, ap.id, frequency_id || null, due_date || null, notes || '', 'Pending', req.user.id);
+  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,effective_date,due_date,notes,status,assigned_by)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(aid, checklist_id, target_type, target_id, assignee.id, rv.id, ap.id, frequency_id || null, effective_date || null, due_date || null, notes || '', 'Pending', req.user.id);
 
   notify(assignee.id,
     'New PM activity assigned',
