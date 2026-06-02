@@ -210,13 +210,23 @@ app.get('/api/dashboard/compliance-by-dept', requireAuth, (req, res) => {
 app.get('/api/plants', requireAuth, (req, res) => {
   res.json(db.prepare('SELECT * FROM plants ORDER BY plant_id').all());
 });
+// Common ID validation: 1-50 chars of letters / digits / dash / underscore.
+const ID_PATTERN = /^[A-Za-z0-9_\-]{1,50}$/;
+function checkId(label, value) {
+  if (!value || !String(value).trim()) return `${label} is required`;
+  if (!ID_PATTERN.test(String(value).trim())) return `${label} must be 1-50 alphanumeric characters (- and _ allowed)`;
+  return null;
+}
+
 app.post('/api/plants', requireAuth, requireRole('System Administrator'), (req, res) => {
-  const { name, location, unit_number, version } = req.body || {};
-  if (!name) return res.status(400).json({ error: 'Name required' });
-  const plant_id = nextId('PL-', 'plants', 'plant_id');
-  db.prepare('INSERT INTO plants(plant_id,unit_number,name,location,version) VALUES (?,?,?,?,?)')
-    .run(plant_id, unit_number || null, name, location || '', version || null);
-  audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}"${unit_number?` (${unit_number})`:''} at ${location || '-'}`);
+  const { plant_id, name, location } = req.body || {};
+  const idErr = checkId('Plant ID', plant_id); if (idErr) return res.status(400).json({ error: idErr });
+  if (!name) return res.status(400).json({ error: 'Plant Name is required' });
+  if (db.prepare('SELECT 1 FROM plants WHERE plant_id=?').get(plant_id)) {
+    return res.status(409).json({ error: `Plant ID "${plant_id}" already exists` });
+  }
+  db.prepare('INSERT INTO plants(plant_id,name,location) VALUES (?,?,?)').run(plant_id, name, location || '');
+  audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}" at ${location || '-'}`);
   res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(plant_id));
 });
 app.put('/api/plants/:plant_id', requireAuth, requireRole('System Administrator'), (req, res) => {
@@ -249,11 +259,17 @@ app.get('/api/blocks', requireAuth, (req, res) => {
   res.json(rows);
 });
 app.post('/api/blocks', requireAuth, requireRole('System Administrator'), (req, res) => {
-  const { plant_id, name } = req.body;
-  if (!plant_id || !name) return res.status(400).json({ error: 'plant_id and name required' });
-  const block_id = nextId('BLK-', 'blocks', 'block_id');
+  const { block_id, plant_id, name } = req.body || {};
+  const idErr = checkId('Block ID', block_id); if (idErr) return res.status(400).json({ error: idErr });
+  if (!plant_id) return res.status(400).json({ error: 'Plant is required' });
+  if (!name) return res.status(400).json({ error: 'Block Name is required' });
+  const plant = db.prepare('SELECT name FROM plants WHERE plant_id=?').get(plant_id);
+  if (!plant) return res.status(400).json({ error: 'Unknown plant_id' });
+  if (db.prepare('SELECT 1 FROM blocks WHERE block_id=?').get(block_id)) {
+    return res.status(409).json({ error: `Block ID "${block_id}" already exists` });
+  }
   db.prepare('INSERT INTO blocks(block_id,plant_id,name) VALUES (?,?,?)').run(block_id, plant_id, name);
-  audit(req.user, 'CREATE', 'Block', block_id, `Block "${name}" under ${plant_id}`);
+  audit(req.user, 'CREATE', 'Block', block_id, `Block "${name}" under plant ${plant_id} (${plant.name})`);
   res.json(db.prepare('SELECT * FROM blocks WHERE block_id=?').get(block_id));
 });
 
@@ -284,8 +300,13 @@ app.get('/api/locations', requireAuth, (req,res) => res.json(db.prepare(`
   ORDER BY l.location_id
 `).all()));
 app.post('/api/locations', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { block_id, description, formulation_id } = req.body || {};
-  if (!block_id) return res.status(400).json({ error: 'block_id required' });
+  // 'description' is the Location Name in our schema (renamed in the UI).
+  // Accept both 'name' and 'description' for forward-compat.
+  const { location_id, block_id, name, description, formulation_id } = req.body || {};
+  const locName = name || description;
+  const idErr = checkId('Location ID', location_id); if (idErr) return res.status(400).json({ error: idErr });
+  if (!block_id) return res.status(400).json({ error: 'Block is required' });
+  if (!locName) return res.status(400).json({ error: 'Location Name is required' });
   const block = db.prepare('SELECT name FROM blocks WHERE block_id=?').get(block_id);
   if (!block) return res.status(400).json({ error: 'Unknown block_id' });
   let formName = null;
@@ -294,10 +315,12 @@ app.post('/api/locations', requireAuth, requireActivity('manage_plants'), (req, 
     if (!f) return res.status(400).json({ error: 'Unknown formulation_id' });
     formName = f.name;
   }
-  const location_id = nextId('LOC-', 'locations', 'location_id');
+  if (db.prepare('SELECT 1 FROM locations WHERE location_id=?').get(location_id)) {
+    return res.status(409).json({ error: `Location ID "${location_id}" already exists` });
+  }
   db.prepare('INSERT INTO locations(location_id,block_id,description,formulation_id) VALUES (?,?,?,?)')
-    .run(location_id, block_id, description || '', formulation_id || null);
-  audit(req.user, 'CREATE', 'Location', location_id, `"${description || location_id}" under block ${block_id} (${block.name})${formName?` [${formName}]`:''}`);
+    .run(location_id, block_id, locName, formulation_id || null);
+  audit(req.user, 'CREATE', 'Location', location_id, `"${locName}" under block ${block_id} (${block.name})${formName?` [${formName}]`:''}`);
   res.json(db.prepare('SELECT * FROM locations WHERE location_id=?').get(location_id));
 });
 app.put('/api/locations/:location_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
@@ -317,14 +340,18 @@ app.put('/api/locations/:location_id', requireAuth, requireActivity('manage_plan
 app.get('/api/areas', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM areas ORDER BY area_id').all()));
 app.post('/api/areas', requireAuth, requireActivity('manage_plants'), (req, res) => {
   // Accept both 'name' (new) and 'area_type' (legacy) from the client.
-  const { location_id, name, area_type } = req.body || {};
+  const { area_id, location_id, name, area_type } = req.body || {};
   const areaName = name || area_type;
-  if (!location_id) return res.status(400).json({ error: 'location_id required' });
+  const idErr = checkId('Area ID', area_id); if (idErr) return res.status(400).json({ error: idErr });
+  if (!location_id) return res.status(400).json({ error: 'Location is required' });
+  if (!areaName) return res.status(400).json({ error: 'Area Name is required' });
   const loc = db.prepare('SELECT description FROM locations WHERE location_id=?').get(location_id);
   if (!loc) return res.status(400).json({ error: 'Unknown location_id' });
-  const area_id = nextId('AR-', 'areas', 'area_id');
-  db.prepare('INSERT INTO areas(area_id,location_id,name) VALUES (?,?,?)').run(area_id, location_id, areaName || '');
-  audit(req.user, 'CREATE', 'Area', area_id, `"${areaName || '—'}" under location ${location_id} (${loc.description})`);
+  if (db.prepare('SELECT 1 FROM areas WHERE area_id=?').get(area_id)) {
+    return res.status(409).json({ error: `Area ID "${area_id}" already exists` });
+  }
+  db.prepare('INSERT INTO areas(area_id,location_id,name) VALUES (?,?,?)').run(area_id, location_id, areaName);
+  audit(req.user, 'CREATE', 'Area', area_id, `"${areaName}" under location ${location_id} (${loc.description})`);
   res.json(db.prepare('SELECT * FROM areas WHERE area_id=?').get(area_id));
 });
 app.put('/api/areas/:area_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
@@ -345,19 +372,25 @@ app.get('/api/equipment/:equipment_id', requireAuth, (req,res) => {
   res.json(row);
 });
 app.post('/api/equipment', requireAuth, requireRole('System Administrator','Engineering'), (req, res) => {
-  let { name, make, model, make_model, serial, capacity, area_id, status } = req.body || {};
-  if (!name) return res.status(400).json({ error: 'Name required' });
+  let { equipment_id, name, make, model, make_model, serial, capacity, area_id, status } = req.body || {};
+  const idErr = checkId('Equipment ID', equipment_id); if (idErr) return res.status(400).json({ error: idErr });
+  if (!name) return res.status(400).json({ error: 'Equipment Name is required' });
+  if (!area_id) return res.status(400).json({ error: 'Area is required' });
   // Backwards compat: if legacy make_model passed, split into make/model.
   if (!make && !model && make_model) {
     const parts = String(make_model).split('/').map(s => s.trim());
     make = parts[0] || ''; model = parts.slice(1).join(' / ');
   }
-  const eid = nextId('EQ-', 'equipment', 'equipment_id');
+  if (db.prepare('SELECT 1 FROM equipment WHERE equipment_id=?').get(equipment_id)) {
+    return res.status(409).json({ error: `Equipment ID "${equipment_id}" already exists` });
+  }
+  // Restrict status to Active / Inactive at this endpoint per spec.
+  const safeStatus = (status === 'Inactive') ? 'Inactive' : 'Active';
   db.prepare(`INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,status,qr_code)
               VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(eid, name, make||'', model||'', serial||'', capacity||'', area_id||'', status||'Active', `QR:${eid}`);
-  audit(req.user, 'CREATE', 'Equipment', eid, `Registered: ${name} — ${make||'—'} ${model||''}${serial?` (SN ${serial})`:''}${area_id?` @ ${area_id}`:''}`);
-  res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(eid));
+    .run(equipment_id, name, make||'', model||'', serial||'', capacity||'', area_id, safeStatus, `QR:${equipment_id}`);
+  audit(req.user, 'CREATE', 'Equipment', equipment_id, `Registered: ${name} — ${make||'—'} ${model||''}${serial?` (SN ${serial})`:''} @ ${area_id}`);
+  res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(equipment_id));
 });
 app.put('/api/equipment/:equipment_id', requireAuth, requireRole('System Administrator','Engineering'), (req, res) => {
   const f = req.body || {};
