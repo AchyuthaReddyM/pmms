@@ -1259,7 +1259,7 @@ function saveChecklistFrequencies(checklistId, frequencyIds) {
 }
 
 app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (req, res) => {
-  const { code, name, description, group_id, category_id, version, sections, required_fields, frequency_ids } = req.body || {};
+  const { code, name, description, group_id, category_id, sections, required_fields, frequency_ids } = req.body || {};
   const err = validateChecklistCore({ code, name });
   if (err) return res.status(400).json({ error: err });
   if (!group_id) return res.status(400).json({ error: 'PM Checklist Group is required' });
@@ -1272,9 +1272,10 @@ app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (
   const reqd = Array.isArray(required_fields)
     ? required_fields.filter(k => REQUIRED_FIELD_KEYS.includes(k))
     : [];
+  // Version is system-controlled. New checklists always start at v1.0 — the client cannot override.
   const r = db.prepare(`INSERT INTO checklists(code,name,description,group_id,category_id,version,status,required_fields_json,created_by)
                         VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(code, name, description || '', group_id || null, category_id || null, version || 'v1.0', 'Draft', JSON.stringify(reqd), req.user.id);
+    .run(code, name, description || '', group_id || null, category_id || null, 'v1.0', 'Draft', JSON.stringify(reqd), req.user.id);
   const newId = r.lastInsertRowid;
   saveChecklistFrequencies(newId, frequency_ids);
   if (Array.isArray(sections)) {
@@ -1298,7 +1299,8 @@ app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (
 });
 
 app.put('/api/checklists/:id', requireAuth, requireActivity('manage_checklists'), (req, res) => {
-  const { code, name, description, group_id, category_id, version, status, sections, required_fields, frequency_ids } = req.body || {};
+  // Note: `version` from req.body is intentionally ignored — it's system-controlled.
+  const { code, name, description, group_id, category_id, status, sections, required_fields, frequency_ids } = req.body || {};
   const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
   if (!cl) return res.status(404).json({ error: 'Not found' });
   // Only allow content edits while in Draft / Rejected. Approved checklists are locked.
@@ -1324,10 +1326,9 @@ app.put('/api/checklists/:id', requireAuth, requireActivity('manage_checklists')
       description=COALESCE(?,description),
       group_id=COALESCE(?,group_id),
       category_id=COALESCE(?,category_id),
-      version=COALESCE(?,version),
       status=COALESCE(?,status),
       required_fields_json=COALESCE(?,required_fields_json)
-    WHERE id=?`).run(code, name, description, group_id, category_id, version, status, reqdJson, req.params.id);
+    WHERE id=?`).run(code, name, description, group_id, category_id, status, reqdJson, req.params.id);
 
   if (Array.isArray(frequency_ids)) saveChecklistFrequencies(req.params.id, frequency_ids);
 

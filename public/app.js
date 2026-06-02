@@ -1641,7 +1641,13 @@ async function openChecklistBuilder(existingId) {
       <div class="form-row"><label>Checklist Name *</label>
         <input name="name" value="${escapeHtml(cl?.name || '')}" required minlength="3" maxlength="300" placeholder="3-300 characters" />
       </div>
-      <div class="form-row"><label>Version</label><input name="version" value="${escapeHtml(cl?.version || 'v1.0')}" /></div>
+      <div class="form-row" style="align-items: start;"><label style="padding-top:8px;">Version</label>
+        <div>
+          <input name="version" value="${escapeHtml(cl?.version || 'v1.0')}" readonly tabindex="-1"
+                 style="background: var(--cream-100); color: var(--muted); cursor: not-allowed; width: 120px;" />
+          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Auto-assigned. New checklists start at v1.0; the version is bumped automatically when a re-approval cycle is started.</div>
+        </div>
+      </div>
       <div class="form-row"><label>Maintenance Category</label>
         <select name="category_id"><option value="">—</option>${cats.map(c => `<option value="${c.id}" ${cl && cl.category_id===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}</select>
       </div>
