@@ -2259,15 +2259,37 @@ async function openAssignment(assignmentId) {
         }).join('')}
       </div>` : '';
 
-    // Filter checklist questions to those applicable to THIS assignment's frequency.
-    // A question with empty `frequencies` array applies to all frequencies the checklist allows.
+    // Cascading applicability: at execution frequency X, complete every checkpoint tagged at
+    // X-or-LOWER frequency. Higher-frequency checkpoints are shown as N/A so the audit trail
+    // captures that they were deliberately not performed during this run.
+    //
+    // "Lower frequency" = smaller `days` value (Weekly=7 < Monthly=30 < Quarterly=90 ...).
     const asnFreqId = a.frequency_id;
+    const asnDays   = Number(a.frequency_days || 0);
+    const freqDaysMap = {};
+    const freqNameMap = {};
+    ((cl && cl.frequencies) || []).forEach(f => { freqDaysMap[f.id] = Number(f.days || 0); freqNameMap[f.id] = f.name; });
+    // also include the assignment's frequency in case it isn't on the checklist's allowed list
+    if (asnFreqId) { freqDaysMap[asnFreqId] = asnDays; freqNameMap[asnFreqId] = a.frequency || `#${asnFreqId}`; }
+
+    const questionApplies = (q) => {
+      if (!q.frequencies || q.frequencies.length === 0) return true;          // tagged "all" → always applies
+      if (!asnDays) return q.frequencies.includes(asnFreqId);                  // assignment has no days info → exact match
+      return q.frequencies.some(fid => {
+        const d = freqDaysMap[fid];
+        return d !== undefined && d <= asnDays;                                // cascade: lower- or equal-frequency tag → applies
+      });
+    };
+    const questionHigherFreqLabel = (q) => {
+      const names = (q.frequencies || []).map(fid => freqNameMap[fid] || `#${fid}`).filter(Boolean);
+      return names.length ? names.join(' / ') : '—';
+    };
+
     const filteredSections = (cl?.sections || [])
       .map(s => ({
         ...s,
-        questions: (s.questions || []).filter(q => !q.frequencies || q.frequencies.length === 0 || (asnFreqId && q.frequencies.includes(asnFreqId)))
-      }))
-      .filter(s => s.questions.length > 0);
+        questions: (s.questions || []).map(q => ({ ...q, _applies: questionApplies(q) }))
+      }));
     const sectionsHtml = filteredSections.map((s, si) => `
       <div style="margin: 10px 0 6px; padding: 8px 12px; background: var(--cream-100); border-left:3px solid var(--brand); border-radius:6px;">
         <strong>${si+1}. ${escapeHtml(s.name)}</strong>
@@ -2275,6 +2297,17 @@ async function openAssignment(assignmentId) {
       </div>
       <ul class="checklist">
         ${s.questions.map((q, qi) => {
+          if (!q._applies) {
+            // Higher-frequency checkpoint — render as N/A so the audit captures it.
+            const onlyOn = questionHigherFreqLabel(q);
+            return `<li style="opacity:0.55;">
+              <div class="chk-num" style="background:#eee; color:#999;">${si+1}.${qi+1}</div>
+              <div class="chk-body">
+                <div class="chk-title" style="text-decoration: line-through;">${escapeHtml(q.label)}${q.required?' *':''}</div>
+                <div class="chk-meta"><em>N/A this run — performed on <strong>${escapeHtml(onlyOn)}</strong> PM only</em></div>
+                <div class="chk-input"><input type="text" name="q_${q.id}" value="N/A" disabled style="background:#f5f5f5; color:#999; font-style:italic;" /></div>
+              </div></li>`;
+          }
           const val = existing[`q_${q.id}`] ?? '';
           let inp = '';
           const dis = formEditable ? '' : 'disabled';
@@ -2347,10 +2380,20 @@ async function openAssignment(assignmentId) {
     }
     const actionsHtml = acts.join(' ');
 
+    // Cascade banner — count applicable vs N/A and explain the rule.
+    let nApplies = 0, nNA = 0;
+    filteredSections.forEach(s => s.questions.forEach(q => { q._applies ? nApplies++ : nNA++; }));
+    const cascadeBanner = (nNA > 0 && a.frequency) ? `
+      <div style="margin:0 0 10px; padding:8px 12px; background:var(--blue-bg); border-left:3px solid var(--blue); border-radius:6px; font-size:12px;">
+        <strong>Frequency Cascade — ${escapeHtml(a.frequency)} PM:</strong>
+        ${nApplies} checkpoint(s) to complete · ${nNA} marked N/A for this run.
+        <div style="color:var(--muted); margin-top:2px;">A ${escapeHtml(a.frequency)} run includes every checkpoint tagged at ${escapeHtml(a.frequency)} or any lower frequency. Higher-frequency checkpoints are shown but disabled, so the record reflects what was deliberately skipped.</div>
+      </div>` : '';
+
     openModal({
       title: `Assignment ${a.assignment_id} — ${escapeHtml(cl?.name || '')}`,
       width: 780,
-      body: `${banner}${rfHtml}${sectionsHtml}${notesBox}${sigsHtml}`,
+      body: `${banner}${rfHtml}${cascadeBanner}${sectionsHtml}${notesBox}${sigsHtml}`,
       actions: actionsHtml,
       hideDefaultSubmit: true,
     });

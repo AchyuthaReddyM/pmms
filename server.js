@@ -1510,7 +1510,7 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
            u.name  AS assignee_name, u.user_id  AS assignee_user_id,
            rv.name AS reviewer_name, rv.user_id AS reviewer_user_id,
            ap.name AS approver_name, ap.user_id AS approver_user_id,
-           b.name  AS assigned_by_name, f.name AS frequency,
+           b.name  AS assigned_by_name, f.name AS frequency, f.days AS frequency_days, f.tolerance_days,
            CASE ca.target_type
              WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
              WHEN 'area'      THEN (SELECT area_type FROM areas WHERE area_id = ca.target_id)
@@ -1780,7 +1780,7 @@ app.get('/api/assignments/expired', requireAuth, (req, res) => {
            ca.pnc_number, ca.exception_number, ca.exception_description,
            ca.expired_at, ca.reassigned_at,
            cl.name AS checklist_name, cl.version AS checklist_version,
-           f.name AS frequency,
+           f.name AS frequency, f.days AS frequency_days, f.tolerance_days,
            e.name AS equipment_name, e.make, e.model, e.capacity,
            a.area_id, a.name AS area_name,
            l.location_id, l.description AS location_name,
