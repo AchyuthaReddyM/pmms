@@ -1947,43 +1947,55 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
       if (rv && d.reviewer_id) rv.value = d.reviewer_id;
       if (ap && d.approver_id) ap.value = d.approver_id;
     };
+    // Helpers — render the auto-populated "name" label below each dropdown.
+    // Empty state shows a placeholder hint so the user knows what's coming.
+    const setDesc = (id, label, value) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      if (value) {
+        el.innerHTML = `<strong style="color:var(--brown-700);">${escapeHtml(label)}:</strong> ${escapeHtml(value)}`;
+        el.style.color = 'var(--brown-700)';
+      } else {
+        el.innerHTML = `<em style="color:var(--muted);">${escapeHtml(label)} will appear here once you pick an ID above.</em>`;
+      }
+    };
     window.__asnOnBlock = () => {
       const sel = document.getElementById('asnBlockSel');
       const b = blocks.find(x => x.block_id === sel.value);
-      document.getElementById('asnBlockDesc').textContent = b ? b.name : '—';
+      setDesc('asnBlockDesc', 'Block Name', b ? b.name : null);
       const matching = locations.filter(l => l.block_id === sel.value);
       document.getElementById('asnLocSel').innerHTML = '<option value="">— select location —</option>' +
-        matching.map(l => `<option value="${escapeHtml(l.location_id)}">${escapeHtml(l.location_id)}</option>`).join('');
-      document.getElementById('asnLocDesc').textContent = '—';
+        matching.map(l => `<option value="${escapeHtml(l.location_id)}">${escapeHtml(l.location_id)} · ${escapeHtml(l.description || '')}</option>`).join('');
+      setDesc('asnLocDesc', 'Location Name', null);
       document.getElementById('asnAreaSel').innerHTML = '<option value="">— select location first —</option>';
-      document.getElementById('asnAreaDesc').textContent = '—';
+      setDesc('asnAreaDesc', 'Area Name', null);
       document.getElementById('asnEqSel').innerHTML = '<option value="">— select area first —</option>';
-      document.getElementById('asnEqDesc').textContent = '—';
+      setDesc('asnEqDesc', 'Equipment Name', null);
     };
     window.__asnOnLoc = () => {
       const sel = document.getElementById('asnLocSel');
       const l = locations.find(x => x.location_id === sel.value);
-      document.getElementById('asnLocDesc').textContent = l ? l.description : '—';
+      setDesc('asnLocDesc', 'Location Name', l ? l.description : null);
       const matching = areas.filter(a => a.location_id === sel.value);
       document.getElementById('asnAreaSel').innerHTML = '<option value="">— select area —</option>' +
-        matching.map(a => `<option value="${escapeHtml(a.area_id)}">${escapeHtml(a.area_id)}</option>`).join('');
-      document.getElementById('asnAreaDesc').textContent = '—';
+        matching.map(a => `<option value="${escapeHtml(a.area_id)}">${escapeHtml(a.area_id)} · ${escapeHtml(a.name || a.area_type || '')}</option>`).join('');
+      setDesc('asnAreaDesc', 'Area Name', null);
       document.getElementById('asnEqSel').innerHTML = '<option value="">— select area first —</option>';
-      document.getElementById('asnEqDesc').textContent = '—';
+      setDesc('asnEqDesc', 'Equipment Name', null);
     };
     window.__asnOnArea = () => {
       const sel = document.getElementById('asnAreaSel');
       const a = areas.find(x => x.area_id === sel.value);
-      document.getElementById('asnAreaDesc').textContent = a ? a.area_type : '—';
+      setDesc('asnAreaDesc', 'Area Name', a ? (a.name || a.area_type) : null);
       const matching = equipment.filter(e => e.area_id === sel.value);
       document.getElementById('asnEqSel').innerHTML = '<option value="">— select equipment —</option>' +
-        matching.map(e => `<option value="${escapeHtml(e.equipment_id)}">${escapeHtml(e.equipment_id)}</option>`).join('');
-      document.getElementById('asnEqDesc').textContent = '—';
+        matching.map(e => `<option value="${escapeHtml(e.equipment_id)}">${escapeHtml(e.equipment_id)} · ${escapeHtml(e.name || '')}</option>`).join('');
+      setDesc('asnEqDesc', 'Equipment Name', null);
     };
     window.__asnOnEq = () => {
       const sel = document.getElementById('asnEqSel');
       const e = equipment.find(x => x.equipment_id === sel.value);
-      document.getElementById('asnEqDesc').textContent = e ? e.name : '—';
+      setDesc('asnEqDesc', 'Equipment Name', e ? e.name : null);
     };
 
     const catRadios = cats.map(c => `
@@ -2022,9 +2034,9 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
           <div>
             <select id="asnBlockSel" name="block_id" onchange="window.__asnOnBlock()">
               <option value="">— select block —</option>
-              ${blocks.map(b => `<option value="${escapeHtml(b.block_id)}">${escapeHtml(b.block_id)}</option>`).join('')}
+              ${blocks.map(b => `<option value="${escapeHtml(b.block_id)}">${escapeHtml(b.block_id)} · ${escapeHtml(b.name || '')}</option>`).join('')}
             </select>
-            <div id="asnBlockDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+            <div id="asnBlockDesc" style="font-size:12px; margin-top:5px;"><em style="color:var(--muted);">Block Name will appear here once you pick an ID above.</em></div>
           </div>
         </div>
         <div class="form-row"><label>Location ID</label>
@@ -2032,7 +2044,7 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
             <select id="asnLocSel" name="location_id" onchange="window.__asnOnLoc()">
               <option value="">— select block first —</option>
             </select>
-            <div id="asnLocDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+            <div id="asnLocDesc" style="font-size:12px; margin-top:5px;"><em style="color:var(--muted);">Location Name will appear here once you pick an ID above.</em></div>
           </div>
         </div>
         <div class="form-row"><label>Area ID</label>
@@ -2040,7 +2052,7 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
             <select id="asnAreaSel" name="area_id" onchange="window.__asnOnArea()">
               <option value="">— select location first —</option>
             </select>
-            <div id="asnAreaDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+            <div id="asnAreaDesc" style="font-size:12px; margin-top:5px;"><em style="color:var(--muted);">Area Name will appear here once you pick an ID above.</em></div>
           </div>
         </div>
         <div class="form-row"><label>Equipment ID *</label>
@@ -2048,7 +2060,7 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
             <select id="asnEqSel" name="equipment_id" required onchange="window.__asnOnEq()">
               <option value="">— select area first —</option>
             </select>
-            <div id="asnEqDesc" style="color:var(--muted); font-size:11px; margin-top:3px;">—</div>
+            <div id="asnEqDesc" style="font-size:12px; margin-top:5px;"><em style="color:var(--muted);">Equipment Name will appear here once you pick an ID above.</em></div>
           </div>
         </div>
 
