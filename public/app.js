@@ -2610,12 +2610,14 @@ async function fetchPmStatus(equipmentId) {
             : ''}
         </div>
         <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px;">
-          ${fld('Plant Name', s.plant_name ? `${s.plant_name}${s.unit_number?` (${s.unit_number})`:''}` : null)}
+          ${fld('Plant ID', s.plant_id)}
+          ${fld('Unit ID',  s.unit_number)}
           ${fld('Equipment ID', s.equipment_id)}
+          ${fld('Equipment Name', s.equipment_name)}
           ${fld('Equipment Description', s.equipment_description)}
           ${fld('PM Number', s.pm_number)}
           ${fld('Frequency', s.frequency)}
-          ${fld('Assigned User', s.assignee_name)}
+          ${fld('Assigned User / PM Done By', s.assignee_name)}
           ${fld('Last Execution Date', s.last_execution_date)}
           ${fld('Next Due Date', s.next_due_date)}
           ${fld('Block / Location / Area', [s.block_name, s.location_name, s.area_name].filter(Boolean).join(' · '))}
