@@ -251,12 +251,12 @@ const MASTER_DEFS = {
   },
   blocks: {
     api: '/api/blocks',
-    head: ['Block ID','Plant','Block Name','Status'],
-    row: r => [r.block_id, r.plant_id, r.name, statusPill(r.status)],
+    head: ['Plant','Block ID','Block Name','Status'],
+    row: r => [r.plant_id, r.block_id, r.name, statusPill(r.status)],
     canAdd: true,
     addFields: [
+      { id:'plant_id', label:'Plant ID', required:true, type:'remoteSelect', source:'/api/plants', valueKey:'plant_id', labelFn:r => `${r.plant_id} · ${r.name}` },
       { id:'block_id', label:'Block ID', required:true, placeholder:'e.g., BLK-001' },
-      { id:'plant_id', label:'Plant', required:true, type:'remoteSelect', source:'/api/plants', valueKey:'plant_id', labelFn:r => `${r.plant_id} · ${r.name}` },
       { id:'name', label:'Block Name', required:true },
     ],
     create: (data) => api('POST','/api/blocks',data),
