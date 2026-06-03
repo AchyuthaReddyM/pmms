@@ -152,9 +152,12 @@ table.tbl tr:hover td { background: var(--cream-50); }
 .form-row { display:grid; grid-template-columns: 200px 1fr; gap: 14px; padding: 10px 0; border-bottom: 1px dashed var(--border); align-items: center; }
 .form-row:last-child { border-bottom:0; }
 .form-row label { color: var(--brown-700); font-weight: 600; font-size: 13px; }
-.form-row input, .form-row select, .form-row textarea {
+.form-row input:not([type="checkbox"]):not([type="radio"]), .form-row select, .form-row textarea {
   width:100%; padding: 8px 10px; border:1px solid var(--border-strong); border-radius: 7px;
   background: var(--cream-50); font-size: 13px; font-family: inherit; color: var(--ink);
+}
+.form-row input[type="checkbox"], .form-row input[type="radio"] {
+  width: auto; flex: none; margin: 0; cursor: pointer;
 }
 .form-row input:focus, .form-row select:focus, .form-row textarea:focus { outline: 2px solid var(--gold-400); outline-offset: 1px; border-color: var(--gold-500); }
 .form-row textarea { min-height: 70px; resize: vertical; }
