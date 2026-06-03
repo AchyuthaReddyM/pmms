@@ -1960,7 +1960,7 @@ async function loadTasks(tab) {
             <div style="color:var(--muted); font-size:11px;">rev: ${escapeHtml(a.reviewer_name || '—')} · app: ${escapeHtml(a.approver_name || '—')}</div>
           </td>
           <td>${escapeHtml(a.frequency || '—')}</td>
-          <td>${escapeHtml(a.due_date || a.effective_date || '—')}${a.effective_date && a.due_date ? `<div style="color:var(--muted); font-size:11px;">effective ${escapeHtml(a.effective_date)}</div>` : ''}</td>
+          <td>${escapeHtml(a.due_date || a.effective_date || '—')}${a.effective_date && a.due_date ? `<div style="color:var(--muted); font-size:11px;">scheduled ${escapeHtml(a.effective_date)}</div>` : ''}</td>
           <td>${statusPill(a.status)}</td>
           <td><button class="btn ${act?'primary':'ghost'} sm" onclick="openAssignment('${escapeHtml(a.assignment_id)}')">${a.status==='Completed'?'View':'Open'}</button></td>
         </tr>`;
@@ -2032,6 +2032,16 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
         el.innerHTML = `<em style="color:var(--muted);">${escapeHtml(label)} will appear here once you pick an ID above.</em>`;
       }
     };
+
+    // Lookup table by checklist ID for the auto-populated Checklist Name below the dropdown.
+    const checklistById = {};
+    checklists.forEach(c => { checklistById[c.id] = c; });
+    window.__asnOnChecklist = () => {
+      const sel = document.getElementById('asnChecklistSel');
+      const c = checklistById[Number(sel.value)];
+      setDesc('asnChecklistNameAuto', 'Checklist Name', c ? `${c.name} · ${c.version}` : null);
+      window.__asnSyncReviewerApprover();
+    };
     window.__asnOnBlock = () => {
       const sel = document.getElementById('asnBlockSel');
       const b = blocks.find(x => x.block_id === sel.value);
@@ -2097,10 +2107,13 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
           <label>Maintenance Category</label>
           <div id="asnCatRadios">${catRadios}</div>
         </div>
-        <div class="form-row"><label>Approved Checklist *</label>
-          <select id="asnChecklistSel" name="checklist_id" required onchange="window.__asnSyncReviewerApprover()">
-            ${checklists.map(c => `<option value="${c.id}" ${presetChecklistId===c.id?'selected':''}>${escapeHtml(c.name)} (${escapeHtml(c.version)})</option>`).join('')}
-          </select>
+        <div class="form-row"><label>Checklist ID *</label>
+          <div>
+            <select id="asnChecklistSel" name="checklist_id" required onchange="window.__asnOnChecklist()">
+              ${checklists.map(c => `<option value="${c.id}" ${presetChecklistId===c.id?'selected':''}>${escapeHtml(c.code || ('#'+c.id))} · ${escapeHtml(c.name)} (${escapeHtml(c.version)})</option>`).join('')}
+            </select>
+            <div id="asnChecklistNameAuto" style="font-size:12px; margin-top:5px;"><em style="color:var(--muted);">Checklist Name will appear here once you pick a Checklist ID.</em></div>
+          </div>
         </div>
 
         <div class="form-row"><label>Block ID</label>
@@ -2142,8 +2155,8 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
           <div id="asnFreqRadios">${freqRadios}</div>
         </div>
 
-        <div class="form-row"><label>Effective Date *</label><input type="date" name="effective_date" required value="${todayStr}" /></div>
-        <div class="form-row"><label>Due Date</label><input type="date" name="due_date" /></div>
+        <div class="form-row"><label>Scheduled Date *</label><input type="date" id="asnScheduledDate" name="effective_date" required value="${todayStr}" /></div>
+        <div class="form-row"><label>Due Date</label><input type="date" id="asnDueDate" name="due_date" onchange="(function(el){ var s=document.getElementById('asnScheduledDate'); if (s && el.value) s.value = el.value; })(this)" /></div>
 
         <div class="form-row"><label>Executor (Initiator) *</label>
           <select name="assignee_id" required>
@@ -2183,9 +2196,9 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
         if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
       }
     });
-    // After the modal is in the DOM, sync reviewer/approver defaults for the initial checklist
+    // After the modal is in the DOM, sync the auto-populated Checklist Name + reviewer/approver defaults.
     setTimeout(() => {
-      window.__asnSyncReviewerApprover();
+      window.__asnOnChecklist();
       // If pre-set equipment was passed (e.g. from Masters → Equipment row), walk the chain back
       // and pre-select Block → Location → Area → Equipment.
       if (presetEquipmentId) {
@@ -2417,7 +2430,7 @@ async function openAssignment(assignmentId) {
       <div class="row-gap" style="font-size:12px; margin-bottom: 8px;">
         ${statusPill(a.status)}
         ${a.target_id ? `<span class="pill brown">${escapeHtml(a.target_type)}: ${escapeHtml(a.target_id)}${a.target_label?' · '+escapeHtml(a.target_label):''}</span>` : ''}
-        ${a.effective_date ? `<span class="pill brown">Effective: ${escapeHtml(a.effective_date)}</span>` : ''}
+        ${a.effective_date ? `<span class="pill brown">Scheduled: ${escapeHtml(a.effective_date)}</span>` : ''}
         ${a.due_date  ? `<span class="pill brown">Due: ${escapeHtml(a.due_date)}</span>` : ''}
         ${a.frequency ? `<span class="pill brown">${escapeHtml(a.frequency)}</span>` : ''}
       </div>
@@ -2792,7 +2805,7 @@ async function openReassignExpiredModal(assignment) {
             ${approvers.map(u => `<option value="${u.id}" ${u.id===assignment.approver_id?'selected':''}>${escapeHtml(u.name)} — ${escapeHtml(u.role)}</option>`).join('')}
           </select>
         </div>
-        <div class="form-row"><label>New Effective Date</label><input name="effective_date" type="date" value="${todayStr}" /></div>
+        <div class="form-row"><label>New Scheduled Date</label><input name="effective_date" type="date" value="${todayStr}" /></div>
         <div class="form-row"><label>New Due Date</label><input name="due_date" type="date" /></div>
       `,
       submitLabel: 'Re-assign Now',
