@@ -708,6 +708,15 @@ function migrateSchema() {
   addColIfMissing('locations', 'formulation_id', 'INTEGER');
   // areas (added new "name" column without dropping legacy area_type)
   addColIfMissing('areas', 'name', 'TEXT');
+  // One-time backfill — if the legacy area_type column still has data and the new name column is empty,
+  // copy it over so SELECT name works on older DBs.
+  try {
+    const areaCols = cols('areas');
+    if (areaCols.includes('area_type') && areaCols.includes('name')) {
+      const r = db.prepare("UPDATE areas SET name = area_type WHERE (name IS NULL OR name = '') AND area_type IS NOT NULL").run();
+      if (r.changes > 0) console.log(`[db] migration: backfilled ${r.changes} areas.name from legacy area_type`);
+    }
+  } catch (e) { console.error('[db] migration: area_type backfill failed:', e.message); }
   // equipment (split make_model -> make + model)
   addColIfMissing('equipment', 'make', 'TEXT');
   addColIfMissing('equipment', 'model', 'TEXT');

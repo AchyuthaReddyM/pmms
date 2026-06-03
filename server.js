@@ -1567,7 +1567,7 @@ app.get('/api/assignments', requireAuth, (req, res) => {
            f.name  AS frequency,
            CASE ca.target_type
              WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
-             WHEN 'area'      THEN (SELECT area_type FROM areas WHERE area_id = ca.target_id)
+             WHEN 'area'      THEN (SELECT name FROM areas WHERE area_id = ca.target_id)
              ELSE NULL
            END AS target_label
     FROM checklist_assignments ca
@@ -1592,7 +1592,7 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
            b.name  AS assigned_by_name, f.name AS frequency, f.days AS frequency_days, f.tolerance_days,
            CASE ca.target_type
              WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
-             WHEN 'area'      THEN (SELECT area_type FROM areas WHERE area_id = ca.target_id)
+             WHEN 'area'      THEN (SELECT name FROM areas WHERE area_id = ca.target_id)
              ELSE NULL
            END AS target_label
     FROM checklist_assignments ca
@@ -1630,9 +1630,9 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
     if (!eq) return res.status(400).json({ error: 'Unknown equipment_id' });
     targetName = `${eq.equipment_id} (${eq.name})`;
   } else {
-    const ar = db.prepare('SELECT area_id, area_type FROM areas WHERE area_id=?').get(target_id);
+    const ar = db.prepare('SELECT area_id, name FROM areas WHERE area_id=?').get(target_id);
     if (!ar) return res.status(400).json({ error: 'Unknown area_id' });
-    targetName = `${ar.area_id} (${ar.area_type})`;
+    targetName = `${ar.area_id} (${ar.name || ''})`;
   }
   const assignee = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
   if (!assignee) return res.status(400).json({ error: 'Unknown assignee_id' });
