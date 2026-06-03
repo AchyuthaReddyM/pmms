@@ -27,10 +27,17 @@ async function api(method, url, body) {
   if (body !== undefined) opts.body = JSON.stringify(body);
   const r = await fetch(url, opts);
   if (r.status === 401) {
+    // Session expired / DB-side session row no longer exists.
+    // Clean everything up so the login modal isn't competing with stale UI.
     localStorage.removeItem(TOKEN_KEY);
     localStorage.removeItem(USER_KEY);
+    CURRENT_USER = null;
+    try { closeModal(); } catch (e) {}                          // close any open form modal
+    if (window._notifTimer) { clearInterval(window._notifTimer); window._notifTimer = null; }
+    const notifPanel = document.getElementById('notifPanel');
+    if (notifPanel) notifPanel.style.display = 'none';
     showLogin();
-    throw new Error('Not authenticated');
+    throw new Error('Your session has expired — please sign in again.');
   }
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
@@ -1707,11 +1714,11 @@ async function openChecklistBuilder(existingId) {
       <div class="form-row"><label>Checklist Name *</label>
         <input name="name" value="${escapeHtml(cl?.name || '')}" required minlength="3" maxlength="300" placeholder="3-300 characters" />
       </div>
-      <div class="form-row" style="align-items: start;"><label style="padding-top:8px;">Version</label>
-        <div>
+      <div class="form-row"><label>Version</label>
+        <div style="display:flex; align-items:center; gap:10px;">
           <input name="version" value="${escapeHtml(cl?.version || 'v1.0')}" readonly tabindex="-1"
-                 style="background: var(--cream-100); color: var(--muted); cursor: not-allowed; width: 120px;" />
-          <div style="font-size:11px; color:var(--muted); margin-top:4px;">Auto-assigned. New checklists start at v1.0; the version is bumped automatically when a re-approval cycle is started.</div>
+                 style="background: var(--cream-100); color: var(--muted); cursor: not-allowed; max-width: 120px;" />
+          <span style="font-size:11px; color:var(--muted);">Auto-assigned · system controlled</span>
         </div>
       </div>
       <div class="form-row"><label>Maintenance Category</label>
