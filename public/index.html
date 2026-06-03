@@ -386,7 +386,10 @@
             <select id="pmFilter" onchange="loadPmList()">
               <option value="">All Statuses</option>
               <option>Pending</option><option>Approved</option><option>Assigned</option>
-              <option>In Progress</option><option>Completed</option><option>Overdue</option><option>Expired</option>
+              <option>In Progress</option>
+              <option>Pending Review</option><option>Pending Approval</option>
+              <option>Completed</option><option>Rejected</option>
+              <option>Overdue</option><option>Expired</option>
             </select>
             <button class="btn primary" onclick="goto('pmconfig')">+ Create PM</button>
           </div>

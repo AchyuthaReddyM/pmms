@@ -763,18 +763,36 @@ function loadSchedule(pm_id) {
 
 app.get('/api/pm', requireAuth, (req, res) => {
   const { status } = req.query;
-  const where = status ? 'WHERE s.status = ?' : '';
-  const args = status ? [status] : [];
-  const rows = db.prepare(`
+  // Union legacy pm_schedules with the new checklist_assignments so the PM Execution view
+  // shows EVERY PM in flight — regardless of which subsystem created it.
+  const pmSql = `
     SELECT s.pm_id, s.equipment_id, e.name AS equipment_name,
       s.category, s.frequency, s.scheduled_date, s.status, s.department,
-      tech.name AS technician_name
+      tech.name AS technician_name,
+      'pm_schedule' AS source
     FROM pm_schedules s
     LEFT JOIN equipment e ON e.equipment_id = s.equipment_id
     LEFT JOIN users tech  ON tech.id = s.technician_id
-    ${where}
-    ORDER BY s.scheduled_date DESC
-  `).all(...args);
+    ${status ? 'WHERE s.status = ?' : ''}
+  `;
+  const caSql = `
+    SELECT ca.assignment_id AS pm_id, ca.target_id AS equipment_id, e.name AS equipment_name,
+      NULL AS category,
+      f.name AS frequency,
+      COALESCE(ca.due_date, ca.effective_date) AS scheduled_date,
+      ca.status,
+      NULL AS department,
+      u.name AS technician_name,
+      'assignment' AS source
+    FROM checklist_assignments ca
+    LEFT JOIN equipment e   ON e.equipment_id = ca.target_id
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    LEFT JOIN users u       ON u.id = ca.assignee_id
+    WHERE ca.target_type='equipment'
+    ${status ? 'AND ca.status = ?' : ''}
+  `;
+  const args = status ? [status, status] : [];
+  const rows = db.prepare(`${pmSql} UNION ALL ${caSql} ORDER BY scheduled_date DESC`).all(...args);
   res.json(rows);
 });
 
@@ -962,21 +980,48 @@ app.get('/api/reports/overdue', requireAuth, (req, res) => {
 // =============================================================
 app.get('/api/calendar', requireAuth, (req, res) => {
   const { year, month } = req.query; // month is 1-12
+  // Union pm_schedules + checklist_assignments — calendar shows EVERY scheduled PM.
+  const pmCols = `
+    s.pm_id, s.equipment_id, e.name AS equipment_name,
+    s.frequency, s.category, s.scheduled_date, s.status,
+    'pm_schedule' AS source
+  `;
+  const caCols = `
+    ca.assignment_id AS pm_id, ca.target_id AS equipment_id, e.name AS equipment_name,
+    f.name AS frequency, NULL AS category,
+    COALESCE(ca.due_date, ca.effective_date) AS scheduled_date,
+    ca.status,
+    'assignment' AS source
+  `;
   let rows;
   if (year && month) {
     const yyyy = String(year).padStart(4,'0');
     const mm = String(month).padStart(2,'0');
     rows = db.prepare(`
-      SELECT s.pm_id, s.equipment_id, e.name AS equipment_name, s.frequency, s.category, s.scheduled_date, s.status
+      SELECT ${pmCols}
       FROM pm_schedules s LEFT JOIN equipment e ON e.equipment_id = s.equipment_id
       WHERE strftime('%Y', s.scheduled_date)=? AND strftime('%m', s.scheduled_date)=?
-      ORDER BY s.scheduled_date
-    `).all(yyyy, mm);
+      UNION ALL
+      SELECT ${caCols}
+      FROM checklist_assignments ca
+      LEFT JOIN equipment e   ON e.equipment_id = ca.target_id
+      LEFT JOIN frequencies f ON f.id = ca.frequency_id
+      WHERE ca.target_type='equipment'
+        AND strftime('%Y', COALESCE(ca.due_date, ca.effective_date))=?
+        AND strftime('%m', COALESCE(ca.due_date, ca.effective_date))=?
+      ORDER BY scheduled_date
+    `).all(yyyy, mm, yyyy, mm);
   } else {
     rows = db.prepare(`
-      SELECT s.pm_id, s.equipment_id, e.name AS equipment_name, s.frequency, s.category, s.scheduled_date, s.status
+      SELECT ${pmCols}
       FROM pm_schedules s LEFT JOIN equipment e ON e.equipment_id = s.equipment_id
-      ORDER BY s.scheduled_date
+      UNION ALL
+      SELECT ${caCols}
+      FROM checklist_assignments ca
+      LEFT JOIN equipment e   ON e.equipment_id = ca.target_id
+      LEFT JOIN frequencies f ON f.id = ca.frequency_id
+      WHERE ca.target_type='equipment'
+      ORDER BY scheduled_date
     `).all();
   }
   res.json(rows);

@@ -977,6 +977,11 @@ async function loadPmList() {
 }
 
 function actionsForPm(p) {
+  // Checklist assignments use a separate lifecycle (executor/reviewer/approver workflow)
+  // and need to open through openAssignment, not openPm.
+  if (p.source === 'assignment') {
+    return `<button class="btn primary sm" onclick="openAssignment('${escapeHtml(p.pm_id)}')">Open</button>`;
+  }
   const btn = (label, handler, kind='ghost') => `<button class="btn ${kind} sm" onclick="${handler}">${label}</button>`;
   const open = btn('Open', `openPm('${p.pm_id}')`);
   if (p.status === 'Pending')      return btn('Approve', `quickPm('${p.pm_id}','approve')`,'primary') + ' ' + open;
@@ -1103,7 +1108,11 @@ async function loadCalendar() {
       const evHtml = evs.map(e => {
         const c = statusColor(e.status);
         const t = `${e.pm_id} · ${e.equipment_id}`;
-        return `<div class="ev ${c}" title="${escapeHtml(e.status)}: ${escapeHtml(t)}" onclick="openPm('${e.pm_id}')">${escapeHtml(t)}</div>`;
+        // Route assignment-sourced events to the assignment modal (workflow lifecycle differs from legacy pm_schedules).
+        const handler = e.source === 'assignment'
+          ? `openAssignment('${escapeHtml(e.pm_id)}')`
+          : `openPm('${escapeHtml(e.pm_id)}')`;
+        return `<div class="ev ${c}" title="${escapeHtml(e.status)}: ${escapeHtml(t)}" onclick="${handler}">${escapeHtml(t)}</div>`;
       }).join('');
       html += `<div class="day${todayCls}"><div class="num">${d}</div>${evHtml}</div>`;
     }
