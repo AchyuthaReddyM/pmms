@@ -255,6 +255,12 @@ function createSchema() {
       expired_at TEXT,
       reassigned_at TEXT,
       reassigned_by INTEGER REFERENCES users(id),
+      -- Clearance step: production user grants clearance before the executor can be assigned.
+      clearance_user_id INTEGER REFERENCES users(id),
+      clearance_status TEXT,
+      clearance_requested_at TEXT,
+      clearance_responded_at TEXT,
+      clearance_remarks TEXT,
       assigned_by INTEGER REFERENCES users(id),
       assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
       started_at TEXT,
@@ -366,6 +372,7 @@ const BUILTIN_ACTIVITIES = [
   // Checklist assignments
   ['assign_checklist',       'Assign Checklist',          'Checklists'],
   ['execute_checklist',      'Execute Assigned Checklist','Checklists'],
+  ['grant_clearance',        'Grant PM Clearance',        'Checklists'],
   // Breakdowns
   ['view_breakdowns',        'View Breakdowns',           'Breakdowns'],
   ['report_breakdown',       'Report Breakdown',          'Breakdowns'],
@@ -405,7 +412,7 @@ function seed() {
   const techActs   = ['view_pm','execute_pm','view_equipment','report_breakdown','execute_checklist'];
   const reviewerActs = ['view_pm','review_pm','view_equipment','view_reports','view_audit','execute_checklist','review_checklist'];
   const approverActs = ['view_pm','create_pm','approve_pm','assign_pm','view_equipment','manage_equipment','view_reports','view_breakdowns','resolve_breakdown','manage_checklists','assign_checklist','execute_checklist','review_checklist','approve_checklist'];
-  const prodActs   = ['view_pm','view_equipment','report_breakdown','view_breakdowns','execute_checklist'];
+  const prodActs   = ['view_pm','view_equipment','report_breakdown','view_breakdowns','execute_checklist','grant_clearance'];
   const qaActs     = ['view_pm','approve_pm','review_pm','view_reports','view_audit','execute_checklist','review_checklist','approve_checklist'];
   const whActs     = ['view_equipment','view_pm','execute_checklist'];
 
@@ -638,16 +645,22 @@ function seed() {
     .run(completedData, fmt(addDays(today, -16))+' 09:15:00', fmt(addDays(today,-16))+' 11:20:00','S. Naidu','R. Mehta','S. Iyer');
 
   // Sample checklist assignment with notification (target = equipment)
-  // Workflow: Executor snaidu -> Reviewer rmehta -> Approver qaapprove
-  ins('INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,effective_date,due_date,status,assigned_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
-    .run('CA-001', ahuCl, 'equipment', 'EQ-AHU-12', u('snaidu'), u('rmehta'), u('qaapprove'),
+  // Workflow: Manager assigns -> Clearance (mverma/Production) -> Engineering assigns executor
+  //           -> Executor (TBD) -> Reviewer rmehta -> Approver qaapprove
+  ins(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,
+       clearance_user_id,clearance_status,clearance_requested_at,
+       reviewer_id,approver_id,frequency_id,effective_date,due_date,status,assigned_by)
+       VALUES (?,?,?,?, ?,?,datetime('now'), ?,?,?,?,?,?,?)`)
+    .run('CA-001', ahuCl, 'equipment', 'EQ-AHU-12',
+         u('mverma'), 'Pending',
+         u('rmehta'), u('qaapprove'),
          db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
-         fmt(today), fmt(addDays(today, 3)), 'Pending', u('siyer'));
+         fmt(today), fmt(addDays(today, 3)), 'Pending Clearance', u('siyer'));
   ins('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
-    .run(u('snaidu'),
-         'New checklist assigned',
-         'AHU Monthly Inspection (v2) for EQ-AHU-12 is due ' + fmt(addDays(today,3)) + '.',
-         'assignment',
+    .run(u('mverma'),
+         'PM Clearance requested',
+         'AHU Monthly Inspection (v2) on EQ-AHU-12 needs your clearance — due ' + fmt(addDays(today,3)) + '.',
+         'clearance',
          '/assignments/CA-001');
 
   // CA-002 — a deliberately-overdue assignment to populate the Expired Equipment module.
@@ -755,6 +768,11 @@ function migrateSchema() {
   addColIfMissing('checklist_assignments', 'expired_at', 'TEXT');
   addColIfMissing('checklist_assignments', 'reassigned_at', 'TEXT');
   addColIfMissing('checklist_assignments', 'reassigned_by', 'INTEGER');
+  addColIfMissing('checklist_assignments', 'clearance_user_id', 'INTEGER');
+  addColIfMissing('checklist_assignments', 'clearance_status', 'TEXT');
+  addColIfMissing('checklist_assignments', 'clearance_requested_at', 'TEXT');
+  addColIfMissing('checklist_assignments', 'clearance_responded_at', 'TEXT');
+  addColIfMissing('checklist_assignments', 'clearance_remarks', 'TEXT');
   // frequencies / pm_categories — status column was added later
   addColIfMissing('frequencies', 'status', "TEXT NOT NULL DEFAULT 'Active'");
   addColIfMissing('pm_categories', 'status', "TEXT NOT NULL DEFAULT 'Active'");

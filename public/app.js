@@ -231,7 +231,8 @@ function statusPill(status) {
     'Inactive':'gray','Under Review':'amber','Locked':'amber','Validation':'amber',
     'Under Maintenance':'red',
     // Checklist workflow states
-    'Draft':'gray','Pending Review':'amber','Pending Approval':'amber','Rejected':'red','Expired':'red'
+    'Draft':'gray','Pending Review':'amber','Pending Approval':'amber','Rejected':'red','Expired':'red',
+    'Pending Clearance':'amber','Awaiting Executor':'amber','Clearance Denied':'red'
   };
   return `<span class="pill ${map[status] || 'gray'}">${escapeHtml(status)}</span>`;
 }
@@ -1911,10 +1912,12 @@ document.querySelectorAll('#tasksTabs button').forEach(b => {
 function actionableForUser(a) {
   // What's awaiting THIS user on this assignment? Returns a label or null.
   const uid = CURRENT_USER.id;
-  if (a.status === 'Pending' && a.assignee_id === uid)         return { label: 'Start', tone: 'amber' };
-  if (a.status === 'In Progress' && a.assignee_id === uid)    return { label: 'Continue execution', tone: 'blue' };
-  if (a.status === 'Pending Review' && a.reviewer_id === uid) return { label: 'Review', tone: 'amber' };
-  if (a.status === 'Pending Approval' && a.approver_id === uid) return { label: 'Approve', tone: 'amber' };
+  if (a.status === 'Pending Clearance' && a.clearance_user_id === uid)            return { label: 'Grant Clearance', tone: 'amber' };
+  if (a.status === 'Awaiting Executor' && (a.assigned_by === uid || CURRENT_USER.is_admin)) return { label: 'Assign Executor', tone: 'amber' };
+  if (a.status === 'Pending' && a.assignee_id === uid)                            return { label: 'Start', tone: 'amber' };
+  if (a.status === 'In Progress' && a.assignee_id === uid)                        return { label: 'Continue execution', tone: 'blue' };
+  if (a.status === 'Pending Review' && a.reviewer_id === uid)                     return { label: 'Review', tone: 'amber' };
+  if (a.status === 'Pending Approval' && a.approver_id === uid)                   return { label: 'Approve', tone: 'amber' };
   return null;
 }
 
@@ -1994,15 +1997,17 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
       toast('No approved checklists yet. A checklist must complete Review + Approval before it can be assigned.', 'error');
       return;
     }
-    const executorSet = usersWithActivity(users, roles, 'execute_checklist','execute_pm');
-    const reviewerSet = usersWithActivity(users, roles, 'review_pm','review_checklist');
-    const approverSet = usersWithActivity(users, roles, 'approve_pm','approve_checklist');
-    const executors = users.filter(u => executorSet.has(u.id));
-    const reviewers = users.filter(u => reviewerSet.has(u.id));
-    const approvers = users.filter(u => approverSet.has(u.id));
-    if (executors.length === 0) { toast('No users with execute permission.','error'); return; }
+    const reviewerSet  = usersWithActivity(users, roles, 'review_pm','review_checklist');
+    const approverSet  = usersWithActivity(users, roles, 'approve_pm','approve_checklist');
+    const clearanceSet = usersWithActivity(users, roles, 'grant_clearance');
+    const reviewers    = users.filter(u => reviewerSet.has(u.id));
+    const approvers    = users.filter(u => approverSet.has(u.id));
+    const clearanceCandidates = users.filter(u => clearanceSet.has(u.id));
     if (reviewers.length === 0 || approvers.length === 0) {
       toast('No users with the review/approve permission. Configure roles first.','error'); return;
+    }
+    if (clearanceCandidates.length === 0) {
+      toast('No users with the grant_clearance permission. Configure a role first.','error'); return;
     }
 
     // Stash data for inline handlers
@@ -2167,9 +2172,10 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
         <div class="form-row"><label>Scheduled Date *</label><input type="date" id="asnScheduledDate" name="effective_date" required value="${todayStr}" /></div>
         <div class="form-row"><label>Due Date</label><input type="date" id="asnDueDate" name="due_date" onchange="(function(el){ var s=document.getElementById('asnScheduledDate'); if (s && el.value) s.value = el.value; })(this)" /></div>
 
-        <div class="form-row"><label>Executor (Initiator) *</label>
-          <select name="assignee_id" required>
-            ${executors.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+        <div class="form-row"><label>Clearance User (Production) *</label>
+          <select name="clearance_user_id" required>
+            <option value="">— select clearance user —</option>
+            ${clearanceCandidates.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
           </select>
         </div>
         <div class="form-row"><label>Reviewer (Engineering) *</label>
@@ -2182,17 +2188,18 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
             ${approvers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)}</option>`).join('')}
           </select>
         </div>
-        <div class="form-row" style="grid-template-columns:1fr;"><label>Notes</label><textarea name="notes" placeholder="Optional context for the executor"></textarea></div>
-        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Workflow: Executor performs → Reviewer (Engineering) passes → Approver (QA) signs off.</p>
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Notes</label><textarea name="notes" placeholder="Optional context"></textarea></div>
+        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Workflow: Clearance from Production → Engineering Manager assigns Executor → Executor performs → Reviewer passes → Approver signs off.</p>
       `,
       onSubmit: async (data) => {
         if (!data.frequency_id) throw new Error('Please select a Checklist Frequency');
         if (!data.equipment_id) throw new Error('Please select an Equipment');
+        if (!data.clearance_user_id) throw new Error('Please select a Clearance User');
         await api('POST','/api/assignments', {
           checklist_id: Number(data.checklist_id),
           target_type: 'equipment',
           target_id: data.equipment_id,
-          assignee_id: Number(data.assignee_id),
+          clearance_user_id: Number(data.clearance_user_id),
           reviewer_id: Number(data.reviewer_id),
           approver_id: Number(data.approver_id),
           frequency_id: Number(data.frequency_id),
@@ -2319,16 +2326,20 @@ async function openAssignment(assignmentId) {
     const userId = CURRENT_USER.id;
 
     // Determine roles
-    const amExecutor = a.assignee_id === userId || (!a.assignee_id && can('execute_checklist'));
-    const amReviewer = a.reviewer_id === userId;
-    const amApprover = a.approver_id === userId;
-    const amAdmin    = CURRENT_USER.is_admin;
+    const amExecutor       = a.assignee_id === userId || (a.status === 'Pending' && !a.assignee_id && can('execute_checklist'));
+    const amReviewer       = a.reviewer_id === userId;
+    const amApprover       = a.approver_id === userId;
+    const amClearanceUser  = a.clearance_user_id === userId;
+    const amAssigner       = a.assigned_by === userId;
+    const amAdmin          = CURRENT_USER.is_admin;
 
     // Editable matrix
-    const executorEditable = (a.status === 'Pending' || a.status === 'In Progress') && (amExecutor || amAdmin);
-    const reviewerActing   = a.status === 'Pending Review' && (amReviewer || amAdmin);
-    const approverActing   = a.status === 'Pending Approval' && (amApprover || amAdmin);
-    const formEditable     = executorEditable;
+    const executorEditable      = (a.status === 'Pending' || a.status === 'In Progress') && (amExecutor || amAdmin);
+    const reviewerActing        = a.status === 'Pending Review' && (amReviewer || amAdmin);
+    const approverActing        = a.status === 'Pending Approval' && (amApprover || amAdmin);
+    const clearanceActing       = a.status === 'Pending Clearance' && (amClearanceUser || amAdmin);
+    const executorAssignerActing= a.status === 'Awaiting Executor' && (amAssigner || amAdmin || can('assign_checklist'));
+    const formEditable          = executorEditable;
 
     // Fetch equipment context for auto-populated Required Fields when target is equipment.
     let eqCtx = null;
@@ -2444,11 +2455,18 @@ async function openAssignment(assignmentId) {
         ${a.frequency ? `<span class="pill brown">${escapeHtml(a.frequency)}</span>` : ''}
       </div>
       <div style="font-size:12px; color:var(--muted); margin-bottom:12px;">
-        Executor <strong>${escapeHtml(a.assignee_name || '— open —')}</strong>
+        Clearance <strong>${escapeHtml(a.clearance_user_name || '—')}</strong>
+        &nbsp;→&nbsp; Executor <strong>${escapeHtml(a.assignee_name || '— not yet assigned —')}</strong>
         &nbsp;→&nbsp; Reviewer <strong>${escapeHtml(a.reviewer_name || '—')}</strong>
         &nbsp;→&nbsp; Approver <strong>${escapeHtml(a.approver_name || '—')}</strong>
         &nbsp;·&nbsp; Assigned by ${escapeHtml(a.assigned_by_name || '')}
       </div>
+      ${a.clearance_status === 'Granted' ? `<div style="margin-bottom:10px; padding:6px 12px; background:#eaf6ea; border-left:3px solid var(--green); border-radius:6px; font-size:12px;">
+        <strong>Clearance granted</strong> by ${escapeHtml(a.clearance_user_name || '—')}${a.clearance_responded_at?` on ${escapeHtml(a.clearance_responded_at)}`:''}${a.clearance_remarks?`<div style="color:var(--muted); margin-top:3px;">Remarks: ${escapeHtml(a.clearance_remarks)}</div>`:''}
+      </div>` : ''}
+      ${a.status === 'Clearance Denied' ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fdecec; border-left:3px solid var(--red); border-radius:6px; font-size:12px;">
+        <strong>Clearance denied:</strong> ${escapeHtml(a.clearance_remarks || '')}
+      </div>` : ''}
       ${a.rejection_reason ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fdecec; border-left:3px solid var(--red); border-radius:6px; font-size:12px;"><strong>Returned for rework:</strong> ${escapeHtml(a.rejection_reason)}</div>` : ''}
       ${a.pnc_number ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fff5e6; border-left:3px solid #c77b00; border-radius:6px; font-size:12px;">
         <strong>Re-assignment from Expired</strong>
@@ -2479,6 +2497,13 @@ async function openAssignment(assignmentId) {
 
     // Action buttons by stage
     const acts = [];
+    if (clearanceActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentClearanceDecision('${a.assignment_id}','grant')">✓ Grant Clearance</button>`);
+      acts.push(`<button type="button" class="btn ghost"   onclick="assignmentClearanceDecision('${a.assignment_id}','deny')">✗ Deny Clearance</button>`);
+    }
+    if (executorAssignerActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="openAssignExecutorModal('${a.assignment_id}')">👤 Assign Executor</button>`);
+    }
     if (formEditable) {
       acts.push(`<button type="button" class="btn ghost" onclick="saveAssignmentProgress('${a.assignment_id}')">💾 Save Progress</button>`);
       acts.push(`<button type="button" class="btn primary" onclick="submitAssignmentForReview('${a.assignment_id}')">Submit for Review →</button>`);
@@ -2545,6 +2570,57 @@ async function submitAssignmentForReview(assignmentId) {
 }
 
 // ---- Reviewer / Approver actions ----
+// ---- Clearance / Executor-assignment actions ----
+async function assignmentClearanceDecision(assignmentId, decision) {
+  let remarks = null;
+  if (decision === 'deny') {
+    remarks = prompt('Reason for denying clearance (required):');
+    if (!remarks) return;
+  } else {
+    remarks = prompt('Clearance remarks (optional):') || '';
+  }
+  try {
+    await api('PUT', `/api/assignments/${assignmentId}/clearance`, { decision, remarks });
+    toast(decision === 'grant'
+      ? 'Clearance granted. Engineering Manager notified to assign an executor.'
+      : 'Clearance denied.', 'success');
+    closeModal();
+    if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+    if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+    refreshNotifBadge();
+  } catch (e) { toast(e.message,'error'); }
+}
+
+async function openAssignExecutorModal(assignmentId) {
+  try {
+    const [users, roles] = await Promise.all([api('GET','/api/users'), api('GET','/api/roles')]);
+    const executorSet = usersWithActivity(users, roles, 'execute_checklist','execute_pm');
+    const executors = users.filter(u => executorSet.has(u.id));
+    if (executors.length === 0) { toast('No users with execute permission.','error'); return; }
+    openModal({
+      title: `Assign Executor — ${assignmentId}`,
+      width: 500,
+      body: `
+        <p style="font-size:12px; color:var(--muted); margin-top:0;">Clearance has been granted. Pick the executor who will perform this PM activity.</p>
+        <div class="form-row"><label>Executor *</label>
+          <select name="assignee_id" required>
+            <option value="">— select executor —</option>
+            ${executors.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+          </select>
+        </div>
+      `,
+      submitLabel: 'Assign Executor',
+      onSubmit: async (data) => {
+        await api('PUT', `/api/assignments/${assignmentId}/assign-executor`, { assignee_id: Number(data.assignee_id) });
+        toast('Executor assigned. They have been notified.', 'success');
+        if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+        if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+        refreshNotifBadge();
+      }
+    });
+  } catch (e) { toast(e.message,'error'); }
+}
+
 async function assignmentReviewDecision(assignmentId, decision) {
   let reason = null;
   if (decision === 'reject') {

@@ -1546,11 +1546,15 @@ function nextAssignmentId() {
 
 app.get('/api/assignments', requireAuth, (req, res) => {
   const { mine, status, inbox } = req.query;
-  // "inbox=1" means: anything where the user is executor / reviewer / approver
+  // "inbox=1" — anything awaiting THIS user: executor / reviewer / approver / clearance grantor /
+  //                                          assigner whose assignment is now Awaiting Executor.
   const where = [];
   const args = [];
   if (mine === '1')  { where.push('ca.assignee_id = ?'); args.push(req.user.id); }
-  if (inbox === '1') { where.push('(ca.assignee_id = ? OR ca.reviewer_id = ? OR ca.approver_id = ?)'); args.push(req.user.id, req.user.id, req.user.id); }
+  if (inbox === '1') {
+    where.push("(ca.assignee_id = ? OR ca.reviewer_id = ? OR ca.approver_id = ? OR ca.clearance_user_id = ? OR (ca.status='Awaiting Executor' AND ca.assigned_by = ?))");
+    args.push(req.user.id, req.user.id, req.user.id, req.user.id, req.user.id);
+  }
   if (status)        { where.push('ca.status = ?');     args.push(status); }
   const sql = `
     SELECT ca.id, ca.assignment_id, ca.checklist_id, ca.target_type, ca.target_id,
@@ -1559,12 +1563,15 @@ app.get('/api/assignments', requireAuth, (req, res) => {
            ca.status, ca.notes, ca.assigned_at, ca.started_at,
            ca.submitted_at, ca.reviewed_at, ca.approved_at, ca.completed_at,
            ca.rejection_reason,
+           ca.clearance_user_id, ca.clearance_status,
+           ca.clearance_requested_at, ca.clearance_responded_at, ca.clearance_remarks,
            cl.name AS checklist_name, cl.version AS checklist_version,
            u.name  AS assignee_name, u.user_id  AS assignee_user_id,
            rv.name AS reviewer_name, rv.user_id AS reviewer_user_id,
            ap.name AS approver_name, ap.user_id AS approver_user_id,
+           cu.name AS clearance_user_name,
            b.name  AS assigned_by_name,
-           f.name  AS frequency,
+           f.name  AS frequency, f.days AS frequency_days, f.tolerance_days,
            CASE ca.target_type
              WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
              WHEN 'area'      THEN (SELECT name FROM areas WHERE area_id = ca.target_id)
@@ -1575,6 +1582,7 @@ app.get('/api/assignments', requireAuth, (req, res) => {
     LEFT JOIN users u   ON u.id   = ca.assignee_id
     LEFT JOIN users rv  ON rv.id  = ca.reviewer_id
     LEFT JOIN users ap  ON ap.id  = ca.approver_id
+    LEFT JOIN users cu  ON cu.id  = ca.clearance_user_id
     LEFT JOIN users b   ON b.id   = ca.assigned_by
     LEFT JOIN frequencies f ON f.id = ca.frequency_id
     ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
@@ -1589,6 +1597,7 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
            u.name  AS assignee_name, u.user_id  AS assignee_user_id,
            rv.name AS reviewer_name, rv.user_id AS reviewer_user_id,
            ap.name AS approver_name, ap.user_id AS approver_user_id,
+           cu.name AS clearance_user_name,
            b.name  AS assigned_by_name, f.name AS frequency, f.days AS frequency_days, f.tolerance_days,
            CASE ca.target_type
              WHEN 'equipment' THEN (SELECT name FROM equipment WHERE equipment_id = ca.target_id)
@@ -1600,6 +1609,7 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
     LEFT JOIN users u   ON u.id   = ca.assignee_id
     LEFT JOIN users rv  ON rv.id  = ca.reviewer_id
     LEFT JOIN users ap  ON ap.id  = ca.approver_id
+    LEFT JOIN users cu  ON cu.id  = ca.clearance_user_id
     LEFT JOIN users b   ON b.id   = ca.assigned_by
     LEFT JOIN frequencies f ON f.id = ca.frequency_id
     WHERE ca.assignment_id = ?`).get(req.params.assignment_id);
@@ -1610,11 +1620,12 @@ app.get('/api/assignments/:assignment_id', requireAuth, (req, res) => {
 });
 
 app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (req, res) => {
-  const { checklist_id, target_type, target_id, assignee_id, reviewer_id, approver_id, frequency_id, effective_date, due_date, notes } = req.body || {};
+  const { checklist_id, target_type, target_id, clearance_user_id, reviewer_id, approver_id,
+          frequency_id, effective_date, due_date, notes } = req.body || {};
   if (!checklist_id || !target_type || !target_id) {
     return res.status(400).json({ error: 'checklist_id, target_type and target_id required' });
   }
-  if (!assignee_id) return res.status(400).json({ error: 'assignee_id (executor) required' });
+  if (!clearance_user_id) return res.status(400).json({ error: 'Clearance User (production) is required' });
   if (!['equipment','area'].includes(target_type)) {
     return res.status(400).json({ error: 'target_type must be "equipment" or "area"' });
   }
@@ -1634,8 +1645,8 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
     if (!ar) return res.status(400).json({ error: 'Unknown area_id' });
     targetName = `${ar.area_id} (${ar.name || ''})`;
   }
-  const assignee = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
-  if (!assignee) return res.status(400).json({ error: 'Unknown assignee_id' });
+  const grantor = db.prepare('SELECT id, name FROM users WHERE id=?').get(clearance_user_id);
+  if (!grantor) return res.status(400).json({ error: 'Unknown clearance_user_id' });
 
   // Reviewer/approver: default to checklist's template reviewer/approver if not given.
   const finalReviewer = reviewer_id || cl.template_reviewer;
@@ -1646,27 +1657,99 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
   if (finalReviewer === finalApprover) {
     return res.status(400).json({ error: 'Reviewer and approver must be different users' });
   }
-  if (finalReviewer === assignee.id || finalApprover === assignee.id) {
-    return res.status(400).json({ error: 'Executor cannot also be their own reviewer or approver' });
-  }
   const rv = db.prepare('SELECT id, name FROM users WHERE id=?').get(finalReviewer);
   const ap = db.prepare('SELECT id, name FROM users WHERE id=?').get(finalApprover);
   if (!rv || !ap) return res.status(400).json({ error: 'Unknown reviewer/approver' });
 
   const aid = nextAssignmentId();
-  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,effective_date,due_date,notes,status,assigned_by)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(aid, checklist_id, target_type, target_id, assignee.id, rv.id, ap.id, frequency_id || null, effective_date || null, due_date || null, notes || '', 'Pending', req.user.id);
+  db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,
+              reviewer_id,approver_id,frequency_id,effective_date,due_date,notes,status,
+              clearance_user_id,clearance_status,clearance_requested_at,assigned_by)
+              VALUES (?,?,?,?, ?,?,?,?,?,?,?, ?,?,datetime('now'),?)`)
+    .run(aid, checklist_id, target_type, target_id,
+         rv.id, ap.id, frequency_id || null, effective_date || null, due_date || null, notes || '', 'Pending Clearance',
+         grantor.id, 'Pending', req.user.id);
 
-  notify(assignee.id,
-    'New PM activity assigned',
-    `${cl.name} on ${target_type} ${targetName}${due_date ? ' — due ' + due_date : ''}. Assigned by ${req.user.name}.`,
-    'assignment',
+  notify(grantor.id,
+    'PM Clearance requested',
+    `${cl.name} on ${target_type} ${targetName}${due_date ? ' — due ' + due_date : ''} needs your clearance.`,
+    'clearance',
     `/assignments/${aid}`);
 
   audit(req.user, 'ASSIGN', 'Checklist', aid,
-    `Assigned "${cl.name}" to ${target_type} ${targetName} — Executor: ${assignee.name}, Reviewer: ${rv.name}, Approver: ${ap.name}`);
+    `Assigned "${cl.name}" to ${target_type} ${targetName} — Clearance pending from ${grantor.name}; Reviewer: ${rv.name}, Approver: ${ap.name}`);
   res.json(db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(aid));
+});
+
+// ---- Clearance step: Production user grants/denies BEFORE executor is assigned ----
+app.put('/api/assignments/:assignment_id/clearance', requireAuth, requireActivity('grant_clearance'), (req, res) => {
+  const { decision, remarks } = req.body || {};
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Pending Clearance') return res.status(409).json({ error: `Cannot act on clearance — assignment is "${a.status}"` });
+  if (a.clearance_user_id !== req.user.id && !req.user.is_admin) {
+    return res.status(403).json({ error: 'Only the designated clearance user can grant or deny this clearance' });
+  }
+  if (!['grant','deny'].includes(decision)) return res.status(400).json({ error: 'decision must be "grant" or "deny"' });
+
+  if (decision === 'grant') {
+    db.prepare(`UPDATE checklist_assignments SET
+        status='Awaiting Executor',
+        clearance_status='Granted',
+        clearance_responded_at=datetime('now'),
+        clearance_remarks=?
+      WHERE assignment_id=?`).run(remarks || null, req.params.assignment_id);
+    if (a.assigned_by) {
+      notify(a.assigned_by,
+        'Clearance granted — assign an executor',
+        `${req.params.assignment_id} is cleared by ${req.user.name}. Pick an executor to start execution.`,
+        'awaiting_executor',
+        `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'CLEARANCE_GRANT', 'Assignment', req.params.assignment_id,
+      `Granted by ${req.user.name}${remarks?` — ${remarks}`:''}`);
+  } else {
+    if (!remarks || !remarks.trim()) return res.status(400).json({ error: 'Remarks required for denial' });
+    db.prepare(`UPDATE checklist_assignments SET
+        status='Clearance Denied',
+        clearance_status='Denied',
+        clearance_responded_at=datetime('now'),
+        clearance_remarks=?
+      WHERE assignment_id=?`).run(remarks, req.params.assignment_id);
+    if (a.assigned_by) {
+      notify(a.assigned_by,
+        'Clearance denied',
+        `${req.params.assignment_id}: ${remarks}`,
+        'clearance_denied',
+        `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'CLEARANCE_DENY', 'Assignment', req.params.assignment_id,
+      `Denied by ${req.user.name} — ${remarks}`);
+  }
+  res.json({ ok: true });
+});
+
+// ---- After clearance is granted, the Engineering Manager picks the executor ----
+app.put('/api/assignments/:assignment_id/assign-executor', requireAuth, requireActivity('assign_checklist'), (req, res) => {
+  const { assignee_id } = req.body || {};
+  if (!assignee_id) return res.status(400).json({ error: 'assignee_id required' });
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Awaiting Executor') return res.status(409).json({ error: `Cannot assign executor — assignment is "${a.status}"` });
+  const u = db.prepare('SELECT id, name FROM users WHERE id=?').get(assignee_id);
+  if (!u) return res.status(400).json({ error: 'Unknown user' });
+  if (a.reviewer_id === u.id || a.approver_id === u.id) {
+    return res.status(400).json({ error: 'Executor cannot also be the assigned reviewer or approver' });
+  }
+  db.prepare(`UPDATE checklist_assignments SET assignee_id=?, status='Pending' WHERE assignment_id=?`)
+    .run(u.id, req.params.assignment_id);
+  notify(u.id,
+    'New PM activity assigned to you',
+    `${req.params.assignment_id} — ${req.user.name} assigned you as executor.`,
+    'assignment',
+    `/assignments/${req.params.assignment_id}`);
+  audit(req.user, 'ASSIGN_EXECUTOR', 'Assignment', req.params.assignment_id, `Executor set to ${u.name}`);
+  res.json({ ok: true });
 });
 
 function isExecutor(a, user) {
@@ -1824,7 +1907,7 @@ function markExpiredAssignments() {
            f.days AS freq_days, f.tolerance_days
     FROM checklist_assignments ca
     LEFT JOIN frequencies f ON f.id = ca.frequency_id
-    WHERE ca.status IN ('Pending','In Progress','Pending Review','Pending Approval')
+    WHERE ca.status IN ('Pending Clearance','Awaiting Executor','Pending','In Progress','Pending Review','Pending Approval')
   `).all();
   const todayStr = new Date().toISOString().slice(0, 10);
   const today = new Date(todayStr);
