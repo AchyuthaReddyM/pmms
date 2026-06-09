@@ -20,7 +20,11 @@ function verifyPassword(plain, stored) {
   return crypto.timingSafeEqual(actual, expected);
 }
 
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'pmms.db');
+// When packaged by pkg, __dirname points inside the read-only snapshot. The DB file must live
+// next to the .exe in the real filesystem instead. process.execPath is "PMMS.exe" in that case.
+const IS_PACKAGED = typeof process.pkg !== 'undefined';
+const BASE_DIR    = IS_PACKAGED ? path.dirname(process.execPath) : __dirname;
+const DB_PATH = process.env.DB_PATH || path.join(BASE_DIR, 'pmms.db');
 try { require('fs').mkdirSync(path.dirname(DB_PATH), { recursive: true }); } catch (e) { /* ignore */ }
 console.log(`[db] using SQLite at ${DB_PATH}`);
 const db = new Database(DB_PATH);

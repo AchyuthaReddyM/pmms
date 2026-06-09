@@ -11,3 +11,6 @@ pmms.db-shm
 # OneDrive sync cruft
 desktop.ini
 Thumbs.db
+# pkg build output — the .exe is generated, not committed
+dist/
+*.exe

@@ -2080,11 +2080,34 @@ app.use('/api', (err, req, res, next) => {
 
 app.listen(PORT, '0.0.0.0', () => {
   const env = process.env.NODE_ENV || 'development';
+  const isPackaged = typeof process.pkg !== 'undefined';
   console.log('==========================================');
   console.log(`  PMMS server listening on port ${PORT} (${env})`);
+  console.log(`  Open http://localhost:${PORT} in your browser`);
   if (env !== 'production') {
-    console.log(`  Open http://localhost:${PORT} in your browser`);
     console.log('  Default login:  admin / admin123');
   }
+  // Show the LAN IPs so testers on the office network can connect.
+  try {
+    const nets = require('os').networkInterfaces();
+    const lanIps = [];
+    for (const name of Object.keys(nets)) {
+      for (const iface of nets[name] || []) {
+        if (iface.family === 'IPv4' && !iface.internal) lanIps.push(iface.address);
+      }
+    }
+    if (lanIps.length) {
+      console.log('  Office LAN URL:');
+      for (const ip of lanIps) console.log(`     http://${ip}:${PORT}`);
+    }
+  } catch (e) {}
   console.log('==========================================');
+
+  // When running as a packaged .exe, auto-launch the default browser so the user
+  // doesn't have to type the URL by hand.
+  if (isPackaged && process.platform === 'win32' && process.env.PMMS_NO_BROWSER !== '1') {
+    try {
+      require('child_process').exec(`start "" "http://localhost:${PORT}"`);
+    } catch (e) { /* ignore */ }
+  }
 });

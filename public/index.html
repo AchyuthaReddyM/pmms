@@ -73,6 +73,7 @@
       <a data-page="pmconfig"><span class="ico">⚙️</span> PM Configuration</a>
       <a data-page="checklist"><span class="ico">📋</span> Checklists</a>
       <a data-page="assignments"><span class="ico">🎯</span> Checklist Assignment</a>
+      <a data-page="workflow"><span class="ico">🔄</span> PM Workflow</a>
 
       <div class="nav-section">Operations</div>
       <a data-page="execution"><span class="ico">🛠️</span> PM Execution</a>
@@ -327,11 +328,20 @@
         </div>
       </div>
 
+      <!-- =========== PM WORKFLOW (process reference) =========== -->
+      <div class="page" id="page-workflow">
+        <div class="page-head">
+          <div><h1>PM Workflow</h1><p>End-to-end Preventive Maintenance lifecycle — from checklist authoring through to closure and audit archive. Tap a step to open the relevant module.</p></div>
+        </div>
+        <div id="workflowBody"></div>
+      </div>
+
       <!-- =========== CHECKLIST ASSIGNMENT (manager view) =========== -->
       <div class="page" id="page-assignments">
         <div class="page-head">
           <div><h1>Checklist Assignment</h1><p>Assign approved checklists to equipment for PM activities — by Block, Location, Area, Equipment, Category and Frequency.</p></div>
           <div class="actions">
+            <button class="btn ghost" onclick="goto('workflow')">📖 View PM Workflow</button>
             <button class="btn primary" onclick="openAssignChecklistModal()">+ New Assignment</button>
           </div>
         </div>

@@ -105,8 +105,8 @@ function onLoggedIn() {
 }
 
 // ---------- Routing ----------
-const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','execution','tasks','pmstatus','expired','calendar','breakdown','reports','audit','compliance','about'];
-const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', execution:'PM Execution', tasks:'My Tasks', pmstatus:'PM Status', expired:'Expired Equipment', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
+const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','workflow','execution','tasks','pmstatus','expired','calendar','breakdown','reports','audit','compliance','about'];
+const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', workflow:'PM Workflow', execution:'PM Execution', tasks:'My Tasks', pmstatus:'PM Status', expired:'Expired Equipment', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
 
 function goto(name) {
   PAGES.forEach(p => $('page-'+p)?.classList.toggle('active', p === name));
@@ -122,6 +122,7 @@ function goto(name) {
     pmconfig: loadPmConfig,
     checklist: loadChecklists,
     assignments: loadAssignmentsPage,
+    workflow: loadWorkflowPage,
     execution: loadPmList,
     tasks: () => loadTasks('inbox'),
     pmstatus: loadPmStatusPage,
@@ -1919,6 +1920,127 @@ function actionableForUser(a) {
   if (a.status === 'Pending Review' && a.reviewer_id === uid)                     return { label: 'Review', tone: 'amber' };
   if (a.status === 'Pending Approval' && a.approver_id === uid)                   return { label: 'Approve', tone: 'amber' };
   return null;
+}
+
+// ===========================================================
+// PM WORKFLOW — 12-step lifecycle reference + flexibility matrix
+// ===========================================================
+const PM_WORKFLOW_STEPS = [
+  { n: 1,  phase:'Authoring',  color:'blue',
+    title:'Initiator creates the PM checklist',
+    desc:'Engineering authors a structured checklist with sections, questions, allowed frequencies and configurable required fields.',
+    actor:'Initiator (Engineering)', link:'checklist', linkLabel:'Open Checklists →' },
+  { n: 2,  phase:'Authoring',  color:'blue',
+    title:'Checklist passes the approval workflow',
+    desc:'Reviewer (Engineering Manager) and Approver (QA) act on the checklist in sequence. Hierarchy is driven by the role permissions in Admin Settings — additional review/approval stages can be modelled by extending the role activities.',
+    actor:'Initiator → Reviewer → Approver', link:'settings', linkLabel:'Configure roles →' },
+  { n: 3,  phase:'Authoring',  color:'blue',
+    title:'Approved checklist is assigned to equipment',
+    desc:'Only Approved checklists are assignable. The manager picks Block → Location → Area → Equipment plus category, frequency, scheduled and due dates.',
+    actor:'Engineering Manager', link:'assignments', linkLabel:'Checklist Assignment →' },
+  { n: 4,  phase:'Scheduling', color:'amber',
+    title:'System generates the PM schedule',
+    desc:'On assignment, the PM is scheduled per the chosen frequency (Weekly/Monthly/Quarterly/…) and due date. Cascading frequency rules govern which checkpoints apply per run.',
+    actor:'System (automatic)', link:null },
+  { n: 5,  phase:'Scheduling', color:'amber',
+    title:'Schedule reflected in PM Calendar + Pending lists',
+    desc:'Scheduled PMs appear in the Calendar tile for that month and in the PM Execution list under Pending. Users on the network see the same view.',
+    actor:'System (automatic)', link:'calendar', linkLabel:'Open Calendar →' },
+  { n: 6,  phase:'Clearance',  color:'amber',
+    title:'Engineering initiates Equipment Clearance Request',
+    desc:'A clearance request is sent to the Production user named on the assignment. Assignment status is "Pending Clearance".',
+    actor:'Engineering (Initiator)', link:'assignments', linkLabel:'Pending Clearance →' },
+  { n: 7,  phase:'Clearance',  color:'amber',
+    title:'Production grants (or denies) clearance',
+    desc:'The named Production user (anyone with grant_clearance activity) reviews the request against the production plan and either grants clearance (with optional remarks) or denies it (with mandatory reason).',
+    actor:'Production User', link:'tasks', linkLabel:'My Tasks → Inbox →' },
+  { n: 8,  phase:'Execution',  color:'brown',
+    title:'Engineering Manager assigns the Technician',
+    desc:'After clearance, status flips to "Awaiting Executor". The Engineering Manager picks the Technician (anyone with execute_checklist activity) to perform the PM.',
+    actor:'Engineering Manager', link:'tasks', linkLabel:'My Tasks →' },
+  { n: 9,  phase:'Execution',  color:'brown',
+    title:'Technician performs the PM and completes the checklist',
+    desc:'The Technician opens the assignment, fills in only the checkpoints applicable to this frequency (higher-frequency checkpoints display as N/A), records spares + remarks, signs and submits.',
+    actor:'Technician (Executor)', link:'tasks', linkLabel:'My Tasks →' },
+  { n: 10, phase:'Review',     color:'green',
+    title:'Executed PM submitted for review',
+    desc:'Status becomes "Pending Review". The Engineering Manager (and/or User) reviews the responses and either passes the work forward or returns it for rework with a reason.',
+    actor:'Engineering Reviewer', link:'tasks', linkLabel:'Reviewer Inbox →' },
+  { n: 11, phase:'Approval',   color:'green',
+    title:'QA performs final review and approval',
+    desc:'Status becomes "Pending Approval". QA performs the final compliance check, then approves and signs — or rejects with reason (bouncing back into Execution).',
+    actor:'QA Approver', link:'tasks', linkLabel:'Approver Inbox →' },
+  { n: 12, phase:'Closure',    color:'green',
+    title:'PM is closed and archived',
+    desc:'On final approval the PM auto-closes (status "Completed"). All signatures, response data, exception details and audit entries are retained for compliance, traceability and historical reference.',
+    actor:'System (automatic)', link:'audit', linkLabel:'Audit Trail →' },
+];
+
+const PM_WORKFLOW_FLEXIBILITY = [
+  { label:'Checklist approval hierarchy',
+    where:'Admin Settings → Roles → grant review_checklist / approve_checklist activities to any role. Reviewer and Approver are picked per checklist at "Submit for Review" time.' },
+  { label:'PM execution approval workflow',
+    where:'Admin Settings → Roles → review_pm / approve_pm activities. Reviewer and Approver are picked per assignment.' },
+  { label:'Review and approval stages',
+    where:'Today: one reviewer + one approver per assignment. Sequence is hard-wired (Executor → Reviewer → Approver). Extra stages can be added by extending the activity list and the assignment lifecycle — code change required.' },
+  { label:'User roles and responsibilities',
+    where:'Admin Settings → Roles. Each role belongs to one department and holds any subset of the activities catalogue. New roles created without code changes.' },
+  { label:'Notification & escalation rules',
+    where:'In-app bell notifications fire on every workflow transition (assigned, clearance requested, clearance granted/denied, executor assigned, submitted, reviewed, approved, rejected). Email + escalation timers are not yet wired — would require SMTP credentials and a scheduler.' },
+  { label:'Workflow sequence and authorisation levels',
+    where:'Driven by the activity catalogue. Reordering steps (e.g. Approver before Reviewer) is a code change today.' },
+  { label:'Equipment clearance approval process',
+    where:'Admin Settings → Roles → grant_clearance activity. The specific clearance user is picked per assignment, so different equipment / departments can route to different Production users.' },
+  { label:'Technician assignment process',
+    where:'Engineering Manager picks any user with execute_checklist activity from a dropdown after clearance is granted. The pool of candidates is the configurable bit.' },
+];
+
+async function loadWorkflowPage() {
+  const phaseLabels = { Authoring:'Phase 1 · Checklist Authoring', Scheduling:'Phase 2 · Scheduling',
+                        Clearance:'Phase 3 · Equipment Clearance', Execution:'Phase 4 · Execution',
+                        Review:'Phase 5 · Review',                Approval:'Phase 6 · Approval',
+                        Closure:'Phase 7 · Closure & Archive' };
+  let lastPhase = null;
+  const stepsHtml = PM_WORKFLOW_STEPS.map(s => {
+    const phaseBanner = (s.phase !== lastPhase)
+      ? `<div style="margin: 18px 0 8px; padding: 6px 12px; background: var(--cream-100); border-radius: 6px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; font-weight: 700;">${escapeHtml(phaseLabels[s.phase] || s.phase)}</div>`
+      : '';
+    lastPhase = s.phase;
+    return `${phaseBanner}
+      <div style="display:grid; grid-template-columns: 50px 1fr; gap: 14px; padding: 8px 0; position: relative;">
+        <div style="position:relative;">
+          <div style="width:40px; height:40px; border-radius:50%; background: var(--${s.color}-bg, var(--cream-100)); color: var(--${s.color}, var(--brown-700)); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:16px; border: 2px solid var(--${s.color}, var(--brown-500));">${s.n}</div>
+        </div>
+        <div style="padding: 4px 0;">
+          <div style="font-weight:700; font-size:14px; color:var(--brown-900);">${escapeHtml(s.title)}</div>
+          <div style="color:var(--muted); font-size:12px; margin-top:3px; line-height:1.5;">${escapeHtml(s.desc)}</div>
+          <div style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+            <span class="pill brown" style="font-size:10px;">${escapeHtml(s.actor)}</span>
+            ${s.link ? `<button class="btn ghost sm" onclick="goto('${s.link}')">${escapeHtml(s.linkLabel)}</button>` : ''}
+          </div>
+        </div>
+      </div>`;
+  }).join('');
+
+  const flexHtml = PM_WORKFLOW_FLEXIBILITY.map(f => `
+    <div style="padding: 10px 14px; border-bottom: 1px dashed var(--border);">
+      <div style="font-weight:600; font-size:13px;">${escapeHtml(f.label)}</div>
+      <div style="color:var(--muted); font-size:12px; margin-top:3px; line-height:1.5;">${escapeHtml(f.where)}</div>
+    </div>`).join('');
+
+  $('workflowBody').innerHTML = `
+    <div class="card">
+      <div class="card-head"><h3>12-Step PM Lifecycle</h3></div>
+      <div style="margin-top:6px;">${stepsHtml}</div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <div class="card-head"><h3>Workflow Flexibility</h3></div>
+      <p style="color:var(--muted); font-size:12px; margin: 4px 0 12px;">Aspects of the workflow that can be defined or modified at runtime without code changes. Each row points to the place in the app where the setting lives.</p>
+      <div>${flexHtml}</div>
+      <p style="font-size:11px; color:var(--muted); margin-top:14px;">Items marked "code change required" are not yet user-configurable. Tell us which one to make dynamic next and we'll wire it up.</p>
+    </div>
+  `;
 }
 
 // ----- Checklist Assignment manager view (dedicated module) -----
