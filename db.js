@@ -649,22 +649,23 @@ function seed() {
     .run(completedData, fmt(addDays(today, -16))+' 09:15:00', fmt(addDays(today,-16))+' 11:20:00','S. Naidu','R. Mehta','S. Iyer');
 
   // Sample checklist assignment with notification (target = equipment)
-  // Workflow: Manager assigns -> Clearance (mverma/Production) -> Engineering assigns executor
-  //           -> Executor (TBD) -> Reviewer rmehta -> Approver qaapprove
+  // Full workflow demo: Plan Review -> Plan Approval -> Clearance -> Executor assignment ->
+  //                     Execution -> Review -> QA Approval -> Closure.
+  // CA-001 starts at the very first stage so testers walk the whole 13-step flow.
   ins(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,
-       clearance_user_id,clearance_status,clearance_requested_at,
+       clearance_user_id,
        reviewer_id,approver_id,frequency_id,effective_date,due_date,status,assigned_by)
-       VALUES (?,?,?,?, ?,?,datetime('now'), ?,?,?,?,?,?,?)`)
+       VALUES (?,?,?,?, ?, ?,?,?,?,?,?,?)`)
     .run('CA-001', ahuCl, 'equipment', 'EQ-AHU-12',
-         u('mverma'), 'Pending',
+         u('mverma'),
          u('rmehta'), u('qaapprove'),
          db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
-         fmt(today), fmt(addDays(today, 3)), 'Pending Clearance', u('siyer'));
+         fmt(today), fmt(addDays(today, 3)), 'Pending Assignment Review', u('siyer'));
   ins('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
-    .run(u('mverma'),
-         'PM Clearance requested',
-         'AHU Monthly Inspection (v2) on EQ-AHU-12 needs your clearance — due ' + fmt(addDays(today,3)) + '.',
-         'clearance',
+    .run(u('rmehta'),
+         'PM assignment plan awaiting your review',
+         'AHU Monthly Inspection (v2) on EQ-AHU-12 — review before production clearance is requested.',
+         'assignment_plan_review',
          '/assignments/CA-001');
 
   // CA-002 — a deliberately-overdue assignment to populate the Expired Equipment module.

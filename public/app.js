@@ -233,7 +233,9 @@ function statusPill(status) {
     'Under Maintenance':'red',
     // Checklist workflow states
     'Draft':'gray','Pending Review':'amber','Pending Approval':'amber','Rejected':'red','Expired':'red',
-    'Pending Clearance':'amber','Awaiting Executor':'amber','Clearance Denied':'red'
+    'Pending Clearance':'amber','Awaiting Executor':'amber','Clearance Denied':'red',
+    // Assignment-plan review states
+    'Pending Assignment Review':'amber','Pending Assignment Approval':'amber','Assignment Rejected':'red'
   };
   return `<span class="pill ${map[status] || 'gray'}">${escapeHtml(status)}</span>`;
 }
@@ -1913,6 +1915,8 @@ document.querySelectorAll('#tasksTabs button').forEach(b => {
 function actionableForUser(a) {
   // What's awaiting THIS user on this assignment? Returns a label or null.
   const uid = CURRENT_USER.id;
+  if (a.status === 'Pending Assignment Review' && a.reviewer_id === uid)          return { label: 'Review Plan',    tone: 'amber' };
+  if (a.status === 'Pending Assignment Approval' && a.approver_id === uid)        return { label: 'Approve Plan',   tone: 'amber' };
   if (a.status === 'Pending Clearance' && a.clearance_user_id === uid)            return { label: 'Grant Clearance', tone: 'amber' };
   if (a.status === 'Awaiting Executor' && (a.assigned_by === uid || CURRENT_USER.is_admin)) return { label: 'Assign Executor', tone: 'amber' };
   if (a.status === 'Pending' && a.assignee_id === uid)                            return { label: 'Start', tone: 'amber' };
@@ -1927,52 +1931,56 @@ function actionableForUser(a) {
 // ===========================================================
 const PM_WORKFLOW_STEPS = [
   { n: 1,  phase:'Authoring',  color:'blue',
-    title:'Initiator creates the PM checklist',
-    desc:'Engineering authors a structured checklist with sections, questions, allowed frequencies and configurable required fields.',
+    title:'Checklist Creation',
+    desc:'Initiator authors a structured checklist with sections, questions, allowed frequencies and configurable required fields.',
     actor:'Initiator (Engineering)', link:'checklist', linkLabel:'Open Checklists →' },
   { n: 2,  phase:'Authoring',  color:'blue',
-    title:'Checklist passes the approval workflow',
-    desc:'Reviewer (Engineering Manager) and Approver (QA) act on the checklist in sequence. Hierarchy is driven by the role permissions in Admin Settings — additional review/approval stages can be modelled by extending the role activities.',
-    actor:'Initiator → Reviewer → Approver', link:'settings', linkLabel:'Configure roles →' },
-  { n: 3,  phase:'Authoring',  color:'blue',
-    title:'Approved checklist is assigned to equipment',
-    desc:'Only Approved checklists are assignable. The manager picks Block → Location → Area → Equipment plus category, frequency, scheduled and due dates.',
+    title:'Checklist Multi-Level Review & Approval',
+    desc:'Reviewer (Engineering Manager) passes the checklist; Approver (QA) signs it off. Only an Approved checklist becomes assignable.',
+    actor:'Reviewer → Approver', link:'checklist', linkLabel:'Open Checklists →' },
+  { n: 3,  phase:'Assignment', color:'blue',
+    title:'Checklist Assignment to Equipment',
+    desc:'Engineering Manager picks Block → Location → Area → Equipment, frequency and dates, and nominates reviewer / approver / clearance user.',
     actor:'Engineering Manager', link:'assignments', linkLabel:'Checklist Assignment →' },
-  { n: 4,  phase:'Scheduling', color:'amber',
-    title:'System generates the PM schedule',
-    desc:'On assignment, the PM is scheduled per the chosen frequency (Weekly/Monthly/Quarterly/…) and due date. Cascading frequency rules govern which checkpoints apply per run.',
-    actor:'System (automatic)', link:null },
+  { n: 4,  phase:'Assignment', color:'blue',
+    title:'Equipment Assignment Multi-Level Review & Approval',
+    desc:'The assignment plan itself is reviewed by Engineering and approved by QA before the production clearance request is issued. Status: Pending Assignment Review → Pending Assignment Approval.',
+    actor:'Reviewer → Approver', link:'tasks', linkLabel:'Reviewer / Approver Inbox →' },
   { n: 5,  phase:'Scheduling', color:'amber',
-    title:'Schedule reflected in PM Calendar + Pending lists',
-    desc:'Scheduled PMs appear in the Calendar tile for that month and in the PM Execution list under Pending. Users on the network see the same view.',
+    title:'Automatic Schedule Generation',
+    desc:'On plan approval, the PM is scheduled per the chosen frequency and due date. Cascading frequency rules govern which checkpoints apply per run.',
+    actor:'System (automatic)', link:null },
+  { n: 6,  phase:'Scheduling', color:'amber',
+    title:'PM Calendar & Pending Task Update',
+    desc:'Scheduled PMs appear in the Calendar tile for the relevant month and in the PM Execution Pending list. Visible to everyone on the network.',
     actor:'System (automatic)', link:'calendar', linkLabel:'Open Calendar →' },
-  { n: 6,  phase:'Clearance',  color:'amber',
-    title:'Engineering initiates Equipment Clearance Request',
-    desc:'A clearance request is sent to the Production user named on the assignment. Assignment status is "Pending Clearance".',
-    actor:'Engineering (Initiator)', link:'assignments', linkLabel:'Pending Clearance →' },
   { n: 7,  phase:'Clearance',  color:'amber',
-    title:'Production grants (or denies) clearance',
-    desc:'The named Production user (anyone with grant_clearance activity) reviews the request against the production plan and either grants clearance (with optional remarks) or denies it (with mandatory reason).',
+    title:'Production Clearance Request Initiated by Engineering',
+    desc:'A clearance request notification fires to the named Production user. Status: Pending Clearance.',
+    actor:'Engineering (Initiator)', link:'assignments', linkLabel:'Pending Clearance →' },
+  { n: 8,  phase:'Clearance',  color:'amber',
+    title:'Production / User Department Review & Approval',
+    desc:'Production user reviews against the production plan and either grants clearance (with optional remarks) or denies it (mandatory reason). Denial halts the workflow.',
     actor:'Production User', link:'tasks', linkLabel:'My Tasks → Inbox →' },
-  { n: 8,  phase:'Execution',  color:'brown',
-    title:'Engineering Manager assigns the Technician',
-    desc:'After clearance, status flips to "Awaiting Executor". The Engineering Manager picks the Technician (anyone with execute_checklist activity) to perform the PM.',
-    actor:'Engineering Manager', link:'tasks', linkLabel:'My Tasks →' },
   { n: 9,  phase:'Execution',  color:'brown',
-    title:'Technician performs the PM and completes the checklist',
-    desc:'The Technician opens the assignment, fills in only the checkpoints applicable to this frequency (higher-frequency checkpoints display as N/A), records spares + remarks, signs and submits.',
+    title:'Technician Assignment by Engineering Manager',
+    desc:'On cleared status (Awaiting Executor), Engineering Manager picks the Technician who will perform the PM.',
+    actor:'Engineering Manager', link:'tasks', linkLabel:'My Tasks →' },
+  { n: 10, phase:'Execution',  color:'brown',
+    title:'PM Execution by Technician',
+    desc:'Technician opens the assignment, fills only the checkpoints applicable to this run\'s frequency, records spares + remarks, signs and submits.',
     actor:'Technician (Executor)', link:'tasks', linkLabel:'My Tasks →' },
-  { n: 10, phase:'Review',     color:'green',
-    title:'Executed PM submitted for review',
-    desc:'Status becomes "Pending Review". The Engineering Manager (and/or User) reviews the responses and either passes the work forward or returns it for rework with a reason.',
+  { n: 11, phase:'Review',     color:'green',
+    title:'PM Execution Multi-Level Review & Approval',
+    desc:'Executed PM moves to Pending Review. Engineering reviewer passes the work or returns it for rework with a reason.',
     actor:'Engineering Reviewer', link:'tasks', linkLabel:'Reviewer Inbox →' },
-  { n: 11, phase:'Approval',   color:'green',
-    title:'QA performs final review and approval',
-    desc:'Status becomes "Pending Approval". QA performs the final compliance check, then approves and signs — or rejects with reason (bouncing back into Execution).',
+  { n: 12, phase:'Approval',   color:'green',
+    title:'Final QA Approval',
+    desc:'Status becomes Pending Approval. QA performs the final compliance check, then approves and signs — or rejects with reason (bouncing back into Execution).',
     actor:'QA Approver', link:'tasks', linkLabel:'Approver Inbox →' },
-  { n: 12, phase:'Closure',    color:'green',
-    title:'PM is closed and archived',
-    desc:'On final approval the PM auto-closes (status "Completed"). All signatures, response data, exception details and audit entries are retained for compliance, traceability and historical reference.',
+  { n: 13, phase:'Closure',    color:'green',
+    title:'PM Closure & Archive',
+    desc:'On QA approval the PM auto-closes (status Completed). All signatures, response data, exception details and audit entries are retained for compliance, traceability and historical reference.',
     actor:'System (automatic)', link:'audit', linkLabel:'Audit Trail →' },
 ];
 
@@ -2457,6 +2465,8 @@ async function openAssignment(assignmentId) {
 
     // Editable matrix
     const executorEditable      = (a.status === 'Pending' || a.status === 'In Progress') && (amExecutor || amAdmin);
+    const planReviewerActing    = a.status === 'Pending Assignment Review'   && (amReviewer || amAdmin);
+    const planApproverActing    = a.status === 'Pending Assignment Approval' && (amApprover || amAdmin);
     const reviewerActing        = a.status === 'Pending Review' && (amReviewer || amAdmin);
     const approverActing        = a.status === 'Pending Approval' && (amApprover || amAdmin);
     const clearanceActing       = a.status === 'Pending Clearance' && (amClearanceUser || amAdmin);
@@ -2619,6 +2629,14 @@ async function openAssignment(assignmentId) {
 
     // Action buttons by stage
     const acts = [];
+    if (planReviewerActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentPlanReviewDecision('${a.assignment_id}','approve')">✓ Pass Plan Review</button>`);
+      acts.push(`<button type="button" class="btn ghost"   onclick="assignmentPlanReviewDecision('${a.assignment_id}','reject')">✗ Reject Plan</button>`);
+    }
+    if (planApproverActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentPlanApproveDecision('${a.assignment_id}','approve')">✓ Approve Plan &amp; Request Clearance</button>`);
+      acts.push(`<button type="button" class="btn ghost"   onclick="assignmentPlanApproveDecision('${a.assignment_id}','reject')">✗ Reject Plan</button>`);
+    }
     if (clearanceActing) {
       acts.push(`<button type="button" class="btn primary" onclick="assignmentClearanceDecision('${a.assignment_id}','grant')">✓ Grant Clearance</button>`);
       acts.push(`<button type="button" class="btn ghost"   onclick="assignmentClearanceDecision('${a.assignment_id}','deny')">✗ Deny Clearance</button>`);
@@ -2692,6 +2710,43 @@ async function submitAssignmentForReview(assignmentId) {
 }
 
 // ---- Reviewer / Approver actions ----
+// ---- Step 4: Assignment-plan review/approval actions ----
+async function assignmentPlanReviewDecision(assignmentId, decision) {
+  let reason = null;
+  if (decision === 'reject') {
+    reason = prompt('Reason for rejecting the assignment plan (required):');
+    if (!reason) return;
+  }
+  try {
+    await api('PUT', `/api/assignments/${assignmentId}/assignment-review`, { decision, reason });
+    toast(decision === 'approve'
+      ? 'Plan review passed — sent to Approver.'
+      : 'Assignment plan rejected.', 'success');
+    closeModal();
+    if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+    if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+    refreshNotifBadge();
+  } catch (e) { toast(e.message,'error'); }
+}
+
+async function assignmentPlanApproveDecision(assignmentId, decision) {
+  let reason = null;
+  if (decision === 'reject') {
+    reason = prompt('Reason for rejecting the assignment plan (required):');
+    if (!reason) return;
+  }
+  try {
+    await api('PUT', `/api/assignments/${assignmentId}/assignment-approve`, { decision, reason });
+    toast(decision === 'approve'
+      ? 'Plan approved — production clearance requested.'
+      : 'Assignment plan rejected.', 'success');
+    closeModal();
+    if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+    if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+    refreshNotifBadge();
+  } catch (e) { toast(e.message,'error'); }
+}
+
 // ---- Clearance / Executor-assignment actions ----
 async function assignmentClearanceDecision(assignmentId, decision) {
   let remarks = null;

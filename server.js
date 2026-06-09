@@ -1662,23 +1662,90 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
   if (!rv || !ap) return res.status(400).json({ error: 'Unknown reviewer/approver' });
 
   const aid = nextAssignmentId();
+  // New assignments start at "Pending Assignment Review" — the Engineering plan must be
+  // reviewed and then approved before the production clearance request is even issued.
   db.prepare(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,
               reviewer_id,approver_id,frequency_id,effective_date,due_date,notes,status,
-              clearance_user_id,clearance_status,clearance_requested_at,assigned_by)
-              VALUES (?,?,?,?, ?,?,?,?,?,?,?, ?,?,datetime('now'),?)`)
+              clearance_user_id,assigned_by)
+              VALUES (?,?,?,?, ?,?,?,?,?,?,?, ?,?)`)
     .run(aid, checklist_id, target_type, target_id,
-         rv.id, ap.id, frequency_id || null, effective_date || null, due_date || null, notes || '', 'Pending Clearance',
-         grantor.id, 'Pending', req.user.id);
+         rv.id, ap.id, frequency_id || null, effective_date || null, due_date || null, notes || '', 'Pending Assignment Review',
+         grantor.id, req.user.id);
 
-  notify(grantor.id,
-    'PM Clearance requested',
-    `${cl.name} on ${target_type} ${targetName}${due_date ? ' — due ' + due_date : ''} needs your clearance.`,
-    'clearance',
+  notify(rv.id,
+    'PM assignment plan awaiting your review',
+    `${cl.name} on ${target_type} ${targetName}${due_date ? ' — scheduled ' + due_date : ''}. Review before production clearance is requested.`,
+    'assignment_plan_review',
     `/assignments/${aid}`);
 
   audit(req.user, 'ASSIGN', 'Checklist', aid,
-    `Assigned "${cl.name}" to ${target_type} ${targetName} — Clearance pending from ${grantor.name}; Reviewer: ${rv.name}, Approver: ${ap.name}`);
+    `Assigned "${cl.name}" to ${target_type} ${targetName} — Reviewer ${rv.name} → Approver ${ap.name} → Clearance ${grantor.name}`);
   res.json(db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(aid));
+});
+
+// ---- Step 4: Equipment Assignment Review & Approval ----
+// Engineering's assignment plan is reviewed and approved BEFORE the production clearance
+// request is sent. Reuses the same reviewer_id + approver_id picked at assignment time —
+// in pharma practice the same chain authorises both the plan and the execution.
+app.put('/api/assignments/:assignment_id/assignment-review', requireAuth, requireActivity('review_pm','review_checklist'), (req, res) => {
+  const { decision, reason } = req.body || {};
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Pending Assignment Review') return res.status(409).json({ error: `Cannot review from status "${a.status}"` });
+  if (a.reviewer_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assigned reviewer can review this assignment plan' });
+  if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+
+  if (decision === 'approve') {
+    db.prepare("UPDATE checklist_assignments SET status='Pending Assignment Approval' WHERE assignment_id=?").run(req.params.assignment_id);
+    notify(a.approver_id,
+      'PM assignment plan awaiting your approval',
+      `${req.params.assignment_id} reviewed by ${req.user.name}.`,
+      'assignment_plan_approve',
+      `/assignments/${req.params.assignment_id}`);
+    audit(req.user, 'PLAN_REVIEW', 'Assignment', req.params.assignment_id, `Reviewed assignment plan — passed to approver`);
+  } else {
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'reason required for rejection' });
+    db.prepare("UPDATE checklist_assignments SET status='Assignment Rejected', rejection_reason=? WHERE assignment_id=?").run(reason, req.params.assignment_id);
+    if (a.assigned_by) {
+      notify(a.assigned_by, 'PM assignment plan rejected at review', `${req.params.assignment_id}: ${reason}`, 'assignment_plan_rejected', `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'PLAN_REJECT', 'Assignment', req.params.assignment_id, `Rejected at assignment review: ${reason}`);
+  }
+  res.json({ ok: true });
+});
+
+app.put('/api/assignments/:assignment_id/assignment-approve', requireAuth, requireActivity('approve_pm','approve_checklist'), (req, res) => {
+  const { decision, reason } = req.body || {};
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Pending Assignment Approval') return res.status(409).json({ error: `Cannot approve from status "${a.status}"` });
+  if (a.approver_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assigned approver can approve this assignment plan' });
+
+  if (decision === 'reject') {
+    if (!reason || !reason.trim()) return res.status(400).json({ error: 'reason required for rejection' });
+    db.prepare("UPDATE checklist_assignments SET status='Assignment Rejected', rejection_reason=? WHERE assignment_id=?").run(reason, req.params.assignment_id);
+    if (a.assigned_by) {
+      notify(a.assigned_by, 'PM assignment plan rejected at approval', `${req.params.assignment_id}: ${reason}`, 'assignment_plan_rejected', `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'PLAN_REJECT', 'Assignment', req.params.assignment_id, `Rejected at assignment approval: ${reason}`);
+  } else {
+    // Plan approved — kick off the production clearance request.
+    db.prepare(`UPDATE checklist_assignments SET
+        status='Pending Clearance',
+        clearance_status='Pending',
+        clearance_requested_at=datetime('now')
+      WHERE assignment_id=?`).run(req.params.assignment_id);
+    if (a.clearance_user_id) {
+      const c = db.prepare('SELECT name FROM users WHERE id=?').get(a.clearance_user_id);
+      notify(a.clearance_user_id,
+        'PM Clearance requested',
+        `${req.params.assignment_id} approved by ${req.user.name}. Production clearance needed.`,
+        'clearance',
+        `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'PLAN_APPROVE', 'Assignment', req.params.assignment_id, `Assignment plan approved — clearance request issued`);
+  }
+  res.json({ ok: true });
 });
 
 // ---- Clearance step: Production user grants/denies BEFORE executor is assigned ----
@@ -1907,7 +1974,7 @@ function markExpiredAssignments() {
            f.days AS freq_days, f.tolerance_days
     FROM checklist_assignments ca
     LEFT JOIN frequencies f ON f.id = ca.frequency_id
-    WHERE ca.status IN ('Pending Clearance','Awaiting Executor','Pending','In Progress','Pending Review','Pending Approval')
+    WHERE ca.status IN ('Pending Assignment Review','Pending Assignment Approval','Pending Clearance','Awaiting Executor','Pending','In Progress','Pending Review','Pending Approval')
   `).all();
   const todayStr = new Date().toISOString().slice(0, 10);
   const today = new Date(todayStr);
