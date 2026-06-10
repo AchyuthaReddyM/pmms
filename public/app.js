@@ -235,7 +235,9 @@ function statusPill(status) {
     'Draft':'gray','Pending Review':'amber','Pending Approval':'amber','Rejected':'red','Expired':'red',
     'Pending Clearance':'amber','Awaiting Executor':'amber','Clearance Denied':'red',
     // Assignment-plan review states
-    'Pending Assignment Review':'amber','Pending Assignment Approval':'amber','Assignment Rejected':'red'
+    'Pending Assignment Review':'amber','Pending Assignment Approval':'amber','Assignment Rejected':'red',
+    // Scheduled = plan approved, awaiting Engineering to initiate the clearance request
+    'Scheduled':'blue'
   };
   return `<span class="pill ${map[status] || 'gray'}">${escapeHtml(status)}</span>`;
 }
@@ -1917,6 +1919,7 @@ function actionableForUser(a) {
   const uid = CURRENT_USER.id;
   if (a.status === 'Pending Assignment Review' && a.reviewer_id === uid)          return { label: 'Review Plan',    tone: 'amber' };
   if (a.status === 'Pending Assignment Approval' && a.approver_id === uid)        return { label: 'Approve Plan',   tone: 'amber' };
+  if (a.status === 'Scheduled' && (a.assigned_by === uid || CURRENT_USER.is_admin || can('assign_checklist'))) return { label: 'Initiate Clearance', tone: 'blue' };
   if (a.status === 'Pending Clearance' && a.clearance_user_id === uid)            return { label: 'Grant Clearance', tone: 'amber' };
   if (a.status === 'Awaiting Executor' && (a.assigned_by === uid || CURRENT_USER.is_admin)) return { label: 'Assign Executor', tone: 'amber' };
   if (a.status === 'Pending' && a.assignee_id === uid)                            return { label: 'Start', tone: 'amber' };
@@ -1948,7 +1951,7 @@ const PM_WORKFLOW_STEPS = [
     actor:'Reviewer → Approver', link:'tasks', linkLabel:'Reviewer / Approver Inbox →' },
   { n: 5,  phase:'Scheduling', color:'amber',
     title:'Automatic Schedule Generation',
-    desc:'On plan approval, the PM is scheduled per the chosen frequency and due date. Cascading frequency rules govern which checkpoints apply per run.',
+    desc:'On plan approval, status flips to "Scheduled". The PM is now booked into the calendar per the chosen frequency and due date.',
     actor:'System (automatic)', link:null },
   { n: 6,  phase:'Scheduling', color:'amber',
     title:'PM Calendar & Pending Task Update',
@@ -1956,8 +1959,8 @@ const PM_WORKFLOW_STEPS = [
     actor:'System (automatic)', link:'calendar', linkLabel:'Open Calendar →' },
   { n: 7,  phase:'Clearance',  color:'amber',
     title:'Production Clearance Request Initiated by Engineering',
-    desc:'A clearance request notification fires to the named Production user. Status: Pending Clearance.',
-    actor:'Engineering (Initiator)', link:'assignments', linkLabel:'Pending Clearance →' },
+    desc:'Closer to the scheduled date, Engineering opens the assignment and clicks "📤 Initiate Clearance Request". Only at this point does status flip to "Pending Clearance" and the named Production user receive the request notification.',
+    actor:'Engineering (Initiator)', link:'assignments', linkLabel:'Open Checklist Assignment →' },
   { n: 8,  phase:'Clearance',  color:'amber',
     title:'Production / User Department Review & Approval',
     desc:'Production user reviews against the production plan and either grants clearance (with optional remarks) or denies it (mandatory reason). Denial halts the workflow.',
@@ -2467,6 +2470,7 @@ async function openAssignment(assignmentId) {
     const executorEditable      = (a.status === 'Pending' || a.status === 'In Progress') && (amExecutor || amAdmin);
     const planReviewerActing    = a.status === 'Pending Assignment Review'   && (amReviewer || amAdmin);
     const planApproverActing    = a.status === 'Pending Assignment Approval' && (amApprover || amAdmin);
+    const clearanceInitiatorActing = a.status === 'Scheduled' && (amAssigner || amAdmin || can('assign_checklist'));
     const reviewerActing        = a.status === 'Pending Review' && (amReviewer || amAdmin);
     const approverActing        = a.status === 'Pending Approval' && (amApprover || amAdmin);
     const clearanceActing       = a.status === 'Pending Clearance' && (amClearanceUser || amAdmin);
@@ -2634,8 +2638,11 @@ async function openAssignment(assignmentId) {
       acts.push(`<button type="button" class="btn ghost"   onclick="assignmentPlanReviewDecision('${a.assignment_id}','reject')">✗ Reject Plan</button>`);
     }
     if (planApproverActing) {
-      acts.push(`<button type="button" class="btn primary" onclick="assignmentPlanApproveDecision('${a.assignment_id}','approve')">✓ Approve Plan &amp; Request Clearance</button>`);
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentPlanApproveDecision('${a.assignment_id}','approve')">✓ Approve Plan</button>`);
       acts.push(`<button type="button" class="btn ghost"   onclick="assignmentPlanApproveDecision('${a.assignment_id}','reject')">✗ Reject Plan</button>`);
+    }
+    if (clearanceInitiatorActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentRequestClearance('${a.assignment_id}')">📤 Initiate Clearance Request</button>`);
     }
     if (clearanceActing) {
       acts.push(`<button type="button" class="btn primary" onclick="assignmentClearanceDecision('${a.assignment_id}','grant')">✓ Grant Clearance</button>`);
@@ -2745,6 +2752,19 @@ async function assignmentPlanApproveDecision(assignmentId, decision) {
     if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
     refreshNotifBadge();
   } catch (e) { toast(e.message,'error'); }
+}
+
+// ---- Step 7: Engineering manually initiates the production clearance request ----
+async function assignmentRequestClearance(assignmentId) {
+  if (!confirm(`Initiate the production clearance request for ${assignmentId}? The production user will be notified immediately.`)) return;
+  try {
+    await api('PUT', `/api/assignments/${assignmentId}/request-clearance`, {});
+    toast('Clearance request sent. Production user notified.', 'success');
+    closeModal();
+    if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+    if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+    refreshNotifBadge();
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 // ---- Clearance / Executor-assignment actions ----

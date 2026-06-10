@@ -1729,22 +1729,48 @@ app.put('/api/assignments/:assignment_id/assignment-approve', requireAuth, requi
     }
     audit(req.user, 'PLAN_REJECT', 'Assignment', req.params.assignment_id, `Rejected at assignment approval: ${reason}`);
   } else {
-    // Plan approved — kick off the production clearance request.
-    db.prepare(`UPDATE checklist_assignments SET
-        status='Pending Clearance',
-        clearance_status='Pending',
-        clearance_requested_at=datetime('now')
-      WHERE assignment_id=?`).run(req.params.assignment_id);
-    if (a.clearance_user_id) {
-      const c = db.prepare('SELECT name FROM users WHERE id=?').get(a.clearance_user_id);
-      notify(a.clearance_user_id,
-        'PM Clearance requested',
-        `${req.params.assignment_id} approved by ${req.user.name}. Production clearance needed.`,
-        'clearance',
+    // Plan approved — the PM is now Scheduled. Clearance is a separate, manual step
+    // initiated by Engineering closer to the due date (see /request-clearance below).
+    db.prepare(`UPDATE checklist_assignments SET status='Scheduled' WHERE assignment_id=?`)
+      .run(req.params.assignment_id);
+    if (a.assigned_by) {
+      notify(a.assigned_by,
+        'PM scheduled — initiate clearance when ready',
+        `${req.params.assignment_id} plan approved by ${req.user.name}. It now sits in the calendar at ${a.due_date || a.effective_date || 'the scheduled date'}. Initiate the production clearance request closer to that date.`,
+        'pm_scheduled',
         `/assignments/${req.params.assignment_id}`);
     }
-    audit(req.user, 'PLAN_APPROVE', 'Assignment', req.params.assignment_id, `Assignment plan approved — clearance request issued`);
+    audit(req.user, 'PLAN_APPROVE', 'Assignment', req.params.assignment_id, `Assignment plan approved — PM scheduled (clearance pending Engineering initiation)`);
   }
+  res.json({ ok: true });
+});
+
+// ---- Step 7: Engineering manually initiates the Production Clearance Request ----
+// Triggered closer to the due date — only at this point does the production user receive
+// the clearance request notification.
+app.put('/api/assignments/:assignment_id/request-clearance', requireAuth, requireActivity('assign_checklist'), (req, res) => {
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Scheduled') return res.status(409).json({ error: `Cannot initiate clearance — assignment is "${a.status}". Clearance can only be requested for a Scheduled PM.` });
+  if (!a.clearance_user_id) return res.status(409).json({ error: 'No clearance user attached to this assignment.' });
+
+  const cu = db.prepare('SELECT name FROM users WHERE id=?').get(a.clearance_user_id);
+  const cl = db.prepare('SELECT name FROM checklists WHERE id=?').get(a.checklist_id);
+
+  db.prepare(`UPDATE checklist_assignments SET
+      status='Pending Clearance',
+      clearance_status='Pending',
+      clearance_requested_at=datetime('now')
+    WHERE assignment_id=?`).run(req.params.assignment_id);
+
+  notify(a.clearance_user_id,
+    'PM Clearance requested',
+    `${cl ? cl.name + ' on ' : ''}${a.target_id} — clearance requested by ${req.user.name}${a.due_date ? ' (due ' + a.due_date + ')' : ''}.`,
+    'clearance',
+    `/assignments/${req.params.assignment_id}`);
+
+  audit(req.user, 'REQUEST_CLEARANCE', 'Assignment', req.params.assignment_id,
+    `Clearance request sent to ${cu ? cu.name : '#'+a.clearance_user_id}`);
   res.json({ ok: true });
 });
 
@@ -1974,7 +2000,7 @@ function markExpiredAssignments() {
            f.days AS freq_days, f.tolerance_days
     FROM checklist_assignments ca
     LEFT JOIN frequencies f ON f.id = ca.frequency_id
-    WHERE ca.status IN ('Pending Assignment Review','Pending Assignment Approval','Pending Clearance','Awaiting Executor','Pending','In Progress','Pending Review','Pending Approval')
+    WHERE ca.status IN ('Pending Assignment Review','Pending Assignment Approval','Scheduled','Pending Clearance','Awaiting Executor','Pending','In Progress','Pending Review','Pending Approval')
   `).all();
   const todayStr = new Date().toISOString().slice(0, 10);
   const today = new Date(todayStr);
