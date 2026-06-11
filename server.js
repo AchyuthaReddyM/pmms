@@ -113,7 +113,10 @@ function notify(userId, title, message, kind = 'info', link = null) {
 // =============================================================
 app.post('/api/auth/login', (req, res) => {
   const { user_id, password } = req.body || {};
-  if (!user_id || !password) return res.status(400).json({ error: 'user_id and password required' });
+  if (!user_id || !password) {
+    audit({ name: 'Anonymous' }, 'LOGIN_FAILED', 'User', user_id || '-', `Missing credentials from ${req.ip || 'unknown'}`);
+    return res.status(400).json({ error: 'user_id and password required' });
+  }
   const u = db.prepare(`
     SELECT u.*, r.name AS role_name, r.permissions_json, d.name AS dept_name
     FROM users u
@@ -121,9 +124,18 @@ app.post('/api/auth/login', (req, res) => {
     LEFT JOIN departments d ON d.id = u.department_id
     WHERE u.user_id = ?
   `).get(user_id);
-  if (!u) return res.status(401).json({ error: 'Invalid credentials' });
-  if (u.status !== 'Active') return res.status(403).json({ error: 'User is locked or inactive' });
-  if (!verifyPassword(password, u.password_hash)) return res.status(401).json({ error: 'Invalid credentials' });
+  if (!u) {
+    audit({ name: 'Anonymous' }, 'LOGIN_FAILED', 'User', user_id, `Unknown user from ${req.ip || 'unknown'}`);
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  if (u.status !== 'Active') {
+    audit({ id: u.id, name: u.name }, 'LOGIN_FAILED', 'User', user_id, `Account ${u.status} from ${req.ip || 'unknown'}`);
+    return res.status(403).json({ error: 'User is locked or inactive' });
+  }
+  if (!verifyPassword(password, u.password_hash)) {
+    audit({ id: u.id, name: u.name }, 'LOGIN_FAILED', 'User', user_id, `Wrong password from ${req.ip || 'unknown'}`);
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
 
   const token = crypto.randomBytes(24).toString('hex');
   const expires = new Date(Date.now() + 8 * 3600 * 1000).toISOString();
@@ -2189,6 +2201,7 @@ app.listen(PORT, '0.0.0.0', () => {
         if (iface.family === 'IPv4' && !iface.internal) lanIps.push(iface.address);
       }
     }
+
     if (lanIps.length) {
       console.log('  Office LAN URL:');
       for (const ip of lanIps) console.log(`     http://${ip}:${PORT}`);

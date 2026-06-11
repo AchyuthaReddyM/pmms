@@ -387,312 +387,49 @@ const BUILTIN_ACTIVITIES = [
 ];
 
 // ---------- Seed ----------
+// Clean-slate seed: just enough for the admin to log in. Everything else (departments,
+// roles, users, plants, equipment, frequencies, categories, checklists, etc.) is left
+// empty so the administrator can configure the system from scratch.
 function seed() {
   const hasUsers = db.prepare('SELECT COUNT(*) AS n FROM users').get().n;
   if (hasUsers > 0) return; // already seeded
 
-  // 1. Activities (system)
+  // 1. Activities (system) — required because the code references these codes in permission checks.
+  //    Admin can add or remove custom activities later via Admin Settings → Activities.
   const insAct = db.prepare('INSERT INTO activities(code,label,category,is_system) VALUES (?,?,?,1)');
   for (const a of BUILTIN_ACTIVITIES) insAct.run(...a);
   const allCodes = BUILTIN_ACTIVITIES.map(a => a[0]);
 
-  // 2. Departments
-  const depts = [
-    ['IT',                       'Information Technology'],
-    ['Engineering',              'Engineering department (umbrella)'],
-    ['Engineering - Mechanical', 'Mechanical maintenance team'],
-    ['Engineering - Electrical', 'Electrical maintenance team'],
-    ['HVAC',                     'Heating, Ventilation & Air Conditioning'],
-    ['QA',                       'Quality Assurance'],
-    ['Production',               'Production / Manufacturing'],
-    ['Warehouse',                'Warehouse & Stores'],
-  ];
+  // 2. One department: IT (so the admin role has a home).
   const insDept = db.prepare('INSERT INTO departments(name,description) VALUES (?,?)');
-  for (const d of depts) insDept.run(...d);
+  insDept.run('IT', 'Information Technology');
   const deptId = (name) => db.prepare('SELECT id FROM departments WHERE name=?').get(name).id;
 
-  // 3. Roles — each tied to one department, with permission set.
-  // Names match the legacy role strings so existing requireRole() checks still work.
-  const techActs   = ['view_pm','execute_pm','view_equipment','report_breakdown','execute_checklist'];
-  const reviewerActs = ['view_pm','review_pm','view_equipment','view_reports','view_audit','execute_checklist','review_checklist'];
-  const approverActs = ['view_pm','create_pm','approve_pm','assign_pm','view_equipment','manage_equipment','view_reports','view_breakdowns','resolve_breakdown','manage_checklists','assign_checklist','execute_checklist','review_checklist','approve_checklist'];
-  const prodActs   = ['view_pm','view_equipment','report_breakdown','view_breakdowns','execute_checklist','grant_clearance'];
-  const qaActs     = ['view_pm','approve_pm','review_pm','view_reports','view_audit','execute_checklist','review_checklist','approve_checklist'];
-  const whActs     = ['view_equipment','view_pm','execute_checklist'];
+  // 3. One role: System Administrator with every activity. Bypasses all permission checks
+  //    via the is_admin flag, so the admin can configure everything from scratch.
+  db.prepare('INSERT INTO roles(name,department_id,description,permissions_json,is_system) VALUES (?,?,?,?,1)')
+    .run('System Administrator', deptId('IT'), 'Full access to every activity in the system', JSON.stringify(allCodes));
+  const adminRole = db.prepare("SELECT id, department_id FROM roles WHERE name='System Administrator'").get();
 
-  const roles = [
-    ['System Administrator', deptId('IT'),                       'Full access to every activity in the system', allCodes,    1],
-    ['Approver',             deptId('Engineering'),              'Reviews and approves PM schedules',           approverActs, 1],
-    ['Reviewer',             deptId('QA'),                       'Reviews completed PMs for compliance',         reviewerActs, 1],
-    ['Technician',           deptId('Engineering - Mechanical'), 'Executes PMs on assigned equipment',           techActs,    1],
-    ['Engineering',          deptId('Engineering'),              'Engineering manager — create/edit equipment & PMs', approverActs.concat(['create_pm','manage_plants']), 1],
-    ['Production',           deptId('Production'),               'Production staff — reports breakdowns',        prodActs,    1],
-    ['QA',                   deptId('QA'),                       'QA personnel',                                 qaActs,      1],
-    ['Warehouse',            deptId('Warehouse'),                'Stores / inventory',                           whActs,      1],
-  ];
-  const insRole = db.prepare('INSERT INTO roles(name,department_id,description,permissions_json,is_system) VALUES (?,?,?,?,?)');
-  for (const r of roles) {
-    insRole.run(r[0], r[1], r[2], JSON.stringify([...new Set(r[3])]), r[4]);
-  }
-  const roleByName = (n) => db.prepare('SELECT id, department_id, name FROM roles WHERE name=?').get(n);
-
-  // 4. Users — assign role_id + department_id
+  // 4. The admin user — Achyutha Reddy. Password defaults to admin123; override with
+  //    ADMIN_PASSWORD env var before first launch in production.
   const adminPw = process.env.ADMIN_PASSWORD || 'admin123';
   if (adminPw === 'admin123') {
     console.warn('[db] WARNING: seeding admin with default password "admin123" — set ADMIN_PASSWORD env var for production');
   }
-  const mkHash = (pw) => hashPassword(pw);
-  const insertUser = db.prepare(`
-    INSERT INTO users (user_id, employee_id, name, email, password_hash, role_id, department_id, role, department, status)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')
-  `);
-  // [user_id, employee_id, name, email, password, role_name, override_department_name?]
-  const users = [
-    ['admin',     'EMP-0001', 'Achyutha Reddy', 'achyutha2006@gmail.com', adminPw,         'System Administrator', null],
-    ['siyer',     'EMP-1001', 'S. Iyer',        'siyer@ways.local',       'approver123',   'Approver',             null],
-    ['rmehta',    'EMP-1002', 'R. Mehta',       'rmehta@ways.local',      'reviewer123',   'Reviewer',             null],
-    ['pkumar',    'EMP-2001', 'P. Kumar',       'pkumar@ways.local',      'tech123',       'Technician',           'Engineering - Mechanical'],
-    ['krao',      'EMP-2002', 'K. Rao',         'krao@ways.local',        'tech123',       'Technician',           'Engineering - Electrical'],
-    ['snaidu',    'EMP-2003', 'S. Naidu',       'snaidu@ways.local',      'tech123',       'Technician',           'HVAC'],
-    ['mverma',    'EMP-3001', 'M. Verma',       'mverma@ways.local',      'prod123',       'Production',           null],
-    ['qaapprove', 'EMP-4001', 'Q. Anand',       'qa@ways.local',          'qa123',         'QA',                   null],
-    ['stores',    'EMP-5001', 'Stores Officer', 'stores@ways.local',      'store123',      'Warehouse',            null],
-  ];
-  for (const u of users) {
-    const r = roleByName(u[5]);
-    const dId = u[6] ? deptId(u[6]) : r.department_id;
-    const dName = u[6] || db.prepare('SELECT name FROM departments WHERE id=?').get(dId).name;
-    insertUser.run(u[0], u[1], u[2], u[3], mkHash(u[4]), r.id, dId, r.name, dName);
-  }
+  db.prepare(`INSERT INTO users (user_id, employee_id, name, email, password_hash, role_id, department_id, role, department, status)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')`)
+    .run('admin', 'EMP-0001', 'Achyutha Reddy', 'achyutha2006@gmail.com',
+         hashPassword(adminPw), adminRole.id, adminRole.department_id,
+         'System Administrator', 'IT');
 
-  const ins = (sql) => db.prepare(sql);
+  // 5. One audit row marking the clean seed. Audit log otherwise starts empty.
+  db.prepare('INSERT INTO audit_log(user_name,action,entity,entity_id,details) VALUES (?,?,?,?,?)')
+    .run('System', 'SEED', 'SYSTEM', '-', 'Clean seed: System Administrator role + admin user; no other data');
 
-  ins('INSERT INTO plants(plant_id,unit_number,name,location,version,status) VALUES (?,?,?,?,?,?)').run('PL-001','Unit-1','Hyderabad Formulations Plant','Hyderabad, IN','v3.1','Active');
-  ins('INSERT INTO plants(plant_id,unit_number,name,location,version,status) VALUES (?,?,?,?,?,?)').run('PL-002','Unit-2','Visakhapatnam API Plant','Vizag, IN','v2.4','Active');
-  ins('INSERT INTO plants(plant_id,unit_number,name,location,version,status) VALUES (?,?,?,?,?,?)').run('PL-003','Unit-3','Baddi Solid Dosage','Baddi, HP','v1.7','Under Review');
-  ins('INSERT INTO plants(plant_id,unit_number,name,location,version,status) VALUES (?,?,?,?,?,?)').run('PL-004','R&D-Unit','R&D Pilot Plant','Bangalore, IN',null,'Inactive');
-
-  const blocks = [
-    ['BLK-001','PL-001','Block-A · Granulation'],
-    ['BLK-002','PL-001','Block-B · Compression'],
-    ['BLK-003','PL-001','Block-C · Coating'],
-    ['BLK-004','PL-002','API Synthesis Block'],
-  ];
-  for (const b of blocks) ins('INSERT INTO blocks(block_id,plant_id,name) VALUES (?,?,?)').run(...b);
-
-  // Formulation types — used optionally in Location Master to distinguish OSD vs Injectable etc.
-  const forms = [
-    ['FRM-001','OSD',           'Production'],
-    ['FRM-002','Injectable',    'Production'],
-    ['FRM-003','Softgel',       'Production'],
-    ['FRM-004','Bag Filling',   'Production'],
-    ['FRM-005','Others',        'Production'],
-  ];
-  for (const f of forms) ins('INSERT INTO formulations(formulation_id,name,department) VALUES (?,?,?)').run(...f);
-
-  // Locations may optionally link to a formulation (OSD vs Injectable etc.)
-  const osdId = db.prepare("SELECT id FROM formulations WHERE name='OSD'").get().id;
-  const injId = db.prepare("SELECT id FROM formulations WHERE name='Injectable'").get().id;
-  const locs = [
-    ['LOC-001','BLK-001','Granulation Room 1', osdId],
-    ['LOC-002','BLK-001','Sifting Area',       osdId],
-    ['LOC-003','BLK-002','Compression Hall',   osdId],
-    ['LOC-004','BLK-003','Coating Room',       osdId],
-  ];
-  for (const l of locs) ins('INSERT INTO locations(location_id,block_id,description,formulation_id) VALUES (?,?,?,?)').run(...l);
-
-  const areas = [
-    ['AR-001','LOC-001','Classified — Grade D'],
-    ['AR-002','LOC-003','Classified — Grade C'],
-    ['AR-003','LOC-002','Black Area'],
-    ['AR-004','LOC-004','Classified — Grade D'],
-  ];
-  for (const a of areas) ins('INSERT INTO areas(area_id,location_id,name) VALUES (?,?,?)').run(...a);
-
-  // [equipment_id, name, make, model, serial, capacity, area_id, status]
-  const equipment = [
-    ['EQ-RMG-02','Rapid Mixer Granulator','Gansons','RMG-300','SN-7841-A','300 L','AR-001','Active'],
-    ['EQ-FBD-04','Fluid Bed Dryer',       'Gansons','FBD-200','SN-9012-B','200 kg','AR-001','Active'],
-    ['EQ-TBP-02','Tablet Press',          'Cadmach','CMD-27', 'SN-4451-C','27 stations','AR-002','Under Maintenance'],
-    ['EQ-AHU-12','Air Handling Unit',     'Caryaire','AHU-15K','SN-2266-D','15,000 CFM','AR-004','Active'],
-    ['EQ-CMP-03','Air Compressor',        'Atlas Copco','GA-90','SN-3380-E','90 kW','AR-003','Active'],
-    ['EQ-CAP-01','Capsule Filler',        'ACG','AF-90T',     'SN-1188-F','90,000 caps/hr','AR-002','Validation'],
-    ['EQ-AHU-08','Air Handling Unit (8)', 'Caryaire','AHU-10K','SN-7799-G','10,000 CFM','AR-004','Active'],
-  ];
-  const eqIns = ins('INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,status,qr_code) VALUES (?,?,?,?,?,?,?,?,?)');
-  for (const e of equipment) eqIns.run(...e, `QR:${e[0]}`);
-
-  const freqs = [
-    ['Daily',1,0], ['Weekly',7,2], ['Monthly',30,5], ['Quarterly',90,10], ['Half-Yearly',180,15], ['Yearly',365,30]
-  ];
-  for (const f of freqs) ins('INSERT INTO frequencies(name,days,tolerance_days) VALUES (?,?,?)').run(...f);
-
-  const cats = [
-    ['Mechanical',     'Mechanical maintenance activities'],
-    ['Electrical',     'Electrical inspections and tests'],
-    ['Instrumentation','Instrument calibration & checks'],
-    ['Utility',        'Utility systems (steam, compressed air, etc.)'],
-    ['HVAC',           'Heating, ventilation & air conditioning'],
-    ['Calibration',    'Periodic instrument calibration'],
-    ['Lubrication',    'Lubrication schedule'],
-    ['Safety',         'Safety and statutory checks'],
-  ];
-  for (const c of cats) ins('INSERT INTO pm_categories(name,description) VALUES (?,?)').run(...c);
-
-  // Engineering Functions (formerly "Checklist Groups") — engineering sub-functions
-  const groups = [
-    ['Mechanical',      deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],   // id 1
-    ['Electrical',      deptId('Engineering - Electrical'), 'Engineering - Electrical'],   // id 2
-    ['Instrumentation', deptId('Engineering - Electrical'), 'Engineering - Electrical'],   // id 3
-    ['HVAC',            deptId('HVAC'),                     'HVAC'],                       // id 4
-    ['Water Systems',   deptId('Engineering - Mechanical'), 'Engineering - Mechanical'],   // id 5
-  ];
-  for (const g of groups) ins('INSERT INTO checklist_groups(name,department_id,department) VALUES (?,?,?)').run(...g);
-
-  // Legacy fields_json checklists (still supported)
-  const fbdChecklist = JSON.stringify([
-    { id: 'q1', type: 'dropdown', label: 'Verify equipment is shut down and tagged out', options:['OK','Not OK'], required:true },
-    { id: 'q2', type: 'dropdown', label: 'Inspect filter bag condition', options:['OK','Replace'], required:true },
-    { id: 'q3', type: 'number',   label: 'Inlet air temperature (°C)', min:25, max:80, required:true },
-    { id: 'q4', type: 'checkbox', label: 'Lubricated blower bearings', required:true },
-    { id: 'q5', type: 'text',     label: 'Lubricant batch ID', required:true },
-    { id: 'q6', type: 'text',     label: 'Remarks', required:false },
-  ]);
-  const chkFbd = ins("INSERT INTO checklists(code,name,group_id,version,fields_json,status) VALUES (?,?,?,?,?,'Approved')").run('CHK-FBD-01','FBD Monthly Mechanical',1,'v3.2',fbdChecklist).lastInsertRowid;
-  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(chkFbd, 'Monthly');
-  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(chkFbd, 'Quarterly');
-
-  const rmgChecklist = JSON.stringify([
-    { id: 'q1', type: 'dropdown', label: 'Power isolation done', options:['Yes','No'], required:true },
-    { id: 'q2', type: 'number',   label: 'Motor amperage (A)', min:0, max:200, required:true },
-    { id: 'q3', type: 'dropdown', label: 'Impeller condition', options:['OK','Worn'], required:true },
-    { id: 'q4', type: 'text',     label: 'Remarks', required:false },
-  ]);
-  const chkRmg = ins("INSERT INTO checklists(code,name,group_id,version,fields_json,status) VALUES (?,?,?,?,?,'Approved')").run('CHK-RMG-01','RMG Weekly Electrical',2,'v2.1',rmgChecklist).lastInsertRowid;
-  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(chkRmg, 'Weekly');
-
-  const ahuChecklist = JSON.stringify([
-    { id: 'q1', type: 'dropdown', label: 'Filter status', options:['OK','Replace'], required:true },
-    { id: 'q2', type: 'number',   label: 'Differential pressure (Pa)', min:0, max:500, required:true },
-    { id: 'q3', type: 'number',   label: 'Supply air flow (CFM)', min:0, max:20000, required:true },
-    { id: 'q4', type: 'text',     label: 'Remarks', required:false },
-  ]);
-  const chkAhuQ = ins("INSERT INTO checklists(code,name,group_id,version,fields_json,status) VALUES (?,?,?,?,?,'Approved')").run('CHK-AHU-Q','AHU Quarterly HVAC',4,'v1.4',ahuChecklist).lastInsertRowid;
-  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(chkAhuQ, 'Quarterly');
-
-  // ---- Structured (new) checklist sample: AHU Monthly Inspection ----
-  const adminId = db.prepare("SELECT id FROM users WHERE user_id='admin'").get().id;
-  const ahuCatId = db.prepare("SELECT id FROM pm_categories WHERE name='HVAC'").get().id;
-  const reviewerId = db.prepare("SELECT id FROM users WHERE user_id='rmehta'").get().id;
-  const approverId = db.prepare("SELECT id FROM users WHERE user_id='siyer'").get().id;
-  // Required fields the AHU checklist expects executors to record
-  const ahuReqd = JSON.stringify(['area','equipment','capacity_make','spares','validation_by','corrective','external_report']);
-  const clRes = ins(`INSERT INTO checklists(code,name,description,group_id,category_id,version,status,required_fields_json,created_by,reviewer_id,approver_id,submitted_at,reviewed_at,approved_at)
-                     VALUES (?,?,?,?,?,?,?,?,?,?,?, datetime('now','-3 days'), datetime('now','-2 days'), datetime('now','-1 day'))`)
-    .run('CHK-AHU-M','AHU Monthly Inspection (v2)', 'Structured monthly AHU inspection with grouped checkpoints.', 4, ahuCatId, 'v2.0', 'Approved', ahuReqd, adminId, reviewerId, approverId);
-  const ahuCl = clRes.lastInsertRowid;
-  // Allowed frequencies: Monthly + Quarterly
-  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(ahuCl, 'Monthly');
-  ins('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?, (SELECT id FROM frequencies WHERE name=?))').run(ahuCl, 'Quarterly');
-
-  const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
-  const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,frequencies_json,position) VALUES (?,?,?,?,?,?,?,?,?,?)`);
-
-  // Frequency IDs we'll use for tagging seeded checkpoints.
-  const monthlyId   = db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id;
-  const quarterlyId = db.prepare("SELECT id FROM frequencies WHERE name='Quarterly'").get().id;
-  const ALL_FREQS = null;                                                   // applies to every allowed frequency on this checklist
-  const Q_ONLY    = JSON.stringify([quarterlyId]);                          // Quarterly only
-  const M_AND_Q   = JSON.stringify([monthlyId, quarterlyId]);               // both Monthly and Quarterly
-
-  const sec1 = insSec.run(ahuCl, 'Pre-Inspection Safety', 'Lock-out, tag-out and PPE verification', 1).lastInsertRowid;
-  insQ.run(sec1, 'Equipment isolated and locked out',     'yesno',    null, 1, null, null, null, ALL_FREQS, 1);
-  insQ.run(sec1, 'PPE worn (gloves, goggles)',            'checkbox', null, 1, null, null, null, ALL_FREQS, 2);
-  insQ.run(sec1, 'Permit-to-work number',                 'text',     null, 1, null, null, null, ALL_FREQS, 3);
-
-  const sec2 = insSec.run(ahuCl, 'Filters & Coils', 'Visual + measurement checks on filters', 2).lastInsertRowid;
-  insQ.run(sec2, 'Pre-filter condition',                  'dropdown', JSON.stringify(['OK','Dirty','Replace']),       1, null, null, null, M_AND_Q, 1);
-  insQ.run(sec2, 'HEPA filter condition (full inspection)','dropdown', JSON.stringify(['OK','Replace']),               1, null, null, null, Q_ONLY,  2);
-  insQ.run(sec2, 'Differential pressure across filter',   'number',   null, 1, 0, 500, 'Pa', M_AND_Q, 3);
-  insQ.run(sec2, 'Cooling coil cleanliness (deep check)', 'dropdown', JSON.stringify(['Clean','Acceptable','Dirty']), 1, null, null, null, Q_ONLY,  4);
-
-  const sec3 = insSec.run(ahuCl, 'Blower & Motor', 'Mechanical + electrical health of blower assembly', 3).lastInsertRowid;
-  insQ.run(sec3, 'Belt tension OK',                       'yesno',    null, 1, null, null, null, M_AND_Q, 1);
-  insQ.run(sec3, 'Motor current draw',                    'number',   null, 1, 0, 100, 'A',     M_AND_Q, 2);
-  insQ.run(sec3, 'Bearing temperature',                   'number',   null, 1, 0, 120, '°C',    M_AND_Q, 3);
-  insQ.run(sec3, 'Unusual noise / vibration?',            'yesno',    null, 1, null, null, null, M_AND_Q, 4);
-  insQ.run(sec3, 'Thermal imaging of motor windings',     'text',     null, 1, null, null, null, Q_ONLY,  5);
-
-  const sec4 = insSec.run(ahuCl, 'Sign-off', 'Technician notes and signatures', 4).lastInsertRowid;
-  insQ.run(sec4, 'Remarks / observations',                'text',     null, 0, null, null, null, ALL_FREQS, 1);
-
-  // PM Schedules — mix of statuses for a populated dashboard
-  const u = (uid) => db.prepare('SELECT id FROM users WHERE user_id=?').get(uid).id;
-  const cl = (name) => db.prepare('SELECT id FROM checklists WHERE name=?').get(name).id;
-  const today = new Date();
-  const fmt = (d) => d.toISOString().slice(0,10);
-  const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate()+n); return x; };
-
-  const insSched = ins(`INSERT INTO pm_schedules(pm_id,equipment_id,checklist_id,frequency,category,scheduled_date,department,technician_id,reviewer_id,approver_id,status,created_by)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`);
-
-  insSched.run('PM-2607','EQ-FBD-04', cl('FBD Monthly Mechanical'),'Monthly','Mechanical', fmt(addDays(today, 1)),  'Engineering - Mechanical', u('pkumar'),  u('rmehta'), u('siyer'), 'Approved', u('admin'));
-  insSched.run('PM-2608','EQ-AHU-12', cl('AHU Quarterly HVAC'),    'Quarterly','HVAC',     fmt(addDays(today, 2)),  'HVAC',                     null,         u('rmehta'), u('siyer'), 'Pending',  u('admin'));
-  insSched.run('PM-2609','EQ-RMG-02', cl('RMG Weekly Electrical'), 'Weekly','Electrical',  fmt(today),              'Engineering - Electrical', u('pkumar'),  u('rmehta'), u('siyer'), 'In Progress', u('admin'));
-  insSched.run('PM-2610','EQ-CMP-03', cl('FBD Monthly Mechanical'),'Monthly','Mechanical', fmt(addDays(today, 5)),  'Engineering - Mechanical', u('krao'),    u('rmehta'), u('siyer'), 'Approved', u('admin'));
-  insSched.run('PM-2589','EQ-TBP-02', cl('FBD Monthly Mechanical'),'Quarterly','Calibration', fmt(addDays(today, -6)),'Engineering - Mechanical', u('pkumar'), u('rmehta'), u('siyer'), 'Overdue',  u('admin'));
-  insSched.run('PM-2570','EQ-AHU-08', cl('AHU Quarterly HVAC'),    'Monthly','HVAC',       fmt(addDays(today, -22)),'HVAC',                     null,         u('rmehta'), u('siyer'), 'Expired',  u('admin'));
-
-  const completedData = JSON.stringify({ q1:'OK', q2:'OK', q3:55, q4:true, q5:'LUB-2026-04-001', q6:'Routine PM completed without issues' });
-  insSched.run('PM-2575','EQ-CAP-01', cl('FBD Monthly Mechanical'),'Monthly','Mechanical', fmt(addDays(today, -16)),'Engineering - Mechanical', u('snaidu'), u('rmehta'), u('siyer'), 'Completed', u('admin'));
-  db.prepare(`UPDATE pm_schedules SET execution_data=?, started_at=?, completed_at=?, technician_sig=?, reviewer_sig=?, approver_sig=? WHERE pm_id='PM-2575'`)
-    .run(completedData, fmt(addDays(today, -16))+' 09:15:00', fmt(addDays(today,-16))+' 11:20:00','S. Naidu','R. Mehta','S. Iyer');
-
-  // Sample checklist assignment with notification (target = equipment)
-  // Full workflow demo: Plan Review -> Plan Approval -> Clearance -> Executor assignment ->
-  //                     Execution -> Review -> QA Approval -> Closure.
-  // CA-001 starts at the very first stage so testers walk the whole 13-step flow.
-  ins(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,
-       clearance_user_id,
-       reviewer_id,approver_id,frequency_id,effective_date,due_date,status,assigned_by)
-       VALUES (?,?,?,?, ?, ?,?,?,?,?,?,?)`)
-    .run('CA-001', ahuCl, 'equipment', 'EQ-AHU-12',
-         u('mverma'),
-         u('rmehta'), u('qaapprove'),
-         db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
-         fmt(today), fmt(addDays(today, 3)), 'Pending Assignment Review', u('siyer'));
-  ins('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
-    .run(u('rmehta'),
-         'PM assignment plan awaiting your review',
-         'AHU Monthly Inspection (v2) on EQ-AHU-12 — review before production clearance is requested.',
-         'assignment_plan_review',
-         '/assignments/CA-001');
-
-  // CA-002 — a deliberately-overdue assignment to populate the Expired Equipment module.
-  // EQ-AHU-08 had a Monthly PM scheduled 45 days ago that was never picked up — tolerance long crossed.
-  ins(`INSERT INTO checklist_assignments(assignment_id,checklist_id,target_type,target_id,assignee_id,reviewer_id,approver_id,frequency_id,effective_date,due_date,status,expired_at,assigned_by)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?, datetime('now','-7 days'), ?)`)
-    .run('CA-002', ahuCl, 'equipment', 'EQ-AHU-08',
-         null, u('rmehta'), u('qaapprove'),
-         db.prepare("SELECT id FROM frequencies WHERE name='Monthly'").get().id,
-         fmt(addDays(today, -45)), fmt(addDays(today, -38)),
-         'Expired', u('siyer'));
-
-  // Breakdowns
-  const insBd = ins('INSERT INTO breakdowns(bd_id,equipment_id,reported_by,severity,status,description) VALUES (?,?,?,?,?,?)');
-  insBd.run('BD-118','EQ-TBP-02', u('mverma'),'Critical','Active','Punch failure on station 12; abnormal noise.');
-  insBd.run('BD-119','EQ-CAP-01', u('snaidu'),'Major',  'Investigating','Capsule misalignment causing frequent jams.');
-  insBd.run('BD-120','EQ-AHU-08', u('mverma'),'Major',  'Spares Awaited','Belt slippage; replacement belt on order.');
-  insBd.run('BD-117','EQ-CMP-03', u('pkumar'),'Minor',  'Closed','Oil leak from compressor; gasket replaced.');
-  db.prepare(`UPDATE breakdowns SET resolution=?, mttr_hours=?, closed_at=? WHERE bd_id='BD-117'`)
-    .run('Replaced bottom gasket; verified no leaks.', 3.5, fmt(addDays(today,-3))+' 14:30:00');
-
-  // Initial audit entries
-  const insA = ins('INSERT INTO audit_log(user_name,action,entity,entity_id,details) VALUES (?,?,?,?,?)');
-  insA.run('System','SEED','SYSTEM','-','Initial seed completed');
-  insA.run('Achyutha Reddy','CREATE','Plant','PL-001','Plant created');
-  insA.run('Achyutha Reddy','CREATE','Equipment','EQ-FBD-04','Equipment registered with QR code');
-  insA.run('S. Iyer','APPROVE','PM','PM-2607','PM approved for execution');
+  // No further seed data. Departments, roles, users, plants, blocks, locations, areas,
+  // formulations, equipment, frequencies, PM categories, checklist groups, checklists,
+  // assignments, breakdowns — all left empty for the administrator to configure.
 }
 
 // Schema migration: when an existing DB file is missing columns that newer code expects,
@@ -705,29 +442,19 @@ function migrateSchema() {
   }
   function addColIfMissing(table, col, ddl) {
     const existing = cols(table);
-    if (existing.length === 0) return; // table doesn't exist yet — createSchema will handle it
+    if (existing.length === 0) return;
     if (!existing.includes(col)) {
-      try {
-        db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`);
-        console.log(`[db] migration: added ${table}.${col}`);
-      } catch (e) {
-        console.error(`[db] migration failed for ${table}.${col}:`, e.message);
-      }
+      try { db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${ddl}`); console.log(`[db] migration: added ${table}.${col}`); }
+      catch (e) { console.error(`[db] migration failed for ${table}.${col}:`, e.message); }
     }
   }
-  // plants
   addColIfMissing('plants', 'unit_number', 'TEXT');
-  // users
   addColIfMissing('users', 'employee_id', 'TEXT');
   addColIfMissing('users', 'phone', 'TEXT');
   addColIfMissing('users', 'role_id', 'INTEGER');
   addColIfMissing('users', 'department_id', 'INTEGER');
-  // locations
   addColIfMissing('locations', 'formulation_id', 'INTEGER');
-  // areas (added new "name" column without dropping legacy area_type)
   addColIfMissing('areas', 'name', 'TEXT');
-  // One-time backfill — if the legacy area_type column still has data and the new name column is empty,
-  // copy it over so SELECT name works on older DBs.
   try {
     const areaCols = cols('areas');
     if (areaCols.includes('area_type') && areaCols.includes('name')) {
@@ -735,12 +462,9 @@ function migrateSchema() {
       if (r.changes > 0) console.log(`[db] migration: backfilled ${r.changes} areas.name from legacy area_type`);
     }
   } catch (e) { console.error('[db] migration: area_type backfill failed:', e.message); }
-  // equipment (split make_model -> make + model)
   addColIfMissing('equipment', 'make', 'TEXT');
   addColIfMissing('equipment', 'model', 'TEXT');
-  // checklist_groups
   addColIfMissing('checklist_groups', 'department_id', 'INTEGER');
-  // checklists
   addColIfMissing('checklists', 'code', 'TEXT');
   addColIfMissing('checklists', 'description', 'TEXT');
   addColIfMissing('checklists', 'category_id', 'INTEGER');
@@ -752,9 +476,7 @@ function migrateSchema() {
   addColIfMissing('checklists', 'reviewed_at', 'TEXT');
   addColIfMissing('checklists', 'approved_at', 'TEXT');
   addColIfMissing('checklists', 'rejection_reason', 'TEXT');
-  // checklist_questions
   addColIfMissing('checklist_questions', 'frequencies_json', 'TEXT');
-  // checklist_assignments (added a lot across rounds)
   addColIfMissing('checklist_assignments', 'target_type', 'TEXT');
   addColIfMissing('checklist_assignments', 'target_id', 'TEXT');
   addColIfMissing('checklist_assignments', 'reviewer_id', 'INTEGER');
@@ -778,7 +500,6 @@ function migrateSchema() {
   addColIfMissing('checklist_assignments', 'clearance_requested_at', 'TEXT');
   addColIfMissing('checklist_assignments', 'clearance_responded_at', 'TEXT');
   addColIfMissing('checklist_assignments', 'clearance_remarks', 'TEXT');
-  // frequencies / pm_categories — status column was added later
   addColIfMissing('frequencies', 'status', "TEXT NOT NULL DEFAULT 'Active'");
   addColIfMissing('pm_categories', 'status', "TEXT NOT NULL DEFAULT 'Active'");
   addColIfMissing('pm_categories', 'description', 'TEXT');
@@ -820,3 +541,4 @@ function initAndSeed(force=false) {
 initAndSeed(false);
 
 module.exports = { db, initAndSeed, hashPassword, verifyPassword };
+
