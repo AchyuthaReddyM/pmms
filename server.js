@@ -103,6 +103,61 @@ function userHasActivity(user, code) {
   return (user.permissions || []).includes(code);
 }
 
+// ============================================================================
+// E-SIGNATURE MIDDLEWARE — 21 CFR Part 11 §11.50/11.70/11.200/11.300
+// ----------------------------------------------------------------------------
+// Required on every review / approve action across the system. The request
+// body must include:
+//   esig_password   — the current user's password (re-entered at action time)
+//   esig_meaning    — non-empty string describing what the signature attests
+//                     (e.g. "I have reviewed and approve this Plant master")
+//   esig_meaning_ack — true / 'on' — the user must tick the meaning checkbox
+//
+// On success: writes an ESIGNATURE audit entry, exposes req.esig, calls next().
+// On failure: writes ESIGNATURE_FAIL audit, returns 401 with a clear message.
+//
+// The middleware does NOT log the password — only the meaning + outcome.
+// ============================================================================
+function requireESignature(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+  const { esig_password, esig_meaning, esig_meaning_ack } = req.body || {};
+  const actionLabel = `${req.method} ${req.originalUrl}`;
+
+  // 1) Acknowledgement of meaning is mandatory.
+  if (!esig_meaning_ack || (esig_meaning_ack !== true && esig_meaning_ack !== 'true' && esig_meaning_ack !== 'on')) {
+    audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, 'Meaning checkbox not acknowledged');
+    return res.status(401).json({ error: 'You must acknowledge the meaning of your signature to proceed.' });
+  }
+
+  // 2) Meaning text must be present (frontend supplies a default per action).
+  if (!esig_meaning || !String(esig_meaning).trim()) {
+    audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, 'Meaning text missing');
+    return res.status(401).json({ error: 'Signature meaning is required.' });
+  }
+
+  // 3) Password must be present.
+  if (!esig_password) {
+    audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, 'No password supplied');
+    return res.status(401).json({ error: 'Please re-enter your password to sign this action.' });
+  }
+
+  // 4) Verify against the live password_hash for THIS user (not a stale copy).
+  const row = db.prepare('SELECT password_hash, status FROM users WHERE id=?').get(req.user.id);
+  if (!row || row.status !== 'Active') {
+    audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, `User not active (${row?.status || 'missing'})`);
+    return res.status(401).json({ error: 'Your account is not active. Cannot sign.' });
+  }
+  if (!verifyPassword(esig_password, row.password_hash)) {
+    audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, 'Wrong password');
+    return res.status(401).json({ error: 'Password incorrect. Signature rejected.' });
+  }
+
+  // 5) Success — record the signature, then proceed.
+  req.esig = { meaning: String(esig_meaning).trim(), signed_at: new Date().toISOString() };
+  audit(req.user, 'ESIGNATURE', 'E-Signature', actionLabel, req.esig.meaning);
+  next();
+}
+
 function notify(userId, title, message, kind = 'info', link = null) {
   db.prepare('INSERT INTO notifications(user_id,title,message,kind,link) VALUES (?,?,?,?,?)')
     .run(userId, title, message || '', kind, link);
@@ -255,7 +310,7 @@ function validateMasterApprovers(creatorId, reviewer_id, approver_id) {
 //   pkCol       = string PK column, e.g. 'plant_id'
 //   displayName = audit entity label, e.g. 'Plant'
 function addMasterApprovalRoutes(masterName, tableName, pkCol, displayName) {
-  app.put(`/api/${masterName}/:id/review`, requireAuth, requireActivity('review_master'), (req, res) => {
+  app.put(`/api/${masterName}/:id/review`, requireAuth, requireActivity('review_master'), requireESignature, (req, res) => {
     const { decision, remarks } = req.body || {};
     const row = db.prepare(`SELECT * FROM ${tableName} WHERE ${pkCol}=?`).get(req.params.id);
     if (!row) return res.status(404).json({ error: 'Not found' });
@@ -286,7 +341,7 @@ function addMasterApprovalRoutes(masterName, tableName, pkCol, displayName) {
     res.json({ ok: true });
   });
 
-  app.put(`/api/${masterName}/:id/approve`, requireAuth, requireActivity('approve_master'), (req, res) => {
+  app.put(`/api/${masterName}/:id/approve`, requireAuth, requireActivity('approve_master'), requireESignature, (req, res) => {
     const { decision, remarks } = req.body || {};
     const row = db.prepare(`SELECT * FROM ${tableName} WHERE ${pkCol}=?`).get(req.params.id);
     if (!row) return res.status(404).json({ error: 'Not found' });
@@ -1650,7 +1705,7 @@ app.put('/api/checklists/:id/submit', requireAuth, requireActivity('manage_check
   res.json({ ok: true });
 });
 
-app.put('/api/checklists/:id/review', requireAuth, requireActivity('review_checklist'), (req, res) => {
+app.put('/api/checklists/:id/review', requireAuth, requireActivity('review_checklist'), requireESignature, (req, res) => {
   const { decision, reason } = req.body || {};
   const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
   if (!cl) return res.status(404).json({ error: 'Not found' });
@@ -1679,7 +1734,7 @@ app.put('/api/checklists/:id/review', requireAuth, requireActivity('review_check
   res.json({ ok: true });
 });
 
-app.put('/api/checklists/:id/approve', requireAuth, requireActivity('approve_checklist'), (req, res) => {
+app.put('/api/checklists/:id/approve', requireAuth, requireActivity('approve_checklist'), requireESignature, (req, res) => {
   const { decision, reason } = req.body || {};
   const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
   if (!cl) return res.status(404).json({ error: 'Not found' });
@@ -1864,7 +1919,7 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
 // Engineering's assignment plan is reviewed and approved BEFORE the production clearance
 // request is sent. Reuses the same reviewer_id + approver_id picked at assignment time —
 // in pharma practice the same chain authorises both the plan and the execution.
-app.put('/api/assignments/:assignment_id/assignment-review', requireAuth, requireActivity('review_pm','review_checklist'), (req, res) => {
+app.put('/api/assignments/:assignment_id/assignment-review', requireAuth, requireActivity('review_pm','review_checklist'), requireESignature, (req, res) => {
   const { decision, reason } = req.body || {};
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
@@ -1891,7 +1946,7 @@ app.put('/api/assignments/:assignment_id/assignment-review', requireAuth, requir
   res.json({ ok: true });
 });
 
-app.put('/api/assignments/:assignment_id/assignment-approve', requireAuth, requireActivity('approve_pm','approve_checklist'), (req, res) => {
+app.put('/api/assignments/:assignment_id/assignment-approve', requireAuth, requireActivity('approve_pm','approve_checklist'), requireESignature, (req, res) => {
   const { decision, reason } = req.body || {};
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
@@ -1952,7 +2007,7 @@ app.put('/api/assignments/:assignment_id/request-clearance', requireAuth, requir
 });
 
 // ---- Clearance step: Production user grants/denies BEFORE executor is assigned ----
-app.put('/api/assignments/:assignment_id/clearance', requireAuth, requireActivity('grant_clearance'), (req, res) => {
+app.put('/api/assignments/:assignment_id/clearance', requireAuth, requireActivity('grant_clearance'), requireESignature, (req, res) => {
   const { decision, remarks } = req.body || {};
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
@@ -2097,7 +2152,7 @@ app.put('/api/assignments/:assignment_id/submit', requireAuth, (req, res) => {
 });
 
 // Reviewer's action: pass to approver, or reject back to executor
-app.put('/api/assignments/:assignment_id/review', requireAuth, requireActivity('review_pm','review_checklist'), (req, res) => {
+app.put('/api/assignments/:assignment_id/review', requireAuth, requireActivity('review_pm','review_checklist'), requireESignature, (req, res) => {
   const { decision, reason } = req.body || {};
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
@@ -2132,7 +2187,7 @@ app.put('/api/assignments/:assignment_id/review', requireAuth, requireActivity('
 });
 
 // Approver's action: final approval or rejection back to executor
-app.put('/api/assignments/:assignment_id/approve', requireAuth, requireActivity('approve_pm','approve_checklist'), (req, res) => {
+app.put('/api/assignments/:assignment_id/approve', requireAuth, requireActivity('approve_pm','approve_checklist'), requireESignature, (req, res) => {
   const { decision, reason } = req.body || {};
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });

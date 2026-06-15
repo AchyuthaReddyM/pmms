@@ -249,6 +249,49 @@ function severityPill(s) {
 // ===========================================================
 // MASTERS
 // ===========================================================
+// ============================================================================
+// 21 CFR Part 11 E-SIGNATURE MODAL
+// Every review/approve/clearance action must be signed: user re-enters their
+// password and acknowledges the meaning before the action is committed.
+// ============================================================================
+function openESignatureModal({ title, meaning, onConfirm }) {
+  if (!CURRENT_USER) return;
+  openModal({
+    title: title || 'Electronic Signature Required',
+    width: 520,
+    body: `
+      <div style="background:#fff7e6; border:1px solid #ffe7ad; padding:10px 12px; border-radius:6px; margin-bottom:12px; font-size:13px; line-height:1.45;">
+        <div style="font-weight:600; margin-bottom:4px;">21 CFR Part 11 · Electronic Signature</div>
+        <div style="color:var(--muted);">By signing, you affirm:</div>
+        <div style="margin-top:4px; font-style:italic;">&ldquo;${escapeHtml(meaning)}&rdquo;</div>
+      </div>
+      <div class="form-row"><label>Signer</label>
+        <input name="signer" value="${escapeHtml(CURRENT_USER.name)} (${escapeHtml(CURRENT_USER.user_id || '')})" readonly style="background:#f5f5f5;" />
+      </div>
+      <div class="form-row"><label>Password *</label>
+        <input name="esig_password" type="password" required autocomplete="current-password" autofocus />
+      </div>
+      <div class="form-row" style="align-items:flex-start;">
+        <label>&nbsp;</label>
+        <label style="font-size:12px; line-height:1.45; flex:1; cursor:pointer; user-select:none;">
+          <input type="checkbox" name="esig_meaning_ack" required style="margin-right:6px; transform:translateY(2px);" />
+          I confirm the signature meaning above and accept the legal consequences of this electronic signature.
+        </label>
+      </div>
+    `,
+    submitLabel: '✍ Sign &amp; Submit',
+    onSubmit: async (data) => {
+      if (!data.esig_meaning_ack) throw new Error('You must tick the acknowledgement checkbox to sign.');
+      if (!data.esig_password) throw new Error('Password is required.');
+      await onConfirm({
+        esig_password: data.esig_password,
+        esig_meaning: meaning,
+        esig_meaning_ack: true,
+      });
+    }
+  });
+}
+
 // ---------- Master approval helpers (shared by every master form) ----------
 async function loadActiveUsers() {
   try {
@@ -292,39 +335,56 @@ function masterRowActions(master, r) {
 async function openMasterDecisionModal(master, id, stage) {
   // stage = 'review' | 'approve'
   const verb = stage === 'review' ? 'Review' : 'Approve';
-  const approveLabel = stage === 'review' ? 'Forward to Approver' : 'Approve & Activate';
-  // Stash a global reject handler so the Reject button (rendered as a plain button
-  // outside the submit flow) can read the textarea + call the API.
-  window.__masterRejectFn = async () => {
+  const approveLabel = stage === 'review' ? 'Forward to Approver…' : 'Approve & Activate…';
+  const masterLabel = master.slice(0,-1).replace(/^./,c=>c.toUpperCase());
+
+  // After the user fills remarks + clicks Approve/Reject, we close this modal and
+  // open the e-signature modal to capture password + meaning acknowledgement.
+  const performAction = (decision, remarks) => {
+    const meaning = decision === 'approve'
+      ? (stage === 'review'
+         ? `I have reviewed the ${masterLabel} "${id}" and forward it to the Approver.`
+         : `I approve the ${masterLabel} "${id}" for activation. I am responsible for its correctness and GMP impact.`)
+      : `I reject the ${masterLabel} "${id}" at ${verb} stage. Remarks: ${remarks}`;
+    closeModal();
+    openESignatureModal({
+      title: `Sign — ${verb} ${masterLabel} ${id}`,
+      meaning,
+      onConfirm: async (esig) => {
+        await api('PUT', `/api/${master}/${encodeURIComponent(id)}/${stage}`, { decision, remarks, ...esig });
+        toast(decision === 'approve'
+          ? (stage === 'review' ? 'Reviewed — passed to Approver' : 'Approved — now Active')
+          : 'Rejected.', 'success');
+        loadMasters(CURRENT_MASTER);
+      }
+    });
+  };
+
+  window.__masterRejectFn = () => {
     const ta = document.querySelector('textarea[name="masterRemarks"]');
     const remarks = ta ? ta.value.trim() : '';
     if (!remarks) { toast('Remarks are required for rejection', 'error'); return; }
-    try {
-      await api('PUT', `/api/${master}/${encodeURIComponent(id)}/${stage}`, { decision:'reject', remarks });
-      toast('Rejected.', 'success');
-      closeModal();
-      loadMasters(CURRENT_MASTER);
-    } catch (e) { toast(e.message, 'error'); }
+    performAction('reject', remarks);
   };
+
   openModal({
-    title: `${verb} — ${master.slice(0,-1).replace(/^./,c=>c.toUpperCase())} ${id}`,
+    title: `${verb} — ${masterLabel} ${id}`,
     width: 500,
     body: `
       <p style="font-size:12px; color:var(--muted); margin-top:0;">
         ${stage === 'review'
           ? 'Reviewing this record will pass it to the assigned Approver. Rejecting sends it back to the creator with your remarks.'
-          : 'Approving this record marks it as Active and visible everywhere. Rejecting returns it to the creator with your remarks.'}
+          : 'Approving this record marks it as Active and visible everywhere. Rejecting returns it to the creator with your remarks.'}<br>
+        <strong>You will be asked to sign with your password on the next step.</strong>
       </p>
       <div class="form-row"><label>Remarks</label>
         <textarea name="masterRemarks" rows="3" placeholder="Optional for Approve · Required for Reject"></textarea>
       </div>
     `,
     submitLabel: approveLabel,
-    actions: `<button type="button" class="btn ghost" style="color:#c53030; border-color:#fbd5d5;" onclick="window.__masterRejectFn()">✗ Reject</button>`,
+    actions: `<button type="button" class="btn ghost" style="color:#c53030; border-color:#fbd5d5;" onclick="window.__masterRejectFn()">✗ Reject…</button>`,
     onSubmit: async (data) => {
-      await api('PUT', `/api/${master}/${encodeURIComponent(id)}/${stage}`, { decision:'approve', remarks: (data.masterRemarks || '').trim() });
-      toast(stage === 'review' ? 'Reviewed — passed to Approver' : 'Approved — now Active', 'success');
-      loadMasters(CURRENT_MASTER);
+      performAction('approve', (data.masterRemarks || '').trim());
     }
   });
 }
@@ -2543,13 +2603,20 @@ async function reviewChecklistDecision(checklistId, decision) {
     reason = prompt('Reason for rejection:');
     if (!reason) return;
   }
-  try {
-    await api('PUT', `/api/checklists/${checklistId}/review`, { decision, reason });
-    toast(decision === 'approve' ? 'Review passed — sent to approver.' : 'Checklist rejected.', 'success');
-    previewChecklist(checklistId);
-    loadChecklists();
-    refreshNotifBadge();
-  } catch (e) { toast(e.message,'error'); }
+  const meaning = decision === 'approve'
+    ? `I have reviewed Checklist "${checklistId}" and forward it to the Approver.`
+    : `I reject Checklist "${checklistId}" at review. Reason: ${reason}`;
+  openESignatureModal({
+    title: `Sign — Review Checklist ${checklistId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/checklists/${checklistId}/review`, { decision, reason, ...esig });
+      toast(decision === 'approve' ? 'Review passed — sent to approver.' : 'Checklist rejected.', 'success');
+      previewChecklist(checklistId);
+      loadChecklists();
+      refreshNotifBadge();
+    }
+  });
 }
 
 async function approveChecklistDecision(checklistId, decision) {
@@ -2558,13 +2625,20 @@ async function approveChecklistDecision(checklistId, decision) {
     reason = prompt('Reason for rejection:');
     if (!reason) return;
   }
-  try {
-    await api('PUT', `/api/checklists/${checklistId}/approve`, { decision, reason });
-    toast(decision === 'approve' ? 'Checklist approved — now available for assignment.' : 'Checklist rejected.', 'success');
-    previewChecklist(checklistId);
-    loadChecklists();
-    refreshNotifBadge();
-  } catch (e) { toast(e.message,'error'); }
+  const meaning = decision === 'approve'
+    ? `I approve Checklist "${checklistId}" for use in PM assignments. I am responsible for its GMP correctness.`
+    : `I reject Checklist "${checklistId}" at approval. Reason: ${reason}`;
+  openESignatureModal({
+    title: `Sign — Approve Checklist ${checklistId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/checklists/${checklistId}/approve`, { decision, reason, ...esig });
+      toast(decision === 'approve' ? 'Checklist approved — now available for assignment.' : 'Checklist rejected.', 'success');
+      previewChecklist(checklistId);
+      loadChecklists();
+      refreshNotifBadge();
+    }
+  });
 }
 
 async function openAssignment(assignmentId) {
@@ -2840,16 +2914,21 @@ async function assignmentPlanReviewDecision(assignmentId, decision) {
     reason = prompt('Reason for rejecting the assignment plan (required):');
     if (!reason) return;
   }
-  try {
-    await api('PUT', `/api/assignments/${assignmentId}/assignment-review`, { decision, reason });
-    toast(decision === 'approve'
-      ? 'Plan review passed — sent to Approver.'
-      : 'Assignment plan rejected.', 'success');
-    closeModal();
-    if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
-    if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
-    refreshNotifBadge();
-  } catch (e) { toast(e.message,'error'); }
+  const meaning = decision === 'approve'
+    ? `I have reviewed PM assignment plan "${assignmentId}" and forward it to the Approver.`
+    : `I reject PM assignment plan "${assignmentId}" at review. Reason: ${reason}`;
+  openESignatureModal({
+    title: `Sign — Review Plan ${assignmentId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/assignments/${assignmentId}/assignment-review`, { decision, reason, ...esig });
+      toast(decision === 'approve' ? 'Plan review passed — sent to Approver.' : 'Assignment plan rejected.', 'success');
+      closeModal();
+      if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+      if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+      refreshNotifBadge();
+    }
+  });
 }
 
 async function assignmentPlanApproveDecision(assignmentId, decision) {
@@ -2858,16 +2937,21 @@ async function assignmentPlanApproveDecision(assignmentId, decision) {
     reason = prompt('Reason for rejecting the assignment plan (required):');
     if (!reason) return;
   }
-  try {
-    await api('PUT', `/api/assignments/${assignmentId}/assignment-approve`, { decision, reason });
-    toast(decision === 'approve'
-      ? 'Plan approved — production clearance requested.'
-      : 'Assignment plan rejected.', 'success');
-    closeModal();
-    if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
-    if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
-    refreshNotifBadge();
-  } catch (e) { toast(e.message,'error'); }
+  const meaning = decision === 'approve'
+    ? `I approve PM assignment plan "${assignmentId}" for execution. I am responsible for its GMP correctness.`
+    : `I reject PM assignment plan "${assignmentId}" at approval. Reason: ${reason}`;
+  openESignatureModal({
+    title: `Sign — Approve Plan ${assignmentId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/assignments/${assignmentId}/assignment-approve`, { decision, reason, ...esig });
+      toast(decision === 'approve' ? 'Plan approved — production clearance requested.' : 'Assignment plan rejected.', 'success');
+      closeModal();
+      if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+      if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+      refreshNotifBadge();
+    }
+  });
 }
 
 // ---- Step 7: Engineering manually initiates the production clearance request ----
@@ -2892,16 +2976,23 @@ async function assignmentClearanceDecision(assignmentId, decision) {
   } else {
     remarks = prompt('Clearance remarks (optional):') || '';
   }
-  try {
-    await api('PUT', `/api/assignments/${assignmentId}/clearance`, { decision, remarks });
-    toast(decision === 'grant'
-      ? 'Clearance granted. Engineering Manager notified to assign an executor.'
-      : 'Clearance denied.', 'success');
-    closeModal();
-    if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
-    if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
-    refreshNotifBadge();
-  } catch (e) { toast(e.message,'error'); }
+  const meaning = decision === 'grant'
+    ? `I grant production clearance for equipment under PM assignment "${assignmentId}". The equipment is offline and safe for maintenance.`
+    : `I deny production clearance for PM assignment "${assignmentId}". Reason: ${remarks}`;
+  openESignatureModal({
+    title: `Sign — Clearance ${assignmentId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/assignments/${assignmentId}/clearance`, { decision, remarks, ...esig });
+      toast(decision === 'grant'
+        ? 'Clearance granted. Engineering Manager notified to assign an executor.'
+        : 'Clearance denied.', 'success');
+      closeModal();
+      if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+      if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+      refreshNotifBadge();
+    }
+  });
 }
 
 async function openAssignExecutorModal(assignmentId) {
@@ -2940,13 +3031,20 @@ async function assignmentReviewDecision(assignmentId, decision) {
     reason = prompt('Reason for rejection (will be shown to the executor):');
     if (!reason) return;
   }
-  try {
-    await api('PUT', `/api/assignments/${assignmentId}/review`, { decision, reason });
-    toast(decision === 'approve' ? 'Review passed — sent to approver.' : 'Returned to executor for rework.', 'success');
-    closeModal();
-    loadTasks(CURRENT_TASKS_TAB);
-    refreshNotifBadge();
-  } catch (e) { toast(e.message,'error'); }
+  const meaning = decision === 'approve'
+    ? `I have reviewed the executed PM "${assignmentId}" and the responses are complete and correct. Forwarding to the Approver.`
+    : `I reject the executed PM "${assignmentId}" and return it to the Executor for rework. Reason: ${reason}`;
+  openESignatureModal({
+    title: `Sign — Review Execution ${assignmentId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/assignments/${assignmentId}/review`, { decision, reason, ...esig });
+      toast(decision === 'approve' ? 'Review passed — sent to approver.' : 'Returned to executor for rework.', 'success');
+      closeModal();
+      loadTasks(CURRENT_TASKS_TAB);
+      refreshNotifBadge();
+    }
+  });
 }
 async function assignmentApproveDecision(assignmentId, decision) {
   let reason = null;
@@ -2954,13 +3052,20 @@ async function assignmentApproveDecision(assignmentId, decision) {
     reason = prompt('Reason for rejection (will be shown to executor + reviewer):');
     if (!reason) return;
   }
-  try {
-    await api('PUT', `/api/assignments/${assignmentId}/approve`, { decision, reason });
-    toast(decision === 'approve' ? 'Approved & closed.' : 'Returned to executor for rework.', 'success');
-    closeModal();
-    loadTasks(CURRENT_TASKS_TAB);
-    refreshNotifBadge();
-  } catch (e) { toast(e.message,'error'); }
+  const meaning = decision === 'approve'
+    ? `I approve the executed PM "${assignmentId}". The maintenance has been performed and documented per GMP. The PM cycle is closed.`
+    : `I reject the executed PM "${assignmentId}" at approval and return it to the Executor for rework. Reason: ${reason}`;
+  openESignatureModal({
+    title: `Sign — Approve Execution ${assignmentId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/assignments/${assignmentId}/approve`, { decision, reason, ...esig });
+      toast(decision === 'approve' ? 'Approved & closed.' : 'Returned to executor for rework.', 'success');
+      closeModal();
+      loadTasks(CURRENT_TASKS_TAB);
+      refreshNotifBadge();
+    }
+  });
 }
 
 // ===========================================================
