@@ -89,6 +89,9 @@ function createSchema() {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
+    -- Master tables share the same review/approve workflow columns: created_by, reviewer_id,
+    -- approver_id, reviewed_at, review_remarks, approved_at, approval_remarks. New rows start at
+    -- status='Pending Review' and only flip to 'Active' after both gates pass.
     CREATE TABLE IF NOT EXISTS plants (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       plant_id TEXT UNIQUE NOT NULL,
@@ -96,7 +99,12 @@ function createSchema() {
       name TEXT NOT NULL,
       location TEXT,
       version TEXT,
-      status TEXT NOT NULL DEFAULT 'Active',
+      status TEXT NOT NULL DEFAULT 'Pending Review',
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT, review_remarks TEXT,
+      approved_at TEXT, approval_remarks TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       modified_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
@@ -106,7 +114,12 @@ function createSchema() {
       block_id TEXT UNIQUE NOT NULL,
       plant_id TEXT NOT NULL,
       name TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'Active',
+      status TEXT NOT NULL DEFAULT 'Pending Review',
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT, review_remarks TEXT,
+      approved_at TEXT, approval_remarks TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -115,7 +128,12 @@ function createSchema() {
       formulation_id TEXT UNIQUE NOT NULL,
       name TEXT NOT NULL,
       department TEXT,
-      status TEXT NOT NULL DEFAULT 'Active'
+      status TEXT NOT NULL DEFAULT 'Pending Review',
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT, review_remarks TEXT,
+      approved_at TEXT, approval_remarks TEXT
     );
 
     CREATE TABLE IF NOT EXISTS locations (
@@ -124,7 +142,12 @@ function createSchema() {
       block_id TEXT NOT NULL,
       description TEXT,
       formulation_id INTEGER REFERENCES formulations(id),
-      status TEXT NOT NULL DEFAULT 'Active'
+      status TEXT NOT NULL DEFAULT 'Pending Review',
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT, review_remarks TEXT,
+      approved_at TEXT, approval_remarks TEXT
     );
 
     CREATE TABLE IF NOT EXISTS areas (
@@ -132,7 +155,12 @@ function createSchema() {
       area_id TEXT UNIQUE NOT NULL,
       location_id TEXT NOT NULL,
       name TEXT,
-      status TEXT NOT NULL DEFAULT 'Active'
+      status TEXT NOT NULL DEFAULT 'Pending Review',
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT, review_remarks TEXT,
+      approved_at TEXT, approval_remarks TEXT
     );
 
     CREATE TABLE IF NOT EXISTS equipment (
@@ -144,8 +172,13 @@ function createSchema() {
       serial TEXT,
       capacity TEXT,
       area_id TEXT,
-      status TEXT NOT NULL DEFAULT 'Active',
+      status TEXT NOT NULL DEFAULT 'Pending Review',
       qr_code TEXT,
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT, review_remarks TEXT,
+      approved_at TEXT, approval_remarks TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -363,6 +396,8 @@ const BUILTIN_ACTIVITIES = [
   ['manage_plants',          'Manage Plants & Blocks',    'Masters'],
   ['view_equipment',         'View Equipment',            'Masters'],
   ['manage_equipment',       'Add / Edit Equipment',      'Masters'],
+  ['review_master',          'Review Master Data',        'Masters'],
+  ['approve_master',         'Approve Master Data',       'Masters'],
   // PM lifecycle
   ['view_pm',                'View PM Schedules',         'PM Lifecycle'],
   ['create_pm',              'Create PM Schedule',        'PM Lifecycle'],
@@ -503,6 +538,17 @@ function migrateSchema() {
   addColIfMissing('frequencies', 'status', "TEXT NOT NULL DEFAULT 'Active'");
   addColIfMissing('pm_categories', 'status', "TEXT NOT NULL DEFAULT 'Active'");
   addColIfMissing('pm_categories', 'description', 'TEXT');
+
+  // Master-data review / approve workflow columns — applied uniformly across all 6 masters.
+  for (const t of ['plants','blocks','formulations','locations','areas','equipment']) {
+    addColIfMissing(t, 'created_by',        'INTEGER');
+    addColIfMissing(t, 'reviewer_id',       'INTEGER');
+    addColIfMissing(t, 'approver_id',       'INTEGER');
+    addColIfMissing(t, 'reviewed_at',       'TEXT');
+    addColIfMissing(t, 'review_remarks',    'TEXT');
+    addColIfMissing(t, 'approved_at',       'TEXT');
+    addColIfMissing(t, 'approval_remarks',  'TEXT');
+  }
 }
 
 function initAndSeed(force=false) {

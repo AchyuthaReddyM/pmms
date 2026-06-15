@@ -230,15 +230,116 @@ function checkId(label, value) {
   return null;
 }
 
+// Master-data approval helpers — every Plants/Blocks/Locations/Areas/Formulations/Equipment
+// creation now requires a Reviewer and an Approver picked at creation time, and goes through:
+//   Pending Review (reviewer signs)  →  Pending Approval (approver signs)  →  Active
+//   or  →  Rejected (with remarks) at any stage.
+function validateMasterApprovers(creatorId, reviewer_id, approver_id) {
+  if (!reviewer_id) return 'Reviewer is required';
+  if (!approver_id) return 'Approver is required';
+  reviewer_id = Number(reviewer_id);
+  approver_id = Number(approver_id);
+  if (reviewer_id === approver_id) return 'Reviewer and Approver must be different users';
+  if (creatorId && reviewer_id === creatorId) return 'Creator cannot also be the Reviewer';
+  if (creatorId && approver_id === creatorId) return 'Creator cannot also be the Approver';
+  const rv = db.prepare('SELECT id, name FROM users WHERE id=?').get(reviewer_id);
+  const ap = db.prepare('SELECT id, name FROM users WHERE id=?').get(approver_id);
+  if (!rv) return 'Unknown reviewer';
+  if (!ap) return 'Unknown approver';
+  return null;
+}
+
+// addMasterApprovalRoutes — generates /review and /approve endpoints for a master table.
+//   masterName  = URL segment, e.g. 'plants'
+//   tableName   = SQL table, e.g. 'plants'
+//   pkCol       = string PK column, e.g. 'plant_id'
+//   displayName = audit entity label, e.g. 'Plant'
+function addMasterApprovalRoutes(masterName, tableName, pkCol, displayName) {
+  app.put(`/api/${masterName}/:id/review`, requireAuth, requireActivity('review_master'), (req, res) => {
+    const { decision, remarks } = req.body || {};
+    const row = db.prepare(`SELECT * FROM ${tableName} WHERE ${pkCol}=?`).get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    if (row.status !== 'Pending Review') return res.status(409).json({ error: `Not in Pending Review (currently ${row.status})` });
+    if (row.reviewer_id !== req.user.id && !req.user.is_admin) {
+      return res.status(403).json({ error: `Only the assigned reviewer can review this ${displayName.toLowerCase()}` });
+    }
+    if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+
+    if (decision === 'approve') {
+      db.prepare(`UPDATE ${tableName} SET status='Pending Approval', reviewed_at=datetime('now'), review_remarks=? WHERE ${pkCol}=?`)
+        .run(remarks || null, req.params.id);
+      if (row.approver_id) {
+        notify(row.approver_id, `${displayName} awaiting your approval`,
+          `${row[pkCol]} reviewed by ${req.user.name}.`, 'master_approve', `/masters/${masterName}/${row[pkCol]}`);
+      }
+      audit(req.user, 'REVIEW', displayName, row[pkCol], `Reviewed${remarks ? ': ' + remarks : ''} — passed to approver`);
+    } else {
+      if (!remarks || !remarks.trim()) return res.status(400).json({ error: 'remarks required for rejection' });
+      db.prepare(`UPDATE ${tableName} SET status='Rejected', review_remarks=?, reviewed_at=datetime('now') WHERE ${pkCol}=?`)
+        .run(remarks, req.params.id);
+      if (row.created_by) {
+        notify(row.created_by, `${displayName} rejected at review`,
+          `${row[pkCol]}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
+      }
+      audit(req.user, 'REJECT', displayName, row[pkCol], `Rejected at review: ${remarks}`);
+    }
+    res.json({ ok: true });
+  });
+
+  app.put(`/api/${masterName}/:id/approve`, requireAuth, requireActivity('approve_master'), (req, res) => {
+    const { decision, remarks } = req.body || {};
+    const row = db.prepare(`SELECT * FROM ${tableName} WHERE ${pkCol}=?`).get(req.params.id);
+    if (!row) return res.status(404).json({ error: 'Not found' });
+    if (row.status !== 'Pending Approval') return res.status(409).json({ error: `Not in Pending Approval (currently ${row.status})` });
+    if (row.approver_id !== req.user.id && !req.user.is_admin) {
+      return res.status(403).json({ error: `Only the assigned approver can approve this ${displayName.toLowerCase()}` });
+    }
+
+    if (decision === 'reject') {
+      if (!remarks || !remarks.trim()) return res.status(400).json({ error: 'remarks required for rejection' });
+      db.prepare(`UPDATE ${tableName} SET status='Rejected', approval_remarks=?, approved_at=datetime('now') WHERE ${pkCol}=?`)
+        .run(remarks, req.params.id);
+      if (row.created_by) {
+        notify(row.created_by, `${displayName} rejected at approval`,
+          `${row[pkCol]}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
+      }
+      if (row.reviewer_id && row.reviewer_id !== req.user.id) {
+        notify(row.reviewer_id, `${displayName} rejected by approver`,
+          `${row[pkCol]}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
+      }
+      audit(req.user, 'REJECT', displayName, row[pkCol], `Rejected at approval: ${remarks}`);
+    } else {
+      db.prepare(`UPDATE ${tableName} SET status='Active', approval_remarks=?, approved_at=datetime('now') WHERE ${pkCol}=?`)
+        .run(remarks || null, req.params.id);
+      if (row.created_by) {
+        notify(row.created_by, `${displayName} approved`,
+          `${row[pkCol]} is now Active.`, 'master_approved', `/masters/${masterName}/${row[pkCol]}`);
+      }
+      if (row.reviewer_id && row.reviewer_id !== req.user.id) {
+        notify(row.reviewer_id, `${displayName} approved`,
+          `${row[pkCol]} has been approved.`, 'master_approved', `/masters/${masterName}/${row[pkCol]}`);
+      }
+      audit(req.user, 'APPROVE', displayName, row[pkCol], `Approved${remarks ? ' — ' + remarks : ''} — now Active`);
+    }
+    res.json({ ok: true });
+  });
+}
+
 app.post('/api/plants', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { plant_id, name, location } = req.body || {};
+  const { plant_id, name, location, reviewer_id, approver_id } = req.body || {};
   const idErr = checkId('Plant ID', plant_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!name) return res.status(400).json({ error: 'Plant Name is required' });
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   if (db.prepare('SELECT 1 FROM plants WHERE plant_id=?').get(plant_id)) {
     return res.status(409).json({ error: `Plant ID "${plant_id}" already exists` });
   }
-  db.prepare('INSERT INTO plants(plant_id,name,location) VALUES (?,?,?)').run(plant_id, name, location || '');
-  audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}" at ${location || '-'}`);
+  db.prepare(`INSERT INTO plants(plant_id,name,location,status,created_by,reviewer_id,approver_id)
+              VALUES (?,?,?,'Pending Review',?,?,?)`)
+    .run(plant_id, name, location || '', req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}" at ${location || '-'} — submitted for review`);
+  notify(Number(reviewer_id), 'Plant awaiting your review',
+    `${plant_id} — "${name}" submitted by ${req.user.name}`, 'master_review', `/masters/plants/${plant_id}`);
   res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(plant_id));
 });
 app.put('/api/plants/:plant_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
@@ -271,28 +372,41 @@ app.get('/api/blocks', requireAuth, (req, res) => {
   res.json(rows);
 });
 app.post('/api/blocks', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { block_id, plant_id, name } = req.body || {};
+  const { block_id, plant_id, name, reviewer_id, approver_id } = req.body || {};
   const idErr = checkId('Block ID', block_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!plant_id) return res.status(400).json({ error: 'Plant is required' });
   if (!name) return res.status(400).json({ error: 'Block Name is required' });
-  const plant = db.prepare('SELECT name FROM plants WHERE plant_id=?').get(plant_id);
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
+  const plant = db.prepare('SELECT name, status FROM plants WHERE plant_id=?').get(plant_id);
   if (!plant) return res.status(400).json({ error: 'Unknown plant_id' });
+  if (plant.status !== 'Active') return res.status(400).json({ error: `Parent plant is "${plant.status}" — only Active plants accept blocks` });
   if (db.prepare('SELECT 1 FROM blocks WHERE block_id=?').get(block_id)) {
     return res.status(409).json({ error: `Block ID "${block_id}" already exists` });
   }
-  db.prepare('INSERT INTO blocks(block_id,plant_id,name) VALUES (?,?,?)').run(block_id, plant_id, name);
-  audit(req.user, 'CREATE', 'Block', block_id, `Block "${name}" under plant ${plant_id} (${plant.name})`);
+  db.prepare(`INSERT INTO blocks(block_id,plant_id,name,status,created_by,reviewer_id,approver_id)
+              VALUES (?,?,?,'Pending Review',?,?,?)`)
+    .run(block_id, plant_id, name, req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'Block', block_id, `Block "${name}" under plant ${plant_id} (${plant.name}) — submitted for review`);
+  notify(Number(reviewer_id), 'Block awaiting your review',
+    `${block_id} — "${name}" submitted by ${req.user.name}`, 'master_review', `/masters/blocks/${block_id}`);
   res.json(db.prepare('SELECT * FROM blocks WHERE block_id=?').get(block_id));
 });
 
 // FORMULATIONS
 app.get('/api/formulations', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM formulations ORDER BY formulation_id').all()));
 app.post('/api/formulations', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { name, department } = req.body || {};
+  const { name, department, reviewer_id, approver_id } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   const formulation_id = nextId('FRM-', 'formulations', 'formulation_id');
-  db.prepare('INSERT INTO formulations(formulation_id,name,department) VALUES (?,?,?)').run(formulation_id, name, department || '');
-  audit(req.user, 'CREATE', 'Formulation', formulation_id, `"${name}" under "${department || '—'}"`);
+  db.prepare(`INSERT INTO formulations(formulation_id,name,department,status,created_by,reviewer_id,approver_id)
+              VALUES (?,?,?,'Pending Review',?,?,?)`)
+    .run(formulation_id, name, department || '', req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'Formulation', formulation_id, `"${name}" under "${department || '—'}" — submitted for review`);
+  notify(Number(reviewer_id), 'Formulation awaiting your review',
+    `${formulation_id} — "${name}" submitted by ${req.user.name}`, 'master_review', `/masters/formulations/${formulation_id}`);
   res.json(db.prepare('SELECT * FROM formulations WHERE formulation_id=?').get(formulation_id));
 });
 app.put('/api/formulations/:formulation_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
@@ -314,25 +428,32 @@ app.get('/api/locations', requireAuth, (req,res) => res.json(db.prepare(`
 app.post('/api/locations', requireAuth, requireActivity('manage_plants'), (req, res) => {
   // 'description' is the Location Name in our schema (renamed in the UI).
   // Accept both 'name' and 'description' for forward-compat.
-  const { location_id, block_id, name, description, formulation_id } = req.body || {};
+  const { location_id, block_id, name, description, formulation_id, reviewer_id, approver_id } = req.body || {};
   const locName = name || description;
   const idErr = checkId('Location ID', location_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!block_id) return res.status(400).json({ error: 'Block is required' });
   if (!locName) return res.status(400).json({ error: 'Location Name is required' });
-  const block = db.prepare('SELECT name FROM blocks WHERE block_id=?').get(block_id);
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
+  const block = db.prepare('SELECT name, status FROM blocks WHERE block_id=?').get(block_id);
   if (!block) return res.status(400).json({ error: 'Unknown block_id' });
+  if (block.status !== 'Active') return res.status(400).json({ error: `Parent block is "${block.status}" — only Active blocks accept locations` });
   let formName = null;
   if (formulation_id) {
-    const f = db.prepare('SELECT name FROM formulations WHERE id=?').get(formulation_id);
+    const f = db.prepare('SELECT name, status FROM formulations WHERE id=?').get(formulation_id);
     if (!f) return res.status(400).json({ error: 'Unknown formulation_id' });
+    if (f.status !== 'Active') return res.status(400).json({ error: `Selected formulation is "${f.status}" — only Active formulations may be linked` });
     formName = f.name;
   }
   if (db.prepare('SELECT 1 FROM locations WHERE location_id=?').get(location_id)) {
     return res.status(409).json({ error: `Location ID "${location_id}" already exists` });
   }
-  db.prepare('INSERT INTO locations(location_id,block_id,description,formulation_id) VALUES (?,?,?,?)')
-    .run(location_id, block_id, locName, formulation_id || null);
-  audit(req.user, 'CREATE', 'Location', location_id, `"${locName}" under block ${block_id} (${block.name})${formName?` [${formName}]`:''}`);
+  db.prepare(`INSERT INTO locations(location_id,block_id,description,formulation_id,status,created_by,reviewer_id,approver_id)
+              VALUES (?,?,?,?,'Pending Review',?,?,?)`)
+    .run(location_id, block_id, locName, formulation_id || null, req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'Location', location_id, `"${locName}" under block ${block_id} (${block.name})${formName?` [${formName}]`:''} — submitted for review`);
+  notify(Number(reviewer_id), 'Location awaiting your review',
+    `${location_id} — "${locName}" submitted by ${req.user.name}`, 'master_review', `/masters/locations/${location_id}`);
   res.json(db.prepare('SELECT * FROM locations WHERE location_id=?').get(location_id));
 });
 app.put('/api/locations/:location_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
@@ -352,18 +473,25 @@ app.put('/api/locations/:location_id', requireAuth, requireActivity('manage_plan
 app.get('/api/areas', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM areas ORDER BY area_id').all()));
 app.post('/api/areas', requireAuth, requireActivity('manage_plants'), (req, res) => {
   // Accept both 'name' (new) and 'area_type' (legacy) from the client.
-  const { area_id, location_id, name, area_type } = req.body || {};
+  const { area_id, location_id, name, area_type, reviewer_id, approver_id } = req.body || {};
   const areaName = name || area_type;
   const idErr = checkId('Area ID', area_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!location_id) return res.status(400).json({ error: 'Location is required' });
   if (!areaName) return res.status(400).json({ error: 'Area Name is required' });
-  const loc = db.prepare('SELECT description FROM locations WHERE location_id=?').get(location_id);
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
+  const loc = db.prepare('SELECT description, status FROM locations WHERE location_id=?').get(location_id);
   if (!loc) return res.status(400).json({ error: 'Unknown location_id' });
+  if (loc.status !== 'Active') return res.status(400).json({ error: `Parent location is "${loc.status}" — only Active locations accept areas` });
   if (db.prepare('SELECT 1 FROM areas WHERE area_id=?').get(area_id)) {
     return res.status(409).json({ error: `Area ID "${area_id}" already exists` });
   }
-  db.prepare('INSERT INTO areas(area_id,location_id,name) VALUES (?,?,?)').run(area_id, location_id, areaName);
-  audit(req.user, 'CREATE', 'Area', area_id, `"${areaName}" under location ${location_id} (${loc.description})`);
+  db.prepare(`INSERT INTO areas(area_id,location_id,name,status,created_by,reviewer_id,approver_id)
+              VALUES (?,?,?,'Pending Review',?,?,?)`)
+    .run(area_id, location_id, areaName, req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'Area', area_id, `"${areaName}" under location ${location_id} (${loc.description}) — submitted for review`);
+  notify(Number(reviewer_id), 'Area awaiting your review',
+    `${area_id} — "${areaName}" submitted by ${req.user.name}`, 'master_review', `/masters/areas/${area_id}`);
   res.json(db.prepare('SELECT * FROM areas WHERE area_id=?').get(area_id));
 });
 app.put('/api/areas/:area_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
@@ -384,10 +512,15 @@ app.get('/api/equipment/:equipment_id', requireAuth, (req,res) => {
   res.json(row);
 });
 app.post('/api/equipment', requireAuth, requireActivity('manage_equipment'), (req, res) => {
-  let { equipment_id, name, make, model, make_model, serial, capacity, area_id, status } = req.body || {};
+  let { equipment_id, name, make, model, make_model, serial, capacity, area_id, reviewer_id, approver_id } = req.body || {};
   const idErr = checkId('Equipment ID', equipment_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!name) return res.status(400).json({ error: 'Equipment Name is required' });
   if (!area_id) return res.status(400).json({ error: 'Area is required' });
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
+  const area = db.prepare('SELECT name, status FROM areas WHERE area_id=?').get(area_id);
+  if (!area) return res.status(400).json({ error: 'Unknown area_id' });
+  if (area.status !== 'Active') return res.status(400).json({ error: `Parent area is "${area.status}" — only Active areas accept equipment` });
   // Backwards compat: if legacy make_model passed, split into make/model.
   if (!make && !model && make_model) {
     const parts = String(make_model).split('/').map(s => s.trim());
@@ -396,12 +529,13 @@ app.post('/api/equipment', requireAuth, requireActivity('manage_equipment'), (re
   if (db.prepare('SELECT 1 FROM equipment WHERE equipment_id=?').get(equipment_id)) {
     return res.status(409).json({ error: `Equipment ID "${equipment_id}" already exists` });
   }
-  // Restrict status to Active / Inactive at this endpoint per spec.
-  const safeStatus = (status === 'Inactive') ? 'Inactive' : 'Active';
-  db.prepare(`INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,status,qr_code)
-              VALUES (?,?,?,?,?,?,?,?,?)`)
-    .run(equipment_id, name, make||'', model||'', serial||'', capacity||'', area_id, safeStatus, `QR:${equipment_id}`);
-  audit(req.user, 'CREATE', 'Equipment', equipment_id, `Registered: ${name} — ${make||'—'} ${model||''}${serial?` (SN ${serial})`:''} @ ${area_id}`);
+  db.prepare(`INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,status,qr_code,created_by,reviewer_id,approver_id)
+              VALUES (?,?,?,?,?,?,?,'Pending Review',?,?,?,?)`)
+    .run(equipment_id, name, make||'', model||'', serial||'', capacity||'', area_id, `QR:${equipment_id}`,
+         req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'Equipment', equipment_id, `Registered: ${name} — ${make||'—'} ${model||''}${serial?` (SN ${serial})`:''} @ ${area_id} — submitted for review`);
+  notify(Number(reviewer_id), 'Equipment awaiting your review',
+    `${equipment_id} — "${name}" submitted by ${req.user.name}`, 'master_review', `/masters/equipment/${equipment_id}`);
   res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(equipment_id));
 });
 app.put('/api/equipment/:equipment_id', requireAuth, requireActivity('manage_equipment'), (req, res) => {
@@ -424,6 +558,37 @@ app.put('/api/equipment/:equipment_id', requireAuth, requireActivity('manage_equ
   if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
   audit(req.user, 'UPDATE', 'Equipment', req.params.equipment_id, 'Equipment modified');
   res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(req.params.equipment_id));
+});
+
+// Master-data review/approve endpoints (Plants / Blocks / Locations / Areas / Formulations / Equipment).
+// Every master listed here gets:
+//   PUT /api/<master>/:id/review   { decision:'approve'|'reject', remarks }
+//   PUT /api/<master>/:id/approve  { decision:'approve'|'reject', remarks }
+addMasterApprovalRoutes('plants',       'plants',       'plant_id',       'Plant');
+addMasterApprovalRoutes('blocks',       'blocks',       'block_id',       'Block');
+addMasterApprovalRoutes('locations',    'locations',    'location_id',    'Location');
+addMasterApprovalRoutes('areas',        'areas',        'area_id',        'Area');
+addMasterApprovalRoutes('formulations', 'formulations', 'formulation_id', 'Formulation');
+addMasterApprovalRoutes('equipment',    'equipment',    'equipment_id',   'Equipment');
+
+// Per-user "what masters are waiting on me?" — pulled into the bell + dashboard.
+app.get('/api/masters/my-queue', requireAuth, (req, res) => {
+  const out = { review: [], approve: [] };
+  const masters = [
+    { name: 'plants',       table: 'plants',       pk: 'plant_id',       label: 'Plant' },
+    { name: 'blocks',       table: 'blocks',       pk: 'block_id',       label: 'Block' },
+    { name: 'locations',    table: 'locations',    pk: 'location_id',    label: 'Location' },
+    { name: 'areas',        table: 'areas',        pk: 'area_id',        label: 'Area' },
+    { name: 'formulations', table: 'formulations', pk: 'formulation_id', label: 'Formulation' },
+    { name: 'equipment',    table: 'equipment',    pk: 'equipment_id',   'label': 'Equipment' },
+  ];
+  for (const m of masters) {
+    const r = db.prepare(`SELECT ${m.pk} AS id, status FROM ${m.table} WHERE status='Pending Review' AND reviewer_id=?`).all(req.user.id);
+    const a = db.prepare(`SELECT ${m.pk} AS id, status FROM ${m.table} WHERE status='Pending Approval' AND approver_id=?`).all(req.user.id);
+    for (const x of r) out.review.push({ master: m.name, label: m.label, id: x.id });
+    for (const x of a) out.approve.push({ master: m.name, label: m.label, id: x.id });
+  }
+  res.json(out);
 });
 
 // =============================================================

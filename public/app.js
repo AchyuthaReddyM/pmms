@@ -249,11 +249,91 @@ function severityPill(s) {
 // ===========================================================
 // MASTERS
 // ===========================================================
+// ---------- Master approval helpers (shared by every master form) ----------
+async function loadActiveUsers() {
+  try {
+    const users = await api('GET','/api/users');
+    return (users || []).filter(u => u.status === 'Active');
+  } catch (e) { return []; }
+}
+function masterApproverFields(users) {
+  const meId = CURRENT_USER && CURRENT_USER.id;
+  const opts = users
+    .filter(u => u.id !== meId)
+    .map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role || '')}${u.department ? ' / '+escapeHtml(u.department):''}</option>`)
+    .join('');
+  return `
+    <hr style="margin:14px 0; border:none; border-top:1px solid var(--border);" />
+    <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">REVIEW &amp; APPROVAL WORKFLOW</div>
+    <div class="form-row"><label>Reviewer *</label>
+      <select name="reviewer_id" required>
+        <option value="">— select reviewer —</option>${opts}
+      </select>
+    </div>
+    <div class="form-row"><label>Approver *</label>
+      <select name="approver_id" required>
+        <option value="">— select approver —</option>${opts}
+      </select>
+    </div>
+    <p style="font-size:11px; color:var(--muted); margin:4px 0 0;">Reviewer and Approver must be different people, and neither can be you. The record will be created in <strong>Pending Review</strong> and only goes Active after both sign off.</p>`;
+}
+function masterRowActions(master, r) {
+  if (!CURRENT_USER) return '';
+  const me = CURRENT_USER.id;
+  const buttons = [];
+  if (r.status === 'Pending Review' && (r.reviewer_id === me || CURRENT_USER.is_admin)) {
+    buttons.push(`<button class="btn ghost sm" onclick="openMasterDecisionModal('${master}','${escapeHtml(r.__pk)}','review')">📝 Review</button>`);
+  }
+  if (r.status === 'Pending Approval' && (r.approver_id === me || CURRENT_USER.is_admin)) {
+    buttons.push(`<button class="btn ghost sm" onclick="openMasterDecisionModal('${master}','${escapeHtml(r.__pk)}','approve')">✅ Approve</button>`);
+  }
+  return buttons.join(' ');
+}
+async function openMasterDecisionModal(master, id, stage) {
+  // stage = 'review' | 'approve'
+  const verb = stage === 'review' ? 'Review' : 'Approve';
+  const approveLabel = stage === 'review' ? 'Forward to Approver' : 'Approve & Activate';
+  // Stash a global reject handler so the Reject button (rendered as a plain button
+  // outside the submit flow) can read the textarea + call the API.
+  window.__masterRejectFn = async () => {
+    const ta = document.querySelector('textarea[name="masterRemarks"]');
+    const remarks = ta ? ta.value.trim() : '';
+    if (!remarks) { toast('Remarks are required for rejection', 'error'); return; }
+    try {
+      await api('PUT', `/api/${master}/${encodeURIComponent(id)}/${stage}`, { decision:'reject', remarks });
+      toast('Rejected.', 'success');
+      closeModal();
+      loadMasters(CURRENT_MASTER);
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  openModal({
+    title: `${verb} — ${master.slice(0,-1).replace(/^./,c=>c.toUpperCase())} ${id}`,
+    width: 500,
+    body: `
+      <p style="font-size:12px; color:var(--muted); margin-top:0;">
+        ${stage === 'review'
+          ? 'Reviewing this record will pass it to the assigned Approver. Rejecting sends it back to the creator with your remarks.'
+          : 'Approving this record marks it as Active and visible everywhere. Rejecting returns it to the creator with your remarks.'}
+      </p>
+      <div class="form-row"><label>Remarks</label>
+        <textarea name="masterRemarks" rows="3" placeholder="Optional for Approve · Required for Reject"></textarea>
+      </div>
+    `,
+    submitLabel: approveLabel,
+    actions: `<button type="button" class="btn ghost" style="color:#c53030; border-color:#fbd5d5;" onclick="window.__masterRejectFn()">✗ Reject</button>`,
+    onSubmit: async (data) => {
+      await api('PUT', `/api/${master}/${encodeURIComponent(id)}/${stage}`, { decision:'approve', remarks: (data.masterRemarks || '').trim() });
+      toast(stage === 'review' ? 'Reviewed — passed to Approver' : 'Approved — now Active', 'success');
+      loadMasters(CURRENT_MASTER);
+    }
+  });
+}
+
 const MASTER_DEFS = {
   plants: {
-    api: '/api/plants',
-    head: ['Plant ID','Plant Name','Plant Location','Status','Modified'],
-    row: r => [r.plant_id, r.name, r.location, statusPill(r.status), r.modified_at],
+    api: '/api/plants', pk: 'plant_id',
+    head: ['Plant ID','Plant Name','Plant Location','Status','Modified','Actions'],
+    row: r => { r.__pk = r.plant_id; return [r.plant_id, r.name, r.location, statusPill(r.status), r.modified_at, masterRowActions('plants', r)]; },
     canAdd: true,
     addFields: [
       { id:'plant_id', label:'Plant ID', required:true, placeholder:'e.g., PL-001, Unit-1, U-Hyd' },
@@ -263,9 +343,9 @@ const MASTER_DEFS = {
     create: (data) => api('POST','/api/plants',data),
   },
   blocks: {
-    api: '/api/blocks',
-    head: ['Plant','Block ID','Block Name','Status'],
-    row: r => [r.plant_id, r.block_id, r.name, statusPill(r.status)],
+    api: '/api/blocks', pk: 'block_id',
+    head: ['Plant','Block ID','Block Name','Status','Actions'],
+    row: r => { r.__pk = r.block_id; return [r.plant_id, r.block_id, r.name, statusPill(r.status), masterRowActions('blocks', r)]; },
     canAdd: true,
     addFields: [
       { id:'plant_id', label:'Plant ID', required:true, type:'remoteSelect', source:'/api/plants', valueKey:'plant_id', labelFn:r => `${r.plant_id} · ${r.name}` },
@@ -275,9 +355,9 @@ const MASTER_DEFS = {
     create: (data) => api('POST','/api/blocks',data),
   },
   formulations: {
-    api: '/api/formulations',
-    head: ['Formulation ID','Formulation Name','Status'],
-    row: r => [r.formulation_id, r.name, statusPill(r.status)],
+    api: '/api/formulations', pk: 'formulation_id',
+    head: ['Formulation ID','Formulation Name','Status','Actions'],
+    row: r => { r.__pk = r.formulation_id; return [r.formulation_id, r.name, statusPill(r.status), masterRowActions('formulations', r)]; },
     canAdd: true,
     addFields: [
       { id:'name', label:'Formulation Name', required:true, placeholder:'e.g., OSD, Injectable, Softgel, Bag Filling, Others' },
@@ -285,24 +365,32 @@ const MASTER_DEFS = {
     create: (data) => api('POST','/api/formulations',data),
   },
   locations: {
-    api: '/api/locations',
-    head: ['Location ID','Block','Location Name','Formulation','Status'],
-    row: r => [r.location_id, r.block_id, r.description, r.formulation_name || '—', statusPill(r.status)],
+    api: '/api/locations', pk: 'location_id',
+    head: ['Location ID','Block','Location Name','Formulation','Status','Actions'],
+    row: r => { r.__pk = r.location_id; return [r.location_id, r.block_id, r.description, r.formulation_name || '—', statusPill(r.status), masterRowActions('locations', r)]; },
     canAdd: true,
     customAdd: () => openLocationModal(),
   },
   areas: {
-    api: '/api/areas',
-    head: ['Area ID','Location','Area Name','Status'],
-    row: r => [r.area_id, r.location_id, r.name || r.area_type || '—', statusPill(r.status)],
+    api: '/api/areas', pk: 'area_id',
+    head: ['Area ID','Location','Area Name','Status','Actions'],
+    row: r => { r.__pk = r.area_id; return [r.area_id, r.location_id, r.name || r.area_type || '—', statusPill(r.status), masterRowActions('areas', r)]; },
     canAdd: true,
     customAdd: () => openAreaModal(),
   },
   equipment: {
-    api: '/api/equipment',
+    api: '/api/equipment', pk: 'equipment_id',
     head: ['Equipment ID','Equipment Name','Make','Model','Serial','Area','Status','QR','Actions'],
-    row: r => [r.equipment_id, r.name, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status), `<span title="${escapeHtml(r.qr_code)}">▣</span>`,
-               `<button class="btn ghost sm" onclick="openAssignChecklistModal(null, '${escapeHtml(r.equipment_id)}')">🎯 Assign</button>`],
+    row: r => {
+      r.__pk = r.equipment_id;
+      const wfBtn = masterRowActions('equipment', r);
+      const assignBtn = r.status === 'Active'
+        ? `<button class="btn ghost sm" onclick="openAssignChecklistModal(null, '${escapeHtml(r.equipment_id)}')">🎯 Assign</button>`
+        : '';
+      return [r.equipment_id, r.name, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status),
+              `<span title="${escapeHtml(r.qr_code)}">▣</span>`,
+              [wfBtn, assignBtn].filter(Boolean).join(' ')];
+    },
     canAdd: true,
     customAdd: () => openEquipmentModal(),
   },
@@ -330,7 +418,7 @@ async function openMasterAddModal() {
   if (!def.canAdd) return;
   // If a master defines its own modal, defer to it.
   if (typeof def.customAdd === 'function') return def.customAdd();
-  // Pre-load any remote select options
+  // Pre-load any remote select options + active users (for reviewer/approver)
   const remoteData = {};
   for (const f of def.addFields) {
     if (f.type === 'remoteSelect') {
@@ -338,6 +426,7 @@ async function openMasterAddModal() {
       catch (e) { remoteData[f.id] = []; }
     }
   }
+  const users = await loadActiveUsers();
   openModal({
     title: `Add ${CURRENT_MASTER.slice(0,-1).replace(/^./, c=>c.toUpperCase())}`,
     body: def.addFields.map(f => {
@@ -355,10 +444,13 @@ async function openMasterAddModal() {
       }
       return `<div class="form-row"><label>${f.label}${f.required?' *':''}</label>
         <input name="${f.id}" type="text" placeholder="${f.placeholder || ''}" ${f.required?'required':''} /></div>`;
-    }).join(''),
+    }).join('') + masterApproverFields(users),
+    submitLabel: 'Submit for Review',
     onSubmit: async (data) => {
+      if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
+      if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
       await def.create(data);
-      toast('Created.', 'success');
+      toast('Submitted for review.', 'success');
       loadMasters(CURRENT_MASTER);
     }
   });
@@ -367,9 +459,10 @@ async function openMasterAddModal() {
 // ----- Custom Location Master modal (Block dropdown -> auto-pop Block Name + ID + Name inputs) -----
 async function openLocationModal() {
   try {
-    const [blocks, formulations] = await Promise.all([
+    const [blocks, formulations, users] = await Promise.all([
       api('GET','/api/blocks'),
       api('GET','/api/formulations'),
+      loadActiveUsers(),
     ]);
     window.__lmOnBlock = () => {
       const sel = document.getElementById('lmBlockSel');
@@ -403,18 +496,23 @@ async function openLocationModal() {
         <div class="form-row"><label>Formulation</label>
           <select name="formulation_id">
             <option value="">— none —</option>
-            ${formulations.map(f => `<option value="${f.id}">${escapeHtml(f.name)}</option>`).join('')}
+            ${formulations.filter(f => f.status === 'Active').map(f => `<option value="${f.id}">${escapeHtml(f.name)}</option>`).join('')}
           </select>
         </div>
-      `,
+      ` + masterApproverFields(users),
+      submitLabel: 'Submit for Review',
       onSubmit: async (data) => {
+        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
+        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
         await api('POST','/api/locations', {
           location_id: data.location_id,
           block_id: data.block_id,
           name: data.name,
-          formulation_id: data.formulation_id ? Number(data.formulation_id) : null
+          formulation_id: data.formulation_id ? Number(data.formulation_id) : null,
+          reviewer_id: Number(data.reviewer_id),
+          approver_id: Number(data.approver_id),
         });
-        toast('Location created.', 'success');
+        toast('Location submitted for review.', 'success');
         loadMasters('locations');
       }
     });
@@ -424,9 +522,10 @@ async function openLocationModal() {
 // ----- Custom Area Master modal (Block + Location cascading, manual Area ID + Name) -----
 async function openAreaModal() {
   try {
-    const [blocks, locations] = await Promise.all([
+    const [blocks, locations, users] = await Promise.all([
       api('GET','/api/blocks'),
       api('GET','/api/locations'),
+      loadActiveUsers(),
     ]);
     const setAuto = (id, label, value) => {
       const el = document.getElementById(id);
@@ -476,11 +575,17 @@ async function openAreaModal() {
         <div class="form-row"><label>Area Name *</label>
           <input name="name" required placeholder="e.g., Classified — Grade D" />
         </div>
-      `,
+      ` + masterApproverFields(users),
+      submitLabel: 'Submit for Review',
       onSubmit: async (data) => {
         if (!data.location_id) throw new Error('Please select a Location');
-        await api('POST','/api/areas', { area_id: data.area_id, location_id: data.location_id, name: data.name });
-        toast('Area created.', 'success');
+        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
+        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        await api('POST','/api/areas', {
+          area_id: data.area_id, location_id: data.location_id, name: data.name,
+          reviewer_id: Number(data.reviewer_id), approver_id: Number(data.approver_id),
+        });
+        toast('Area submitted for review.', 'success');
         loadMasters('areas');
       }
     });
@@ -490,10 +595,11 @@ async function openAreaModal() {
 // ----- Custom Equipment Registration modal (cascading Block -> Location -> Area + manual Equipment ID + Make/Model) -----
 async function openEquipmentModal(existing) {
   try {
-    const [blocks, locations, areas] = await Promise.all([
+    const [blocks, locations, areas, users] = await Promise.all([
       api('GET','/api/blocks'),
       api('GET','/api/locations'),
       api('GET','/api/areas'),
+      loadActiveUsers(),
     ]);
     const setAuto = (id, label, value) => {
       const el = document.getElementById(id);
@@ -564,24 +670,34 @@ async function openEquipmentModal(existing) {
         <div class="form-row"><label>Make</label><input name="make" value="${escapeHtml(existing?.make || '')}" placeholder="e.g., Gansons" /></div>
         <div class="form-row"><label>Serial Number</label><input name="serial" value="${escapeHtml(existing?.serial || '')}" /></div>
         <div class="form-row"><label>Model Number</label><input name="model" value="${escapeHtml(existing?.model || '')}" placeholder="e.g., RMG-300" /></div>
-        <div class="form-row"><label>Status</label>
+        ${existing ? `<div class="form-row"><label>Status</label>
           <select name="status">
             ${['Active','Inactive'].map(s => `<option ${s===(existing?.status||'Active')?'selected':''}>${s}</option>`).join('')}
           </select>
-        </div>
+        </div>` : ''}
         <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">A QR code is generated automatically from the Equipment ID for shop-floor scanning.</p>
-      `,
+      ` + (existing ? '' : masterApproverFields(users)),
+      submitLabel: existing ? 'Save Changes' : 'Submit for Review',
       onSubmit: async (data) => {
         if (!data.area_id) throw new Error('Please select an Area');
         const payload = {
           equipment_id: data.equipment_id,
           name: data.name, make: data.make, model: data.model,
           serial: data.serial,
-          area_id: data.area_id, status: data.status
+          area_id: data.area_id,
         };
-        if (existing) await api('PUT', `/api/equipment/${existing.equipment_id}`, payload);
-        else          await api('POST','/api/equipment', payload);
-        toast(existing ? 'Equipment updated.' : 'Equipment registered.', 'success');
+        if (existing) {
+          payload.status = data.status;
+          await api('PUT', `/api/equipment/${existing.equipment_id}`, payload);
+          toast('Equipment updated.', 'success');
+        } else {
+          if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
+          if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+          payload.reviewer_id = Number(data.reviewer_id);
+          payload.approver_id = Number(data.approver_id);
+          await api('POST','/api/equipment', payload);
+          toast('Equipment submitted for review.', 'success');
+        }
         loadMasters('equipment');
       }
     });
