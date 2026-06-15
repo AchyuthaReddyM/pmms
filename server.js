@@ -230,7 +230,7 @@ function checkId(label, value) {
   return null;
 }
 
-app.post('/api/plants', requireAuth, requireRole('System Administrator'), (req, res) => {
+app.post('/api/plants', requireAuth, requireActivity('manage_plants'), (req, res) => {
   const { plant_id, name, location } = req.body || {};
   const idErr = checkId('Plant ID', plant_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!name) return res.status(400).json({ error: 'Plant Name is required' });
@@ -241,7 +241,7 @@ app.post('/api/plants', requireAuth, requireRole('System Administrator'), (req, 
   audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}" at ${location || '-'}`);
   res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(plant_id));
 });
-app.put('/api/plants/:plant_id', requireAuth, requireRole('System Administrator'), (req, res) => {
+app.put('/api/plants/:plant_id', requireAuth, requireActivity('manage_plants'), (req, res) => {
   const { name, unit_number, location, version, status } = req.body || {};
   const before = db.prepare('SELECT * FROM plants WHERE plant_id=?').get(req.params.plant_id);
   if (!before) return res.status(404).json({ error: 'Not found' });
@@ -270,7 +270,7 @@ app.get('/api/blocks', requireAuth, (req, res) => {
     : db.prepare('SELECT * FROM blocks ORDER BY block_id').all();
   res.json(rows);
 });
-app.post('/api/blocks', requireAuth, requireRole('System Administrator'), (req, res) => {
+app.post('/api/blocks', requireAuth, requireActivity('manage_plants'), (req, res) => {
   const { block_id, plant_id, name } = req.body || {};
   const idErr = checkId('Block ID', block_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!plant_id) return res.status(400).json({ error: 'Plant is required' });
@@ -383,7 +383,7 @@ app.get('/api/equipment/:equipment_id', requireAuth, (req,res) => {
   if (!row) return res.status(404).json({ error: 'Not found' });
   res.json(row);
 });
-app.post('/api/equipment', requireAuth, requireRole('System Administrator','Engineering'), (req, res) => {
+app.post('/api/equipment', requireAuth, requireActivity('manage_equipment'), (req, res) => {
   let { equipment_id, name, make, model, make_model, serial, capacity, area_id, status } = req.body || {};
   const idErr = checkId('Equipment ID', equipment_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!name) return res.status(400).json({ error: 'Equipment Name is required' });
@@ -404,7 +404,7 @@ app.post('/api/equipment', requireAuth, requireRole('System Administrator','Engi
   audit(req.user, 'CREATE', 'Equipment', equipment_id, `Registered: ${name} — ${make||'—'} ${model||''}${serial?` (SN ${serial})`:''} @ ${area_id}`);
   res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(equipment_id));
 });
-app.put('/api/equipment/:equipment_id', requireAuth, requireRole('System Administrator','Engineering'), (req, res) => {
+app.put('/api/equipment/:equipment_id', requireAuth, requireActivity('manage_equipment'), (req, res) => {
   const f = req.body || {};
   // Backwards compat for legacy make_model
   if (!f.make && !f.model && f.make_model) {
@@ -820,7 +820,7 @@ app.get('/api/pm/:pm_id', requireAuth, (req, res) => {
   res.json(s);
 });
 
-app.post('/api/pm', requireAuth, requireRole('System Administrator','Engineering','Approver','QA'), (req, res) => {
+app.post('/api/pm', requireAuth, requireActivity('create_pm'), (req, res) => {
   const f = req.body;
   if (!f.equipment_id || !f.frequency || !f.scheduled_date)
     return res.status(400).json({ error: 'equipment_id, frequency, scheduled_date required' });
@@ -845,7 +845,7 @@ app.post('/api/pm', requireAuth, requireRole('System Administrator','Engineering
 });
 
 // Approve PM
-app.put('/api/pm/:pm_id/approve', requireAuth, requireRole('System Administrator','Approver','Engineering'), (req, res) => {
+app.put('/api/pm/:pm_id/approve', requireAuth, requireActivity('approve_pm'), (req, res) => {
   const s = db.prepare('SELECT * FROM pm_schedules WHERE pm_id=?').get(req.params.pm_id);
   if (!s) return res.status(404).json({ error: 'Not found' });
   if (s.status !== 'Pending') return res.status(409).json({ error: `Cannot approve from status ${s.status}` });
@@ -856,7 +856,7 @@ app.put('/api/pm/:pm_id/approve', requireAuth, requireRole('System Administrator
 });
 
 // Assign technician
-app.put('/api/pm/:pm_id/assign', requireAuth, requireRole('System Administrator','Engineering','Approver'), (req, res) => {
+app.put('/api/pm/:pm_id/assign', requireAuth, requireActivity('assign_pm'), (req, res) => {
   const { technician_id } = req.body;
   if (!technician_id) return res.status(400).json({ error: 'technician_id required' });
   const tech = db.prepare('SELECT name FROM users WHERE id=?').get(technician_id);
