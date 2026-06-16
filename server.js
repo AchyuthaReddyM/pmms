@@ -123,33 +123,38 @@ function requireESignature(req, res, next) {
   const { esig_password, esig_meaning, esig_meaning_ack } = req.body || {};
   const actionLabel = `${req.method} ${req.originalUrl}`;
 
+  // IMPORTANT: e-signature validation failures use HTTP 403, NOT 401.
+  // The user IS authenticated (their session is valid) — they just failed the
+  // per-action identity challenge. Returning 401 would make the frontend
+  // force-log-them-out, masking the real error and corrupting the workflow.
+
   // 1) Acknowledgement of meaning is mandatory.
   if (!esig_meaning_ack || (esig_meaning_ack !== true && esig_meaning_ack !== 'true' && esig_meaning_ack !== 'on')) {
     audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, 'Meaning checkbox not acknowledged');
-    return res.status(401).json({ error: 'You must acknowledge the meaning of your signature to proceed.' });
+    return res.status(403).json({ error: 'You must acknowledge the meaning of your signature to proceed.' });
   }
 
   // 2) Meaning text must be present (frontend supplies a default per action).
   if (!esig_meaning || !String(esig_meaning).trim()) {
     audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, 'Meaning text missing');
-    return res.status(401).json({ error: 'Signature meaning is required.' });
+    return res.status(403).json({ error: 'Signature meaning is required.' });
   }
 
   // 3) Password must be present.
   if (!esig_password) {
     audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, 'No password supplied');
-    return res.status(401).json({ error: 'Please re-enter your password to sign this action.' });
+    return res.status(403).json({ error: 'Please re-enter your password to sign this action.' });
   }
 
   // 4) Verify against the live password_hash for THIS user (not a stale copy).
   const row = db.prepare('SELECT password_hash, status FROM users WHERE id=?').get(req.user.id);
   if (!row || row.status !== 'Active') {
     audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, `User not active (${row?.status || 'missing'})`);
-    return res.status(401).json({ error: 'Your account is not active. Cannot sign.' });
+    return res.status(403).json({ error: 'Your account is not active. Cannot sign.' });
   }
   if (!verifyPassword(esig_password, row.password_hash)) {
     audit(req.user, 'ESIGNATURE_FAIL', 'E-Signature', actionLabel, 'Wrong password');
-    return res.status(401).json({ error: 'Password incorrect. Signature rejected.' });
+    return res.status(403).json({ error: 'Password incorrect. Signature rejected. Please retype your password.' });
   }
 
   // 5) Success — record the signature, then proceed.
