@@ -2134,13 +2134,42 @@ app.put('/api/assignments/:assignment_id/request-clearance', requireAuth, requir
 // ---- Clearance step: Production user grants/denies BEFORE executor is assigned ----
 app.put('/api/assignments/:assignment_id/clearance', requireAuth, requireActivity('grant_clearance'), requireESignature, (req, res) => {
   const { decision, remarks } = req.body || {};
-  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  // Pull frequency tolerance via join so we can enforce the tolerance window.
+  const a = db.prepare(`
+    SELECT ca.*, f.tolerance_days AS freq_tolerance_days, f.name AS frequency_name
+    FROM checklist_assignments ca
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    WHERE ca.assignment_id=?
+  `).get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
   if (a.status !== 'Pending Clearance') return res.status(409).json({ error: `Cannot act on clearance — assignment is "${a.status}"` });
   if (a.clearance_user_id !== req.user.id && !req.user.is_admin) {
     return res.status(403).json({ error: 'Only the designated clearance user can grant or deny this clearance' });
   }
   if (!['grant','deny'].includes(decision)) return res.status(400).json({ error: 'decision must be "grant" or "deny"' });
+
+  // Tolerance enforcement (only when granting — denial is always allowed).
+  // The scheduled date is `effective_date`. The frequency carries a
+  // `tolerance_days` window. Clearance must be granted by
+  // (effective_date + tolerance_days). Past that, the row should go through
+  // the Expired Equipment / PNC-Exception path, not normal clearance.
+  if (decision === 'grant') {
+    const scheduled = a.effective_date || a.due_date;
+    const tol = Number(a.freq_tolerance_days ?? a.tolerance_days ?? 0);
+    if (scheduled) {
+      const sched = new Date(scheduled + 'T00:00:00Z');
+      const deadline = new Date(sched.getTime() + tol * 24 * 60 * 60 * 1000);
+      const todayUtc = new Date(new Date().toISOString().slice(0, 10) + 'T00:00:00Z');
+      if (todayUtc > deadline) {
+        const overdueDays = Math.floor((todayUtc - deadline) / (24 * 60 * 60 * 1000));
+        audit(req.user, 'CLEARANCE_BLOCKED', 'Assignment', req.params.assignment_id,
+          `Attempted to grant clearance ${overdueDays}d past tolerance window (scheduled ${scheduled}, +${tol}d tolerance). Use Expired Equipment / PNC-Exception flow.`);
+        return res.status(409).json({
+          error: `Cannot grant clearance — assignment is ${overdueDays} day(s) past the tolerance window. Scheduled ${scheduled}, +${tol} day tolerance. Route this through the Expired Equipment module with a PNC + Exception reference instead.`
+        });
+      }
+    }
+  }
 
   if (decision === 'grant') {
     db.prepare(`UPDATE checklist_assignments SET
@@ -2156,8 +2185,12 @@ app.put('/api/assignments/:assignment_id/clearance', requireAuth, requireActivit
         'awaiting_executor',
         `/assignments/${req.params.assignment_id}`);
     }
+    // Audit message captures the timestamp + tolerance window for the regulatory file.
+    const sched = a.effective_date || a.due_date;
+    const tol = Number(a.freq_tolerance_days ?? a.tolerance_days ?? 0);
+    const tolNote = sched ? ` · scheduled ${sched} (+${tol}d tol)` : '';
     audit(req.user, 'CLEARANCE_GRANT', 'Assignment', req.params.assignment_id,
-      `Granted by ${req.user.name}${remarks?` — ${remarks}`:''}`);
+      `Granted by ${req.user.name} at ${new Date().toISOString().slice(0,16).replace('T',' ')}${tolNote}${remarks?` — ${remarks}`:''}`);
   } else {
     if (!remarks || !remarks.trim()) return res.status(400).json({ error: 'Remarks required for denial' });
     db.prepare(`UPDATE checklist_assignments SET

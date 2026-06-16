@@ -2376,6 +2376,59 @@ async function loadAssignmentsPage() {
   } catch (e) { toast(e.message, 'error'); }
 }
 
+// ---- Tolerance / clearance display helpers -------------------------------------
+// Given an assignment row from /api/assignments, compute:
+//   scheduled  — YYYY-MM-DD (effective_date or due_date)
+//   tol        — tolerance window in days (from frequency)
+//   deadline   — YYYY-MM-DD (scheduled + tol days)
+//   responded  — Date object of clearance_responded_at, or null
+//   withinTol  — true/false/null (null if no scheduled date / no clearance)
+function computeToleranceMeta(a) {
+  const scheduled = a.effective_date || a.due_date || null;
+  const tol = Number(a.tolerance_days ?? 0);
+  if (!scheduled) return { scheduled: null, tol, deadline: null, responded: null, withinTol: null };
+  const sched = new Date(scheduled + 'T00:00:00Z');
+  const deadlineMs = sched.getTime() + tol * 24 * 60 * 60 * 1000;
+  const deadline = new Date(deadlineMs).toISOString().slice(0, 10);
+  let responded = null, withinTol = null;
+  if (a.clearance_responded_at) {
+    // SQLite returns 'YYYY-MM-DD HH:MM:SS' (UTC). Coerce to ISO for Date parsing.
+    responded = new Date(String(a.clearance_responded_at).replace(' ', 'T') + 'Z');
+    if (a.clearance_status === 'Granted') {
+      const dayOnly = new Date(responded.toISOString().slice(0, 10) + 'T00:00:00Z');
+      withinTol = dayOnly.getTime() <= deadlineMs;
+    }
+  }
+  return { scheduled, tol, deadline, responded, withinTol };
+}
+
+// Formats the clearance line shown inside My Tasks rows.
+function renderClearanceLine(a, meta) {
+  if (a.clearance_status === 'Granted' && a.clearance_responded_at) {
+    const ts = String(a.clearance_responded_at).replace(' ', ' ').slice(0, 16); // YYYY-MM-DD HH:MM
+    const tolBadge = meta.withinTol === false
+      ? '<span class="pill red" style="font-size:9px; margin-left:4px;">OUT OF TOLERANCE</span>'
+      : (meta.withinTol === true
+          ? '<span class="pill green" style="font-size:9px; margin-left:4px;">on time</span>'
+          : '');
+    return `<div style="font-size:11px; color:var(--green); margin-top:3px;">
+              ✓ Clearance granted ${escapeHtml(ts)}${tolBadge}
+            </div>`;
+  }
+  if (a.clearance_status === 'Denied' && a.clearance_responded_at) {
+    const ts = String(a.clearance_responded_at).slice(0, 16);
+    return `<div style="font-size:11px; color:var(--red); margin-top:3px;">
+              ✗ Clearance denied ${escapeHtml(ts)}
+            </div>`;
+  }
+  if (a.status === 'Pending Clearance') {
+    return `<div style="font-size:11px; color:#b78103; margin-top:3px;">
+              ⏳ Awaiting clearance${meta.deadline ? ` (by ${escapeHtml(meta.deadline)})` : ''}
+            </div>`;
+  }
+  return '';
+}
+
 async function loadTasks(tab) {
   CURRENT_TASKS_TAB = tab;
   document.querySelectorAll('#tasksTabs button').forEach(b => b.classList.toggle('active', b.dataset.tt === tab));
@@ -2392,6 +2445,10 @@ async function loadTasks(tab) {
       : rows.map(a => {
           const act = actionableForUser(a);
           const actBadge = act ? `<span class="pill ${act.tone}" style="font-size:9px; margin-left:6px;">${escapeHtml(act.label)}</span>` : '';
+          // Schedule + tolerance info — surfaces the regulatory date math directly in the row.
+          const tolMeta = computeToleranceMeta(a);
+          // Clearance grant timestamp — displayed prominently when it exists.
+          const clearanceLine = renderClearanceLine(a, tolMeta);
           return `<tr>
           <td><strong>${escapeHtml(a.assignment_id)}</strong>${actBadge}</td>
           <td>${escapeHtml(a.checklist_name || '')} <span style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_version || '')}</span></td>
@@ -2400,8 +2457,12 @@ async function loadTasks(tab) {
             ${escapeHtml(a.assignee_name || '— open —')}
             <div style="color:var(--muted); font-size:11px;">rev: ${escapeHtml(a.reviewer_name || '—')} · app: ${escapeHtml(a.approver_name || '—')}</div>
           </td>
-          <td>${escapeHtml(a.frequency || '—')}</td>
-          <td>${escapeHtml(a.due_date || a.effective_date || '—')}${a.effective_date && a.due_date ? `<div style="color:var(--muted); font-size:11px;">scheduled ${escapeHtml(a.effective_date)}</div>` : ''}</td>
+          <td>${escapeHtml(a.frequency || '—')}${a.tolerance_days != null ? `<div style="color:var(--muted); font-size:10px;">±${a.tolerance_days}d tolerance</div>` : ''}</td>
+          <td>
+            <strong>${escapeHtml(a.effective_date || a.due_date || '—')}</strong>
+            ${tolMeta.deadline ? `<div style="color:var(--muted); font-size:11px;">Window closes ${escapeHtml(tolMeta.deadline)}</div>` : ''}
+            ${clearanceLine}
+          </td>
           <td>${statusPill(a.status)}</td>
           <td><button class="btn ${act?'primary':'ghost'} sm" onclick="openAssignment('${escapeHtml(a.assignment_id)}')">${a.status==='Completed'?'View':'Open'}</button></td>
         </tr>`;
@@ -2967,9 +3028,20 @@ async function openAssignment(assignmentId) {
         &nbsp;→&nbsp; Approver <strong>${escapeHtml(a.approver_name || '—')}</strong>
         &nbsp;·&nbsp; Assigned by ${escapeHtml(a.assigned_by_name || '')}
       </div>
-      ${a.clearance_status === 'Granted' ? `<div style="margin-bottom:10px; padding:6px 12px; background:#eaf6ea; border-left:3px solid var(--green); border-radius:6px; font-size:12px;">
-        <strong>Clearance granted</strong> by ${escapeHtml(a.clearance_user_name || '—')}${a.clearance_responded_at?` on ${escapeHtml(a.clearance_responded_at)}`:''}${a.clearance_remarks?`<div style="color:var(--muted); margin-top:3px;">Remarks: ${escapeHtml(a.clearance_remarks)}</div>`:''}
-      </div>` : ''}
+      ${a.clearance_status === 'Granted' ? (() => {
+        const meta = computeToleranceMeta(a);
+        const ts = String(a.clearance_responded_at || '').slice(0, 16);
+        const tolBadge = meta.withinTol === false
+          ? '<span class="pill red" style="margin-left:6px;">OUT OF TOLERANCE</span>'
+          : (meta.withinTol === true
+              ? '<span class="pill green" style="margin-left:6px;">within tolerance window</span>'
+              : '');
+        return `<div style="margin-bottom:10px; padding:8px 12px; background:#eaf6ea; border-left:3px solid var(--green); border-radius:6px; font-size:12px;">
+          <strong>Clearance granted</strong> by ${escapeHtml(a.clearance_user_name || '—')} on <strong>${escapeHtml(ts)}</strong>${tolBadge}
+          ${meta.scheduled ? `<div style="color:var(--muted); margin-top:3px;">Scheduled ${escapeHtml(meta.scheduled)} · tolerance ±${meta.tol}d · window closed ${escapeHtml(meta.deadline)}</div>` : ''}
+          ${a.clearance_remarks?`<div style="color:var(--muted); margin-top:3px;">Remarks: ${escapeHtml(a.clearance_remarks)}</div>`:''}
+        </div>`;
+      })() : ''}
       ${a.status === 'Clearance Denied' ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fdecec; border-left:3px solid var(--red); border-radius:6px; font-size:12px;">
         <strong>Clearance denied:</strong> ${escapeHtml(a.clearance_remarks || '')}
       </div>` : ''}
@@ -3169,6 +3241,24 @@ async function assignmentRequestClearance(assignmentId) {
 // ---- Clearance / Executor-assignment actions ----
 async function assignmentClearanceDecision(assignmentId, decision) {
   let remarks = null;
+  // For a grant, fetch the assignment first so we can warn the user about the
+  // tolerance window BEFORE they go through the e-signature flow only to be
+  // rejected by the server. Server still enforces; this is just smoother UX.
+  if (decision === 'grant') {
+    try {
+      const a = await api('GET', `/api/assignments/${assignmentId}`);
+      const meta = computeToleranceMeta(a);
+      if (meta.deadline) {
+        const todayUtc = new Date(new Date().toISOString().slice(0, 10) + 'T00:00:00Z');
+        const deadlineUtc = new Date(meta.deadline + 'T00:00:00Z');
+        if (todayUtc > deadlineUtc) {
+          const days = Math.floor((todayUtc - deadlineUtc) / 86400000);
+          toast(`Cannot grant clearance — ${days} day(s) past the tolerance window (window closed ${meta.deadline}). Route via Expired Equipment / PNC-Exception flow instead.`, 'error');
+          return;
+        }
+      }
+    } catch (e) { /* fall through to server which will enforce too */ }
+  }
   if (decision === 'deny') {
     remarks = prompt('Reason for denying clearance (required):');
     if (!remarks) return;
