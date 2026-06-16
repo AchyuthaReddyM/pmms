@@ -245,14 +245,35 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 // DASHBOARD
 // =============================================================
 app.get('/api/dashboard/kpis', requireAuth, (req, res) => {
-  const total      = db.prepare('SELECT COUNT(*) n FROM pm_schedules').get().n;
-  const completed  = db.prepare("SELECT COUNT(*) n FROM pm_schedules WHERE status='Completed'").get().n;
-  const overdue    = db.prepare("SELECT COUNT(*) n FROM pm_schedules WHERE status IN ('Overdue','Expired')").get().n;
-  const pending    = db.prepare("SELECT COUNT(*) n FROM pm_schedules WHERE status IN ('Pending','Approved','Assigned','In Progress')").get().n;
+  // KPIs union pm_schedules (legacy module) + checklist_assignments (current module).
+  // Withdrawn / Rejected assignments don't count toward planned totals.
+  // Pending = anything still in the active workflow (not Completed / Withdrawn / Rejected / Superseded).
+  const totalPm  = db.prepare("SELECT COUNT(*) n FROM pm_schedules").get().n;
+  const totalCa  = db.prepare("SELECT COUNT(*) n FROM checklist_assignments WHERE status NOT IN ('Withdrawn','Rejected')").get().n;
+  const total    = totalPm + totalCa;
+
+  const completedPm = db.prepare("SELECT COUNT(*) n FROM pm_schedules WHERE status='Completed'").get().n;
+  const completedCa = db.prepare("SELECT COUNT(*) n FROM checklist_assignments WHERE status='Completed'").get().n;
+  const completed   = completedPm + completedCa;
+
+  const overduePm = db.prepare("SELECT COUNT(*) n FROM pm_schedules WHERE status IN ('Overdue','Expired')").get().n;
+  const overdueCa = db.prepare("SELECT COUNT(*) n FROM checklist_assignments WHERE status IN ('Overdue','Expired')").get().n;
+  const overdue   = overduePm + overdueCa;
+
+  const pendingPm = db.prepare("SELECT COUNT(*) n FROM pm_schedules WHERE status IN ('Pending','Approved','Assigned','In Progress')").get().n;
+  const pendingCa = db.prepare(`
+    SELECT COUNT(*) n FROM checklist_assignments
+    WHERE status NOT IN ('Completed','Withdrawn','Rejected','Expired','Overdue')
+  `).get().n;
+  const pending   = pendingPm + pendingCa;
+
   const compliance = total === 0 ? 0 : Math.round((completed / total) * 1000) / 10;
 
   const monthStart = new Date(); monthStart.setDate(1);
-  const mtd = db.prepare("SELECT COUNT(*) n FROM pm_schedules WHERE status='Completed' AND completed_at >= ?").get(monthStart.toISOString().slice(0,10)).n;
+  const monthIso = monthStart.toISOString().slice(0, 10);
+  const mtdPm = db.prepare("SELECT COUNT(*) n FROM pm_schedules WHERE status='Completed' AND completed_at >= ?").get(monthIso).n;
+  const mtdCa = db.prepare("SELECT COUNT(*) n FROM checklist_assignments WHERE status='Completed' AND completed_at >= ?").get(monthIso).n;
+  const mtd   = mtdPm + mtdCa;
 
   const openBd = db.prepare("SELECT COUNT(*) n FROM breakdowns WHERE status NOT IN ('Closed','Resolved')").get().n;
 
@@ -260,11 +281,21 @@ app.get('/api/dashboard/kpis', requireAuth, (req, res) => {
 });
 
 app.get('/api/dashboard/compliance-by-dept', requireAuth, (req, res) => {
+  // Pull rows from BOTH tables. checklist_assignments doesn't carry a department
+  // column directly — derive it from the assignee's department.
   const rows = db.prepare(`
     SELECT department,
       COUNT(*) AS planned,
       SUM(CASE WHEN status='Completed' THEN 1 ELSE 0 END) AS done
-    FROM pm_schedules
+    FROM (
+      SELECT department, status FROM pm_schedules
+      UNION ALL
+      SELECT COALESCE(d.name, u.department, 'Unassigned') AS department, ca.status
+      FROM checklist_assignments ca
+      LEFT JOIN users u   ON u.id = ca.assignee_id
+      LEFT JOIN departments d ON d.id = u.department_id
+      WHERE ca.status NOT IN ('Withdrawn','Rejected')
+    )
     GROUP BY department
     ORDER BY department
   `).all();
@@ -1209,18 +1240,106 @@ app.get('/api/audit', requireAuth, (req, res) => {
 // REPORTS
 // =============================================================
 app.get('/api/reports/equipment-history/:equipment_id', requireAuth, (req, res) => {
-  const pm = db.prepare(`SELECT pm_id, scheduled_date, frequency, category, status, completed_at FROM pm_schedules WHERE equipment_id=? ORDER BY scheduled_date DESC`).all(req.params.equipment_id);
+  // Union legacy pm_schedules + current checklist_assignments so the equipment
+  // history reflects every PM cycle this asset has been through.
+  const pmLegacy = db.prepare(`
+    SELECT pm_id AS id, scheduled_date, frequency, category, status, completed_at,
+           'pm_schedule' AS source
+    FROM pm_schedules WHERE equipment_id=?
+  `).all(req.params.equipment_id);
+  const pmCa = db.prepare(`
+    SELECT ca.assignment_id AS id,
+           COALESCE(ca.effective_date, ca.due_date) AS scheduled_date,
+           f.name AS frequency, NULL AS category,
+           ca.status, ca.completed_at,
+           'assignment' AS source
+    FROM checklist_assignments ca
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    WHERE ca.target_type='equipment' AND ca.target_id=?
+  `).all(req.params.equipment_id);
+  const pm = [...pmLegacy, ...pmCa]
+    .sort((a, b) => String(b.scheduled_date || '').localeCompare(String(a.scheduled_date || '')));
   const bd = db.prepare(`SELECT bd_id, reported_at, severity, status, description, closed_at FROM breakdowns WHERE equipment_id=? ORDER BY reported_at DESC`).all(req.params.equipment_id);
   res.json({ pm, breakdowns: bd });
 });
 
 app.get('/api/reports/overdue', requireAuth, (req, res) => {
-  res.json(db.prepare(`
-    SELECT s.pm_id, s.equipment_id, e.name AS equipment_name, s.scheduled_date, s.frequency, s.status, s.department
+  // Combine overdue/expired from both pm_schedules and checklist_assignments.
+  const legacy = db.prepare(`
+    SELECT s.pm_id AS id, s.equipment_id, e.name AS equipment_name,
+           s.scheduled_date, s.frequency, s.status, s.department,
+           'pm_schedule' AS source
     FROM pm_schedules s LEFT JOIN equipment e ON e.equipment_id = s.equipment_id
     WHERE s.status IN ('Overdue','Expired')
-    ORDER BY s.scheduled_date
-  `).all());
+  `).all();
+  const ca = db.prepare(`
+    SELECT ca.assignment_id AS id, ca.target_id AS equipment_id, e.name AS equipment_name,
+           COALESCE(ca.effective_date, ca.due_date) AS scheduled_date,
+           f.name AS frequency, ca.status,
+           COALESCE(d.name, u.department, '') AS department,
+           'assignment' AS source
+    FROM checklist_assignments ca
+    LEFT JOIN equipment e ON e.equipment_id = ca.target_id AND ca.target_type='equipment'
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    LEFT JOIN users u  ON u.id = ca.assignee_id
+    LEFT JOIN departments d ON d.id = u.department_id
+    WHERE ca.status IN ('Overdue','Expired')
+  `).all();
+  const merged = [...legacy, ...ca].sort((a, b) =>
+    String(a.scheduled_date || '').localeCompare(String(b.scheduled_date || '')));
+  res.json(merged);
+});
+
+// Completed PMs report — every PM that has actually been executed and signed off.
+// Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD filters by completion date.
+// Unions pm_schedules + checklist_assignments so it reflects everything completed
+// under either workflow.
+app.get('/api/reports/completed-pms', requireAuth, (req, res) => {
+  const { from, to, equipment_id } = req.query;
+  const legacyFilter = [];
+  const caFilter = [];
+  const legacyArgs = [];
+  const caArgs = [];
+  if (from) { legacyFilter.push('s.completed_at >= ?'); legacyArgs.push(from); caFilter.push('ca.completed_at >= ?'); caArgs.push(from); }
+  if (to)   { legacyFilter.push('s.completed_at <= ?'); legacyArgs.push(to + ' 23:59:59'); caFilter.push('ca.completed_at <= ?'); caArgs.push(to + ' 23:59:59'); }
+  if (equipment_id) { legacyFilter.push('s.equipment_id = ?'); legacyArgs.push(equipment_id); caFilter.push("ca.target_type='equipment' AND ca.target_id = ?"); caArgs.push(equipment_id); }
+
+  const legacy = db.prepare(`
+    SELECT s.pm_id AS id, s.equipment_id, e.name AS equipment_name,
+           s.scheduled_date, s.completed_at,
+           s.frequency, s.category, s.department,
+           NULL AS checklist_name, NULL AS checklist_version,
+           NULL AS assignee_name, NULL AS reviewer_name, NULL AS approver_name,
+           'pm_schedule' AS source
+    FROM pm_schedules s
+    LEFT JOIN equipment e ON e.equipment_id = s.equipment_id
+    WHERE s.status='Completed' ${legacyFilter.length ? 'AND ' + legacyFilter.join(' AND ') : ''}
+  `).all(...legacyArgs);
+
+  const ca = db.prepare(`
+    SELECT ca.assignment_id AS id,
+           ca.target_id AS equipment_id, e.name AS equipment_name,
+           COALESCE(ca.effective_date, ca.due_date) AS scheduled_date,
+           ca.completed_at,
+           f.name AS frequency, NULL AS category,
+           COALESCE(d.name, u.department, '') AS department,
+           cl.name AS checklist_name, cl.version AS checklist_version,
+           u.name AS assignee_name, rv.name AS reviewer_name, ap.name AS approver_name,
+           'assignment' AS source
+    FROM checklist_assignments ca
+    LEFT JOIN equipment e ON e.equipment_id = ca.target_id AND ca.target_type='equipment'
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN users u   ON u.id = ca.assignee_id
+    LEFT JOIN users rv  ON rv.id = ca.reviewer_id
+    LEFT JOIN users ap  ON ap.id = ca.approver_id
+    LEFT JOIN departments d ON d.id = u.department_id
+    WHERE ca.status='Completed' ${caFilter.length ? 'AND ' + caFilter.join(' AND ') : ''}
+  `).all(...caArgs);
+
+  const merged = [...legacy, ...ca].sort((a, b) =>
+    String(b.completed_at || '').localeCompare(String(a.completed_at || '')));
+  res.json(merged);
 });
 
 // =============================================================

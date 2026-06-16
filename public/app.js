@@ -1557,19 +1557,79 @@ async function openOverdueReport() {
       <div class="card">
         <div class="card-head"><h3>Overdue & Expired PMs</h3><span class="pill red">${rows.length} items</span></div>
         <table class="tbl">
-          <thead><tr><th>PM ID</th><th>Equipment</th><th>Scheduled</th><th>Frequency</th><th>Department</th><th>Status</th></tr></thead>
+          <thead><tr><th>ID</th><th>Source</th><th>Equipment</th><th>Scheduled</th><th>Frequency</th><th>Department</th><th>Status</th></tr></thead>
           <tbody>${rows.length === 0
-            ? '<tr class="empty-row"><td colspan="6">No overdue items 🎉</td></tr>'
-            : rows.map(r => `<tr><td><strong>${escapeHtml(r.pm_id)}</strong></td>
-                <td>${escapeHtml(r.equipment_name || r.equipment_id)}</td>
-                <td>${escapeHtml(r.scheduled_date)}</td>
-                <td>${escapeHtml(r.frequency)}</td>
+            ? '<tr class="empty-row"><td colspan="7">No overdue items 🎉</td></tr>'
+            : rows.map(r => `<tr><td><strong>${escapeHtml(r.id || r.pm_id || '')}</strong></td>
+                <td><span class="pill gray" style="font-size:9px;">${r.source === 'assignment' ? 'Assignment' : 'Legacy PM'}</span></td>
+                <td>${escapeHtml(r.equipment_name || r.equipment_id || '')}</td>
+                <td>${escapeHtml(r.scheduled_date || '')}</td>
+                <td>${escapeHtml(r.frequency || '')}</td>
                 <td>${escapeHtml(r.department || '')}</td>
                 <td>${statusPill(r.status)}</td></tr>`).join('')}
           </tbody>
         </table>
       </div>`;
   } catch (e) { toast(e.message,'error'); }
+}
+
+async function openCompletedPmsReport() {
+  // Open with a date-range filter modal first so the report doesn't blow up
+  // for installations with thousands of historical executions.
+  const today = new Date().toISOString().slice(0, 10);
+  const monthStart = new Date(); monthStart.setDate(1);
+  const monthIso = monthStart.toISOString().slice(0, 10);
+  openModal({
+    title: 'Completed PMs — Filters',
+    body: `
+      <p style="font-size:12px; color:var(--muted); margin-top:0;">Pulls completed executions from both the legacy PM schedule and the current checklist-assignment workflow.</p>
+      <div class="form-row"><label>From (completion date)</label><input name="from" type="date" value="${monthIso}" /></div>
+      <div class="form-row"><label>To (completion date)</label><input name="to" type="date" value="${today}" /></div>
+      <div class="form-row"><label>Equipment ID (optional)</label><input name="equipment_id" placeholder="leave blank for all" /></div>
+    `,
+    submitLabel: 'Run Report',
+    onSubmit: async (data) => {
+      const q = new URLSearchParams();
+      if (data.from)  q.set('from', data.from);
+      if (data.to)    q.set('to', data.to);
+      if (data.equipment_id && data.equipment_id.trim()) q.set('equipment_id', data.equipment_id.trim());
+      const rows = await api('GET', '/api/reports/completed-pms?' + q.toString());
+      $('reportPanel').innerHTML = `
+        <div class="card">
+          <div class="card-head">
+            <h3>Completed PMs</h3>
+            <span class="pill green">${rows.length} executions</span>
+          </div>
+          <div style="font-size:11px; color:var(--muted); margin: 4px 12px 8px;">
+            Filter: ${escapeHtml(data.from || '—')} → ${escapeHtml(data.to || '—')}${data.equipment_id?` · Equipment: ${escapeHtml(data.equipment_id)}`:''}
+          </div>
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th>ID</th><th>Source</th><th>Equipment</th><th>Checklist</th>
+                <th>Frequency</th><th>Scheduled</th><th>Completed</th>
+                <th>Executor</th><th>Reviewer</th><th>Approver</th>
+              </tr>
+            </thead>
+            <tbody>${rows.length === 0
+              ? '<tr class="empty-row"><td colspan="10">No completed PMs in this window.</td></tr>'
+              : rows.map(r => `<tr>
+                  <td><strong>${escapeHtml(r.id || '')}</strong></td>
+                  <td><span class="pill gray" style="font-size:9px;">${r.source === 'assignment' ? 'Assignment' : 'Legacy PM'}</span></td>
+                  <td>${escapeHtml(r.equipment_name || r.equipment_id || '')}<div style="color:var(--muted); font-size:11px;">${escapeHtml(r.equipment_id || '')}</div></td>
+                  <td>${escapeHtml(r.checklist_name || '—')}${r.checklist_version?` <span style="color:var(--muted); font-size:11px;">${escapeHtml(r.checklist_version)}</span>`:''}</td>
+                  <td>${escapeHtml(r.frequency || '—')}</td>
+                  <td>${escapeHtml(r.scheduled_date || '—')}</td>
+                  <td><strong>${escapeHtml(r.completed_at || '—')}</strong></td>
+                  <td>${escapeHtml(r.assignee_name || '—')}</td>
+                  <td>${escapeHtml(r.reviewer_name || '—')}</td>
+                  <td>${escapeHtml(r.approver_name || '—')}</td>
+                </tr>`).join('')}
+            </tbody>
+          </table>
+        </div>`;
+    }
+  });
 }
 
 async function openEqHistoryReport() {
@@ -1586,11 +1646,16 @@ async function openEqHistoryReport() {
         const h = await api('GET', `/api/reports/equipment-history/${data.equipment_id}`);
         $('reportPanel').innerHTML = `
           <div class="card">
-            <div class="card-head"><h3>PM History — ${escapeHtml(data.equipment_id)}</h3></div>
+            <div class="card-head"><h3>PM History — ${escapeHtml(data.equipment_id)}</h3><span class="pill brown">${h.pm.length} entries</span></div>
             <table class="tbl">
-              <thead><tr><th>PM ID</th><th>Scheduled</th><th>Freq</th><th>Category</th><th>Status</th><th>Completed</th></tr></thead>
-              <tbody>${h.pm.length===0?'<tr class="empty-row"><td colspan="6">No PMs</td></tr>':h.pm.map(p =>
-                `<tr><td>${escapeHtml(p.pm_id)}</td><td>${escapeHtml(p.scheduled_date)}</td><td>${escapeHtml(p.frequency)}</td><td>${escapeHtml(p.category||'')}</td><td>${statusPill(p.status)}</td><td>${escapeHtml(p.completed_at||'')}</td></tr>`).join('')}</tbody>
+              <thead><tr><th>ID</th><th>Source</th><th>Scheduled</th><th>Freq</th><th>Status</th><th>Completed</th></tr></thead>
+              <tbody>${h.pm.length===0?'<tr class="empty-row"><td colspan="6">No PMs yet</td></tr>':h.pm.map(p =>
+                `<tr><td><strong>${escapeHtml(p.id || p.pm_id || '')}</strong></td>
+                     <td><span class="pill gray" style="font-size:9px;">${p.source === 'assignment' ? 'Assignment' : 'Legacy PM'}</span></td>
+                     <td>${escapeHtml(p.scheduled_date || '')}</td>
+                     <td>${escapeHtml(p.frequency || '')}</td>
+                     <td>${statusPill(p.status)}</td>
+                     <td>${escapeHtml(p.completed_at || '')}</td></tr>`).join('')}</tbody>
             </table>
           </div>
           <div class="card" style="margin-top:16px;">
