@@ -1580,8 +1580,11 @@ app.post('/api/checklists', requireAuth, requireActivity('manage_checklists'), (
   if (!group_id) return res.status(400).json({ error: 'PM Checklist Group is required' });
   const grp = db.prepare('SELECT id FROM checklist_groups WHERE id=?').get(group_id);
   if (!grp) return res.status(400).json({ error: 'Unknown checklist group' });
-  if (db.prepare('SELECT 1 FROM checklists WHERE code=?').get(code)) {
-    return res.status(409).json({ error: `Checklist ID "${code}" already exists` });
+  // First-ever creation of this code starts at v1.0. Multiple versions of the
+  // same code coexist (each row is a distinct version). The composite UNIQUE
+  // index on (code, version) prevents accidental duplicate-version inserts.
+  if (db.prepare("SELECT 1 FROM checklists WHERE code=? AND version='v1.0'").get(code)) {
+    return res.status(409).json({ error: `Checklist ID "${code}" already exists. Use "Create new version" on the existing record instead.` });
   }
   // Sanitize required_fields to known keys
   const reqd = Array.isArray(required_fields)
@@ -1624,8 +1627,9 @@ app.put('/api/checklists/:id', requireAuth, requireActivity('manage_checklists')
   }
   if (code !== undefined && code !== null && code !== '' && code !== cl.code) {
     if (!/^[A-Za-z0-9_\-]{2,50}$/.test(code)) return res.status(400).json({ error: 'Checklist ID must be 2-50 alphanumeric characters' });
-    if (db.prepare('SELECT 1 FROM checklists WHERE code=? AND id!=?').get(code, req.params.id)) {
-      return res.status(409).json({ error: `Checklist ID "${code}" already exists` });
+    // Editing a code is only valid if there's no other row with that (code, version) pair.
+    if (db.prepare('SELECT 1 FROM checklists WHERE code=? AND version=? AND id!=?').get(code, cl.version, req.params.id)) {
+      return res.status(409).json({ error: `Checklist ID "${code}" at ${cl.version} already exists` });
     }
   }
   if (name !== undefined && (name.length < 3 || name.length > 300)) {
@@ -1757,17 +1761,77 @@ app.put('/api/checklists/:id/approve', requireAuth, requireActivity('approve_che
     audit(req.user, 'REJECT', 'Checklist', req.params.id, `Rejected at approval: ${reason}`);
   } else {
     db.prepare("UPDATE checklists SET status='Approved', approved_at=datetime('now') WHERE id=?").run(req.params.id);
+    // Auto-supersede: any other Approved versions of THIS code drop to Superseded.
+    // The current version is now the canonical one for new assignments.
+    const supersededRows = db.prepare(`
+      SELECT id, version FROM checklists
+      WHERE code=? AND id != ? AND status='Approved'
+    `).all(cl.code, req.params.id);
+    if (supersededRows.length > 0) {
+      const upd = db.prepare("UPDATE checklists SET status='Superseded', superseded_at=datetime('now'), superseded_by=? WHERE id=?");
+      for (const row of supersededRows) {
+        upd.run(req.params.id, row.id);
+        audit(req.user, 'SUPERSEDE', 'Checklist', row.id, `Superseded by ${cl.code} ${cl.version} (id ${req.params.id})`);
+      }
+    }
     notify(cl.created_by,
       'Checklist approved',
-      `${cl.name} (${cl.version}) is now approved and available for assignment.`,
+      `${cl.name} (${cl.version}) is now approved${supersededRows.length?` — ${supersededRows.length} prior version(s) auto-superseded`:''}.`,
       'checklist_approved',
       `/checklists/${req.params.id}`);
     if (cl.reviewer_id && cl.reviewer_id !== req.user.id) {
       notify(cl.reviewer_id, 'Checklist approved', `${cl.name} (${cl.version}) has been approved.`, 'checklist_approved', `/checklists/${req.params.id}`);
     }
-    audit(req.user, 'APPROVE', 'Checklist', req.params.id, `Approved "${cl.name}" (${cl.version}) — available for assignment`);
+    audit(req.user, 'APPROVE', 'Checklist', req.params.id, `Approved "${cl.name}" (${cl.version}) — available for assignment${supersededRows.length?` · superseded ${supersededRows.length} older version(s)`:''}`);
   }
   res.json({ ok: true });
+});
+
+// ---- Versioning -----------------------------------------------------------
+// "Create a new version" branches an existing checklist into a brand-new Draft
+// row that shares the same code + name but bumps the major version (v1.0 ->
+// v2.0 -> v3.0). Sections, questions, frequencies, and required_fields are
+// copied. The original row is untouched until the new version reaches Approved
+// — at which point the auto-supersede logic in /approve marks the older Active
+// versions as 'Superseded'. Assignments referencing old versions stay live.
+function bumpMajorVersion(v) {
+  // Accepts 'v1.0', 'v2.0', '1', 'v1', etc. Returns 'v(N+1).0'.
+  const m = String(v || 'v1.0').match(/(\d+)/);
+  const major = m ? parseInt(m[1], 10) : 1;
+  return `v${major + 1}.0`;
+}
+app.post('/api/checklists/:id/new-version', requireAuth, requireActivity('manage_checklists'), (req, res) => {
+  const src = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
+  if (!src) return res.status(404).json({ error: 'Source checklist not found' });
+  // Compute next version: look at every version of this code and pick max+1
+  const sibs = db.prepare("SELECT version FROM checklists WHERE code=?").all(src.code);
+  const maxMajor = sibs.reduce((mx, r) => {
+    const m = String(r.version || '').match(/(\d+)/);
+    return Math.max(mx, m ? parseInt(m[1], 10) : 0);
+  }, 0);
+  const newVersion = `v${maxMajor + 1}.0`;
+  // Insert new Draft row
+  const r = db.prepare(`INSERT INTO checklists(code,name,description,group_id,category_id,version,status,required_fields_json,created_by)
+                        VALUES (?,?,?,?,?,?,?,?,?)`)
+    .run(src.code, src.name, src.description, src.group_id, src.category_id, newVersion, 'Draft', src.required_fields_json, req.user.id);
+  const newId = r.lastInsertRowid;
+  // Copy frequencies
+  const freqRows = db.prepare('SELECT frequency_id FROM checklist_frequencies WHERE checklist_id=?').all(src.id);
+  const insFreq = db.prepare('INSERT INTO checklist_frequencies(checklist_id,frequency_id) VALUES (?,?)');
+  for (const fr of freqRows) insFreq.run(newId, fr.frequency_id);
+  // Copy sections + questions
+  const sections = db.prepare('SELECT * FROM checklist_sections WHERE checklist_id=? ORDER BY position, id').all(src.id);
+  const insSec = db.prepare('INSERT INTO checklist_sections(checklist_id,name,description,position) VALUES (?,?,?,?)');
+  const insQ = db.prepare(`INSERT INTO checklist_questions(section_id,label,qtype,options_json,required,min_value,max_value,unit,frequencies_json,position) VALUES (?,?,?,?,?,?,?,?,?,?)`);
+  for (const sec of sections) {
+    const newSecId = insSec.run(newId, sec.name, sec.description, sec.position).lastInsertRowid;
+    const qs = db.prepare('SELECT * FROM checklist_questions WHERE section_id=? ORDER BY position, id').all(sec.id);
+    for (const q of qs) {
+      insQ.run(newSecId, q.label, q.qtype, q.options_json, q.required, q.min_value, q.max_value, q.unit, q.frequencies_json, q.position);
+    }
+  }
+  audit(req.user, 'NEW_VERSION', 'Checklist', newId, `Created ${newVersion} of "${src.name}" (${src.code}) — branched from ${src.version}`);
+  res.json({ id: newId, code: src.code, version: newVersion, status: 'Draft' });
 });
 
 // ---- Drop / Reactivate ----------------------------------------------------
@@ -1824,6 +1888,8 @@ app.get('/api/assignments', requireAuth, (req, res) => {
   const args = [];
   if (mine === '1')  { where.push('ca.assignee_id = ?'); args.push(req.user.id); }
   if (inbox === '1') {
+    // Withdrawn assignments never appear in the inbox — the workflow is terminal.
+    where.push("ca.status NOT IN ('Withdrawn')");
     where.push("(ca.assignee_id = ? OR ca.reviewer_id = ? OR ca.approver_id = ? OR ca.clearance_user_id = ? OR (ca.status='Awaiting Executor' AND ca.assigned_by = ?))");
     args.push(req.user.id, req.user.id, req.user.id, req.user.id, req.user.id);
   }
@@ -2334,6 +2400,39 @@ app.get('/api/assignments/expired', requireAuth, (req, res) => {
     r.equipment_description = [r.make, r.model, r.capacity].filter(Boolean).join(' / ') || r.equipment_name || '—';
   });
   res.json({ flipped, rows });
+});
+
+// Withdraw an in-flight checklist assignment from a piece of equipment.
+// Used when the checklist itself needs revision (a new version is being prepared)
+// or the assignment was set up incorrectly. Allowed at any pre-Completed stage.
+// Requires remarks + e-signature for GMP traceability.
+app.put('/api/assignments/:assignment_id/withdraw', requireAuth, requireActivity('assign_checklist'), requireESignature, (req, res) => {
+  const { remarks } = req.body || {};
+  if (!remarks || !remarks.trim()) return res.status(400).json({ error: 'Remarks are required to withdraw an assignment' });
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status === 'Completed' || a.status === 'Withdrawn') {
+    return res.status(409).json({ error: `Cannot withdraw — assignment is "${a.status}".` });
+  }
+  db.prepare(`UPDATE checklist_assignments
+              SET status='Withdrawn', withdrawn_at=datetime('now'), withdrawn_by=?, withdraw_remarks=?
+              WHERE assignment_id=?`)
+    .run(req.user.id, remarks, req.params.assignment_id);
+
+  // Notify everyone in the workflow chain so they don't keep trying to act on it.
+  const notifyList = [a.assignee_id, a.reviewer_id, a.approver_id, a.clearance_user_id, a.assigned_by]
+    .filter(x => x && x !== req.user.id);
+  const seen = new Set();
+  for (const uid of notifyList) {
+    if (seen.has(uid)) continue;
+    seen.add(uid);
+    notify(uid, 'PM assignment withdrawn',
+      `${a.assignment_id} (target: ${a.target_id || '—'}) was withdrawn: ${remarks}`,
+      'assignment_withdrawn', `/assignments/${a.assignment_id}`);
+  }
+  audit(req.user, 'WITHDRAW', 'Assignment', a.assignment_id,
+    `Withdrew assignment for ${a.target_type || 'target'} ${a.target_id || ''} (checklist id ${a.checklist_id}). Reason: ${remarks}`);
+  res.json({ ok: true });
 });
 
 app.put('/api/assignments/:assignment_id/reassign', requireAuth, requireActivity('assign_checklist'), (req, res) => {

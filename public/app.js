@@ -237,7 +237,9 @@ function statusPill(status) {
     // Assignment-plan review states
     'Pending Assignment Review':'amber','Pending Assignment Approval':'amber','Assignment Rejected':'red',
     // Scheduled = plan approved, awaiting Engineering to initiate the clearance request
-    'Scheduled':'blue'
+    'Scheduled':'blue',
+    // Versioning / lifecycle
+    'Superseded':'gray','Withdrawn':'gray'
   };
   return `<span class="pill ${map[status] || 'gray'}">${escapeHtml(status)}</span>`;
 }
@@ -1043,13 +1045,13 @@ async function loadChecklists() {
     $('checklistsBody').innerHTML = rows.length === 0
       ? '<tr class="empty-row"><td colspan="5">No checklists yet — click "+ New Checklist" to create one.</td></tr>'
       : rows.map(c => `
-      <tr>
+      <tr${c.status === 'Superseded' ? ' style="opacity:0.7;"' : ''}>
         <td><code style="font-size:11px;">${escapeHtml(c.code || ('#'+c.id))}</code></td>
         <td><strong>${escapeHtml(c.name)}</strong>
           <div style="color:var(--muted); font-size:11px;">${escapeHtml(c.group_name || '—')} · by ${escapeHtml(c.created_by_name || '—')}${c.reviewer_name?` · rev. ${escapeHtml(c.reviewer_name)}`:''}${c.approver_name?` · app. ${escapeHtml(c.approver_name)}`:''}</div>
           ${c.frequencies && c.frequencies.length ? `<div style="margin-top:3px;">${c.frequencies.map(f => `<span class="pill brown" style="font-size:9px; margin-right:3px;">${escapeHtml(f.name)}</span>`).join('')}</div>` : ''}
         </td>
-        <td>${escapeHtml(c.version)}</td>
+        <td><strong style="font-family:monospace;">${escapeHtml(c.version)}</strong></td>
         <td>${statusPill(c.status)}</td>
         <td><button class="btn ghost sm" onclick="previewChecklist(${c.id})">Open</button></td>
       </tr>`).join('');
@@ -1088,6 +1090,9 @@ async function previewChecklist(id) {
     }
     if (cl.status === 'Approved' && can('assign_checklist')) {
       buttons.push(`<button class="btn primary sm" onclick="openAssignChecklistModal(${cl.id})">Assign…</button>`);
+    }
+    if (cl.status === 'Approved' && can('manage_checklists')) {
+      buttons.push(`<button class="btn ghost sm" onclick="newChecklistVersion(${cl.id},'${escapeHtml(cl.code)}','${escapeHtml(cl.version)}')">🔖 New Version…</button>`);
     }
     if (cl.status === 'Approved' && (can('approve_checklist') || can('manage_checklists') || CURRENT_USER.is_admin)) {
       buttons.push(`<button class="btn ghost sm" style="color:#c53030;" onclick="dropChecklist(${cl.id},'${escapeHtml(cl.name)}')">⊘ Drop / Deactivate…</button>`);
@@ -2655,6 +2660,16 @@ async function reviewChecklistDecision(checklistId, decision) {
   });
 }
 
+async function newChecklistVersion(sourceId, code, currentVersion) {
+  if (!confirm(`Create a new MAJOR version of "${code}" (current ${currentVersion})? A new Draft will be created with the same Checklist ID + Name but a bumped version. The existing version remains Approved until the new one is Approved — at that point the old one auto-supersedes.`)) return;
+  try {
+    const created = await api('POST', `/api/checklists/${sourceId}/new-version`, {});
+    toast(`New ${created.version} created as Draft. Edit it and submit for review.`, 'success');
+    loadChecklists();
+    previewChecklist(created.id);
+  } catch (e) { toast(e.message, 'error'); }
+}
+
 async function dropChecklist(checklistId, name) {
   const remarks = prompt(`Reason for dropping (deactivating) "${name}" — required for GMP traceability:`);
   if (!remarks || !remarks.trim()) return;
@@ -2939,6 +2954,14 @@ async function openAssignment(assignmentId) {
       acts.push(`<button type="button" class="btn primary" onclick="assignmentApproveDecision('${a.assignment_id}','approve')">✓ Approve &amp; Close</button>`);
       acts.push(`<button type="button" class="btn ghost"   onclick="assignmentApproveDecision('${a.assignment_id}','reject')">✗ Reject</button>`);
     }
+    // Withdraw — available to the original assigner / admin / anyone with assign_checklist
+    // at any pre-Completed stage. Used when the checklist needs to be revised or the
+    // assignment was set up incorrectly. Lands the row in 'Withdrawn' (terminal).
+    const canWithdraw = !['Completed','Withdrawn'].includes(a.status)
+                      && (amAssigner || amAdmin || can('assign_checklist'));
+    if (canWithdraw) {
+      acts.push(`<button type="button" class="btn ghost" style="color:#c53030;" onclick="withdrawAssignment('${a.assignment_id}', '${escapeHtml(a.target_id || '')}')">⊘ Drop / Withdraw…</button>`);
+    }
     const actionsHtml = acts.join(' ');
 
     // Cascade banner — count applicable vs N/A and explain the rule.
@@ -3143,6 +3166,24 @@ async function assignmentReviewDecision(assignmentId, decision) {
     }
   });
 }
+async function withdrawAssignment(assignmentId, targetId) {
+  const remarks = prompt(`Drop / withdraw assignment ${assignmentId}${targetId?' from '+targetId:''}? Please state the reason (required for GMP traceability — e.g., "checklist v2.0 being prepared, re-assigning post-approval"):`);
+  if (!remarks || !remarks.trim()) return;
+  const meaning = `I withdraw PM assignment "${assignmentId}"${targetId?' for '+targetId:''}. It is removed from the active workflow. Reason: ${remarks}`;
+  openESignatureModal({
+    title: `Sign — Withdraw ${assignmentId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/assignments/${assignmentId}/withdraw`, { remarks, ...esig });
+      toast('Assignment withdrawn. The workflow chain has been notified.', 'success');
+      closeModal();
+      if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+      if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+      refreshNotifBadge();
+    }
+  });
+}
+
 async function assignmentApproveDecision(assignmentId, decision) {
   let reason = null;
   if (decision === 'reject') {

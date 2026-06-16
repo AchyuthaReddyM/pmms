@@ -210,7 +210,7 @@ function createSchema() {
     -- Only Approved checklists can be assigned. Initiator -> Reviewer -> Approver workflow.
     CREATE TABLE IF NOT EXISTS checklists (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      code TEXT UNIQUE,
+      code TEXT,
       name TEXT NOT NULL,
       description TEXT,
       group_id INTEGER REFERENCES checklist_groups(id),
@@ -226,8 +226,14 @@ function createSchema() {
       reviewed_at TEXT,
       approved_at TEXT,
       rejection_reason TEXT,
+      dropped_at TEXT,
+      drop_remarks TEXT,
+      superseded_at TEXT,
+      superseded_by INTEGER,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    -- Multiple versions of the same Checklist ID coexist: each (code, version) is unique.
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_checklists_code_version ON checklists(code, version);
 
     -- Each checklist may be associated with one or more frequencies (Weekly + Monthly + Quarterly)
     CREATE TABLE IF NOT EXISTS checklist_frequencies (
@@ -513,6 +519,11 @@ function migrateSchema() {
   addColIfMissing('checklists', 'rejection_reason', 'TEXT');
   addColIfMissing('checklists', 'dropped_at', 'TEXT');
   addColIfMissing('checklists', 'drop_remarks', 'TEXT');
+  addColIfMissing('checklists', 'superseded_at', 'TEXT');
+  addColIfMissing('checklists', 'superseded_by', 'INTEGER');
+  addColIfMissing('checklist_assignments', 'withdrawn_at', 'TEXT');
+  addColIfMissing('checklist_assignments', 'withdraw_remarks', 'TEXT');
+  addColIfMissing('checklist_assignments', 'withdrawn_by', 'INTEGER');
   addColIfMissing('checklist_questions', 'frequencies_json', 'TEXT');
   addColIfMissing('checklist_assignments', 'target_type', 'TEXT');
   addColIfMissing('checklist_assignments', 'target_id', 'TEXT');
@@ -550,6 +561,69 @@ function migrateSchema() {
     addColIfMissing(t, 'review_remarks',    'TEXT');
     addColIfMissing(t, 'approved_at',       'TEXT');
     addColIfMissing(t, 'approval_remarks',  'TEXT');
+  }
+
+  // -----------------------------------------------------------------------
+  // One-shot rebuild: drop the legacy UNIQUE(code) constraint on checklists.
+  // ----------------------------------------------------------------------
+  // The original CREATE TABLE had `code TEXT UNIQUE`, which created an
+  // auto-index that SQLite won't let us drop without rebuilding the table.
+  // Versioning needs multiple rows to share a code (one per version), so we
+  // rebuild the table once, then keep going with a composite UNIQUE(code,version) index.
+  try {
+    const idxList = db.prepare("PRAGMA index_list('checklists')").all();
+    const hasLegacyUniqueOnCode = idxList.some(i =>
+      i.unique === 1 && i.origin === 'u' && String(i.name).startsWith('sqlite_autoindex'));
+    const hasCompositeIdx = idxList.some(i => i.name === 'idx_checklists_code_version');
+    if (hasLegacyUniqueOnCode && !hasCompositeIdx) {
+      console.log('[migrate] Rebuilding checklists table to drop UNIQUE(code) and add UNIQUE(code, version)…');
+      db.exec('PRAGMA foreign_keys=OFF;');
+      db.exec(`
+        BEGIN TRANSACTION;
+        CREATE TABLE _checklists_new (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          code TEXT,
+          name TEXT NOT NULL,
+          description TEXT,
+          group_id INTEGER REFERENCES checklist_groups(id),
+          category_id INTEGER REFERENCES pm_categories(id),
+          version TEXT NOT NULL DEFAULT 'v1.0',
+          status TEXT NOT NULL DEFAULT 'Draft',
+          fields_json TEXT,
+          required_fields_json TEXT,
+          created_by INTEGER REFERENCES users(id),
+          reviewer_id INTEGER REFERENCES users(id),
+          approver_id INTEGER REFERENCES users(id),
+          submitted_at TEXT,
+          reviewed_at TEXT,
+          approved_at TEXT,
+          rejection_reason TEXT,
+          dropped_at TEXT,
+          drop_remarks TEXT,
+          superseded_at TEXT,
+          superseded_by INTEGER,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO _checklists_new
+          (id, code, name, description, group_id, category_id, version, status,
+           fields_json, required_fields_json, created_by, reviewer_id, approver_id,
+           submitted_at, reviewed_at, approved_at, rejection_reason,
+           dropped_at, drop_remarks, superseded_at, superseded_by, created_at)
+        SELECT id, code, name, description, group_id, category_id, version, status,
+               fields_json, required_fields_json, created_by, reviewer_id, approver_id,
+               submitted_at, reviewed_at, approved_at, rejection_reason,
+               dropped_at, drop_remarks, superseded_at, superseded_by, created_at
+        FROM checklists;
+        DROP TABLE checklists;
+        ALTER TABLE _checklists_new RENAME TO checklists;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_checklists_code_version ON checklists(code, version);
+        COMMIT;
+      `);
+      db.exec('PRAGMA foreign_keys=ON;');
+      console.log('[migrate] checklists rebuild complete.');
+    }
+  } catch (e) {
+    console.error('[migrate] checklists rebuild failed:', e.message);
   }
 }
 
