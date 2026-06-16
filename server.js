@@ -315,6 +315,14 @@ function validateMasterApprovers(creatorId, reviewer_id, approver_id) {
 //   pkCol       = string PK column, e.g. 'plant_id'
 //   displayName = audit entity label, e.g. 'Plant'
 function addMasterApprovalRoutes(masterName, tableName, pkCol, displayName) {
+  // Pick the most human-readable identifier on this row for notify/audit text.
+  // Tries `name` first (every master has one), falls back to the row's PK value.
+  const friendlyId = (row) => {
+    const pk = row[pkCol];
+    const nm = row.name || row.description || row.area_type;
+    return nm ? `${pk} — ${nm}` : String(pk);
+  };
+
   app.put(`/api/${masterName}/:id/review`, requireAuth, requireActivity('review_master'), requireESignature, (req, res) => {
     const { decision, remarks } = req.body || {};
     const row = db.prepare(`SELECT * FROM ${tableName} WHERE ${pkCol}=?`).get(req.params.id);
@@ -324,24 +332,25 @@ function addMasterApprovalRoutes(masterName, tableName, pkCol, displayName) {
       return res.status(403).json({ error: `Only the assigned reviewer can review this ${displayName.toLowerCase()}` });
     }
     if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+    const friendly = friendlyId(row);
 
     if (decision === 'approve') {
       db.prepare(`UPDATE ${tableName} SET status='Pending Approval', reviewed_at=datetime('now'), review_remarks=? WHERE ${pkCol}=?`)
         .run(remarks || null, req.params.id);
       if (row.approver_id) {
         notify(row.approver_id, `${displayName} awaiting your approval`,
-          `${row[pkCol]} reviewed by ${req.user.name}.`, 'master_approve', `/masters/${masterName}/${row[pkCol]}`);
+          `${friendly} reviewed by ${req.user.name}.`, 'master_approve', `/masters/${masterName}/${row[pkCol]}`);
       }
-      audit(req.user, 'REVIEW', displayName, row[pkCol], `Reviewed${remarks ? ': ' + remarks : ''} — passed to approver`);
+      audit(req.user, 'REVIEW', displayName, row[pkCol], `Reviewed ${friendly}${remarks ? ': ' + remarks : ''} — passed to approver`);
     } else {
       if (!remarks || !remarks.trim()) return res.status(400).json({ error: 'remarks required for rejection' });
       db.prepare(`UPDATE ${tableName} SET status='Rejected', review_remarks=?, reviewed_at=datetime('now') WHERE ${pkCol}=?`)
         .run(remarks, req.params.id);
       if (row.created_by) {
         notify(row.created_by, `${displayName} rejected at review`,
-          `${row[pkCol]}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
+          `${friendly}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
       }
-      audit(req.user, 'REJECT', displayName, row[pkCol], `Rejected at review: ${remarks}`);
+      audit(req.user, 'REJECT', displayName, row[pkCol], `Rejected ${friendly} at review: ${remarks}`);
     }
     res.json({ ok: true });
   });
@@ -354,6 +363,7 @@ function addMasterApprovalRoutes(masterName, tableName, pkCol, displayName) {
     if (row.approver_id !== req.user.id && !req.user.is_admin) {
       return res.status(403).json({ error: `Only the assigned approver can approve this ${displayName.toLowerCase()}` });
     }
+    const friendly = friendlyId(row);
 
     if (decision === 'reject') {
       if (!remarks || !remarks.trim()) return res.status(400).json({ error: 'remarks required for rejection' });
@@ -361,25 +371,25 @@ function addMasterApprovalRoutes(masterName, tableName, pkCol, displayName) {
         .run(remarks, req.params.id);
       if (row.created_by) {
         notify(row.created_by, `${displayName} rejected at approval`,
-          `${row[pkCol]}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
+          `${friendly}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
       }
       if (row.reviewer_id && row.reviewer_id !== req.user.id) {
         notify(row.reviewer_id, `${displayName} rejected by approver`,
-          `${row[pkCol]}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
+          `${friendly}: ${remarks}`, 'master_rejected', `/masters/${masterName}/${row[pkCol]}`);
       }
-      audit(req.user, 'REJECT', displayName, row[pkCol], `Rejected at approval: ${remarks}`);
+      audit(req.user, 'REJECT', displayName, row[pkCol], `Rejected ${friendly} at approval: ${remarks}`);
     } else {
       db.prepare(`UPDATE ${tableName} SET status='Active', approval_remarks=?, approved_at=datetime('now') WHERE ${pkCol}=?`)
         .run(remarks || null, req.params.id);
       if (row.created_by) {
         notify(row.created_by, `${displayName} approved`,
-          `${row[pkCol]} is now Active.`, 'master_approved', `/masters/${masterName}/${row[pkCol]}`);
+          `${friendly} is now Active.`, 'master_approved', `/masters/${masterName}/${row[pkCol]}`);
       }
       if (row.reviewer_id && row.reviewer_id !== req.user.id) {
         notify(row.reviewer_id, `${displayName} approved`,
-          `${row[pkCol]} has been approved.`, 'master_approved', `/masters/${masterName}/${row[pkCol]}`);
+          `${friendly} has been approved.`, 'master_approved', `/masters/${masterName}/${row[pkCol]}`);
       }
-      audit(req.user, 'APPROVE', displayName, row[pkCol], `Approved${remarks ? ' — ' + remarks : ''} — now Active`);
+      audit(req.user, 'APPROVE', displayName, row[pkCol], `Approved ${friendly}${remarks ? ' — ' + remarks : ''} — now Active`);
     }
     res.json({ ok: true });
   });
@@ -630,6 +640,7 @@ addMasterApprovalRoutes('locations',    'locations',    'location_id',    'Locat
 addMasterApprovalRoutes('areas',        'areas',        'area_id',        'Area');
 addMasterApprovalRoutes('formulations', 'formulations', 'formulation_id', 'Formulation');
 addMasterApprovalRoutes('equipment',    'equipment',    'equipment_id',   'Equipment');
+addMasterApprovalRoutes('frequencies',  'frequencies',  'id',             'Frequency');
 
 // Per-user "what masters are waiting on me?" — pulled into the bell + dashboard.
 app.get('/api/masters/my-queue', requireAuth, (req, res) => {
@@ -1434,12 +1445,20 @@ app.delete('/api/roles/:id', requireAuth, requireActivity('manage_roles'), (req,
 // PM FREQUENCIES — admin-managed master
 // =============================================================
 app.post('/api/frequencies', requireAuth, requireActivity('manage_pm_frequencies'), (req, res) => {
-  const { name, days, tolerance_days } = req.body || {};
+  const { name, days, tolerance_days, reviewer_id, approver_id } = req.body || {};
   if (!name || days === undefined) return res.status(400).json({ error: 'name and days required' });
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   const exists = db.prepare('SELECT 1 FROM frequencies WHERE name=?').get(name);
   if (exists) return res.status(409).json({ error: 'frequency name already exists' });
-  const r = db.prepare('INSERT INTO frequencies(name,days,tolerance_days) VALUES (?,?,?)').run(name, parseInt(days,10), parseInt(tolerance_days || 0,10));
-  audit(req.user, 'CREATE', 'Frequency', r.lastInsertRowid, `Created "${name}" (${days}d)`);
+  const r = db.prepare(`INSERT INTO frequencies(name,days,tolerance_days,status,created_by,reviewer_id,approver_id)
+                        VALUES (?,?,?,'Pending Review',?,?,?)`)
+    .run(name, parseInt(days,10), parseInt(tolerance_days || 0,10),
+         req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'Frequency', r.lastInsertRowid, `Created "${name}" (${days}d) — submitted for review`);
+  notify(Number(reviewer_id), 'Frequency awaiting your review',
+    `"${name}" (${days}d) submitted by ${req.user.name}`,
+    'master_review', `/pmconfig/frequencies/${r.lastInsertRowid}`);
   res.json(db.prepare('SELECT * FROM frequencies WHERE id=?').get(r.lastInsertRowid));
 });
 

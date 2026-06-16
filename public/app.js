@@ -890,15 +890,27 @@ async function loadPmConfig() {
     ]);
     const adminMode = can('manage_pm_frequencies');
     const adminCatMode = can('manage_pm_categories');
-    $('freqBody').innerHTML = freqs.length === 0 ? '<tr class="empty-row"><td colspan="4">No frequencies</td></tr>' :
-      freqs.map(f => `<tr>
-        <td><strong>${escapeHtml(f.name)}</strong></td>
-        <td>${f.days}</td>
-        <td>±${f.tolerance_days}</td>
-        <td style="text-align:right;">
-          ${adminMode ? `<button class="btn ghost sm" onclick='openFreqModal(${escapeHtml(JSON.stringify(f))})'>Edit</button>
-                         <button class="btn ghost sm" onclick="deleteFreq(${f.id})">×</button>` : ''}
-        </td></tr>`).join('');
+    $('freqBody').innerHTML = freqs.length === 0 ? '<tr class="empty-row"><td colspan="5">No frequencies</td></tr>' :
+      freqs.map(f => {
+        const me = CURRENT_USER ? CURRENT_USER.id : null;
+        const wfBtns = [];
+        if (f.status === 'Pending Review' && (f.reviewer_id === me || (CURRENT_USER && CURRENT_USER.is_admin))) {
+          wfBtns.push(`<button class="btn ghost sm" onclick="openFreqDecisionModal(${f.id}, ${escapeHtml(JSON.stringify(f.name))}, 'review')">📝 Review</button>`);
+        }
+        if (f.status === 'Pending Approval' && (f.approver_id === me || (CURRENT_USER && CURRENT_USER.is_admin))) {
+          wfBtns.push(`<button class="btn ghost sm" onclick="openFreqDecisionModal(${f.id}, ${escapeHtml(JSON.stringify(f.name))}, 'approve')">✅ Approve</button>`);
+        }
+        return `<tr${f.status === 'Pending Review' || f.status === 'Pending Approval' ? ' style="background:#fffbe6;"' : ''}>
+          <td><strong>${escapeHtml(f.name)}</strong></td>
+          <td>${f.days}</td>
+          <td>±${f.tolerance_days}</td>
+          <td>${statusPill(f.status)}</td>
+          <td style="text-align:right;">
+            ${wfBtns.join(' ')}
+            ${adminMode && f.status === 'Active' ? `<button class="btn ghost sm" onclick='openFreqModal(${escapeHtml(JSON.stringify(f))})'>Edit</button>
+                                                    <button class="btn ghost sm" onclick="deleteFreq(${f.id})">×</button>` : ''}
+          </td></tr>`;
+      }).join('');
     $('catBody').innerHTML = cats.length === 0 ? '<tr class="empty-row"><td colspan="3">No categories</td></tr>' :
       cats.map(c => `<tr>
         <td><strong>${escapeHtml(c.name)}</strong></td>
@@ -935,20 +947,87 @@ async function loadPmConfig() {
 }
 
 // ----- Frequency master CRUD -----
-function openFreqModal(existing) {
+async function openFreqModal(existing) {
   const f = existing || { name:'', days:'', tolerance_days:0 };
+  // Editing only allowed on Active rows — adding requires reviewer + approver
+  // pickers because the new row enters the same 2-stage workflow as other masters.
+  const isNew = !existing;
+  const users = isNew ? await loadActiveUsers() : [];
   openModal({
     title: existing ? `Edit Maintenance Frequency — ${escapeHtml(f.name)}` : 'Add Maintenance Frequency',
     body: `
       <div class="form-row"><label>Maintenance Frequency *</label><input name="name" value="${escapeHtml(f.name)}" required placeholder="e.g. Monthly" /></div>
       <div class="form-row"><label>Frequency Interval (Days) *</label><input name="days" type="number" min="1" value="${escapeHtml(f.days)}" required /></div>
       <div class="form-row"><label>Allowed Tolerance (Days)</label><input name="tolerance_days" type="number" min="0" value="${escapeHtml(f.tolerance_days)}" /></div>
-    `,
+    ` + (isNew ? masterApproverFields(users) : ''),
+    submitLabel: isNew ? 'Submit for Review' : 'Save Changes',
     onSubmit: async (data) => {
       const payload = { name: data.name, days: Number(data.days), tolerance_days: Number(data.tolerance_days || 0) };
-      if (existing) await api('PUT', `/api/frequencies/${existing.id}`, payload);
-      else          await api('POST','/api/frequencies', payload);
-      toast('Saved.', 'success'); loadPmConfig();
+      if (existing) {
+        await api('PUT', `/api/frequencies/${existing.id}`, payload);
+        toast('Saved.', 'success');
+      } else {
+        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
+        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        payload.reviewer_id = Number(data.reviewer_id);
+        payload.approver_id = Number(data.approver_id);
+        await api('POST','/api/frequencies', payload);
+        toast('Frequency submitted for review.', 'success');
+      }
+      loadPmConfig();
+    }
+  });
+}
+
+// Review / Approve action modal for Frequency master rows.
+// Mirrors openMasterDecisionModal but targets /api/frequencies/:id/<stage>.
+async function openFreqDecisionModal(freqId, freqName, stage) {
+  const verb = stage === 'review' ? 'Review' : 'Approve';
+  const approveLabel = stage === 'review' ? 'Forward to Approver…' : 'Approve & Activate…';
+  const performAction = (decision, remarks) => {
+    const meaning = decision === 'approve'
+      ? (stage === 'review'
+         ? `I have reviewed Frequency "${freqName}" and forward it to the Approver.`
+         : `I approve Frequency "${freqName}" for activation. I am responsible for its correctness and GMP impact.`)
+      : `I reject Frequency "${freqName}" at ${verb} stage. Remarks: ${remarks}`;
+    setTimeout(() => {
+      openESignatureModal({
+        title: `Sign — ${verb} Frequency ${freqName}`,
+        meaning,
+        onConfirm: async (esig) => {
+          await api('PUT', `/api/frequencies/${freqId}/${stage}`, { decision, remarks, ...esig });
+          toast(decision === 'approve'
+            ? (stage === 'review' ? 'Reviewed — passed to Approver' : 'Approved — now Active')
+            : 'Rejected.', 'success');
+          loadPmConfig();
+        }
+      });
+    }, 0);
+  };
+  window.__freqRejectFn = () => {
+    const ta = document.querySelector('textarea[name="freqRemarks"]');
+    const remarks = ta ? ta.value.trim() : '';
+    if (!remarks) { toast('Remarks are required for rejection', 'error'); return; }
+    performAction('reject', remarks);
+  };
+  openModal({
+    title: `${verb} — Frequency ${freqName}`,
+    width: 500,
+    body: `
+      <p style="font-size:12px; color:var(--muted); margin-top:0;">
+        ${stage === 'review'
+          ? 'Reviewing this Frequency will pass it to the assigned Approver. Rejecting sends it back to the creator with your remarks.'
+          : 'Approving this Frequency marks it as Active and available for assignment to checklists. Rejecting returns it to the creator with your remarks.'}<br>
+        <strong>You will be asked to sign with your password on the next step.</strong>
+      </p>
+      <div class="form-row"><label>Remarks</label>
+        <textarea name="freqRemarks" rows="3" placeholder="Optional for Approve · Required for Reject"></textarea>
+      </div>
+    `,
+    submitLabel: approveLabel,
+    actions: `<button type="button" class="btn ghost" style="color:#c53030; border-color:#fbd5d5;" onclick="window.__freqRejectFn()">✗ Reject…</button>`,
+    onSubmit: async (data) => {
+      performAction('approve', (data.freqRemarks || '').trim());
     }
   });
 }

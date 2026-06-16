@@ -188,7 +188,14 @@ function createSchema() {
       name TEXT UNIQUE NOT NULL,
       days INTEGER NOT NULL,
       tolerance_days INTEGER NOT NULL,
-      status TEXT NOT NULL DEFAULT 'Active'
+      status TEXT NOT NULL DEFAULT 'Pending Review',
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT,
+      review_remarks TEXT,
+      approved_at TEXT,
+      approval_remarks TEXT
     );
 
     -- PM category master (editable by manage_pm_categories)
@@ -549,6 +556,17 @@ function migrateSchema() {
   addColIfMissing('checklist_assignments', 'clearance_responded_at', 'TEXT');
   addColIfMissing('checklist_assignments', 'clearance_remarks', 'TEXT');
   addColIfMissing('frequencies', 'status', "TEXT NOT NULL DEFAULT 'Active'");
+  // Frequency master now follows the same 2-stage Review→Approve workflow as the
+  // 6 main masters. Existing seeded frequencies (Active) stay Active; only newly
+  // created rows are subject to approval. These columns are nullable so the
+  // existing seed rows don't need backfilling.
+  addColIfMissing('frequencies', 'created_by',       'INTEGER');
+  addColIfMissing('frequencies', 'reviewer_id',      'INTEGER');
+  addColIfMissing('frequencies', 'approver_id',      'INTEGER');
+  addColIfMissing('frequencies', 'reviewed_at',      'TEXT');
+  addColIfMissing('frequencies', 'review_remarks',   'TEXT');
+  addColIfMissing('frequencies', 'approved_at',      'TEXT');
+  addColIfMissing('frequencies', 'approval_remarks', 'TEXT');
   addColIfMissing('pm_categories', 'status', "TEXT NOT NULL DEFAULT 'Active'");
   addColIfMissing('pm_categories', 'description', 'TEXT');
 
