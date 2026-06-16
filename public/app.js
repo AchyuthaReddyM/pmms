@@ -338,26 +338,35 @@ async function openMasterDecisionModal(master, id, stage) {
   const approveLabel = stage === 'review' ? 'Forward to Approver…' : 'Approve & Activate…';
   const masterLabel = master.slice(0,-1).replace(/^./,c=>c.toUpperCase());
 
-  // After the user fills remarks + clicks Approve/Reject, we close this modal and
-  // open the e-signature modal to capture password + meaning acknowledgement.
+  // After the user fills remarks + clicks Approve/Reject, we open the
+  // e-signature modal to capture password + meaning acknowledgement.
+  //
+  // IMPORTANT: the e-sig modal open is wrapped in setTimeout(0) because when
+  // this is triggered from the form-submit path (Forward to Approver), the
+  // outer openModal's submit handler calls closeModal() AFTER onSubmit returns.
+  // Without the defer, that closeModal would wipe out the e-sig modal we just
+  // opened, and the user would see the review modal vanish with no password
+  // prompt. The setTimeout pushes our open to the next tick, after the
+  // form-submit auto-close has run.
   const performAction = (decision, remarks) => {
     const meaning = decision === 'approve'
       ? (stage === 'review'
          ? `I have reviewed the ${masterLabel} "${id}" and forward it to the Approver.`
          : `I approve the ${masterLabel} "${id}" for activation. I am responsible for its correctness and GMP impact.`)
       : `I reject the ${masterLabel} "${id}" at ${verb} stage. Remarks: ${remarks}`;
-    closeModal();
-    openESignatureModal({
-      title: `Sign — ${verb} ${masterLabel} ${id}`,
-      meaning,
-      onConfirm: async (esig) => {
-        await api('PUT', `/api/${master}/${encodeURIComponent(id)}/${stage}`, { decision, remarks, ...esig });
-        toast(decision === 'approve'
-          ? (stage === 'review' ? 'Reviewed — passed to Approver' : 'Approved — now Active')
-          : 'Rejected.', 'success');
-        loadMasters(CURRENT_MASTER);
-      }
-    });
+    setTimeout(() => {
+      openESignatureModal({
+        title: `Sign — ${verb} ${masterLabel} ${id}`,
+        meaning,
+        onConfirm: async (esig) => {
+          await api('PUT', `/api/${master}/${encodeURIComponent(id)}/${stage}`, { decision, remarks, ...esig });
+          toast(decision === 'approve'
+            ? (stage === 'review' ? 'Reviewed — passed to Approver' : 'Approved — now Active')
+            : 'Rejected.', 'success');
+          loadMasters(CURRENT_MASTER);
+        }
+      });
+    }, 0);
   };
 
   window.__masterRejectFn = () => {
