@@ -13,7 +13,7 @@ forge them.
 USAGE
 -----
     pip install cryptography
-    python tools/make_keypair.py
+    python lictool/make_keypair.py
 
 Re-running this script OVERWRITES the existing keys. If you do that after
 shipping a build, every license you've already issued becomes invalid.
@@ -34,7 +34,7 @@ PUB_PATH  = os.path.join(HERE, "license_public.pem")
 
 def main():
     if os.path.exists(PRIV_PATH):
-        ans = input(f"⚠  {PRIV_PATH} already exists. Overwrite? Type 'yes' to confirm: ").strip().lower()
+        ans = input(f"!  {PRIV_PATH} already exists. Overwrite? Type 'yes' to confirm: ").strip().lower()
         if ans != "yes":
             print("Cancelled.")
             return
@@ -65,15 +65,15 @@ def main():
         pass
 
     print()
-    print(f"✓ Private key written → {PRIV_PATH}")
-    print(f"✓ Public key written  → {PUB_PATH}")
+    print(f"OK  Private key written -> {PRIV_PATH}")
+    print(f"OK  Public key written  -> {PUB_PATH}")
     print()
     print("=" * 72)
     print("NEXT STEP — paste this PUBLIC KEY into license.js:")
     print("=" * 72)
     print()
     print("Open  ./license.js")
-    print("Find  const PUBLIC_KEY_PEM = `…`;")
+    print("Find  const PUBLIC_KEY_PEM = `...`;")
     print("Replace the body (the part BETWEEN -----BEGIN----- and -----END-----)")
     print("with the body of license_public.pem.")
     print()

@@ -15,10 +15,13 @@ Thumbs.db
 dist/
 *.exe
 
-# Licensing
-# NEVER commit the private key — anyone with it can forge unlimited licenses.
-tools/license_private.pem
+# Licensing — NEVER commit the private key (anyone with it can forge licenses).
+lictool/license_private.pem
+lictool/license_public.pem
+lictool/licenses_issued.csv
 # Runtime license file (sits next to the .exe on each install)
 license.txt
-# CSV ledger of licenses you've issued — sensitive but you decide whether to keep it.
+# Old folder name — kept for safety in case any cache references it.
+tools/license_private.pem
+tools/license_public.pem
 tools/licenses_issued.csv

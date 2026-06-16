@@ -2,7 +2,7 @@
 """
 make_license.py — Issue a signed PMMS license key.
 
-Reads tools/license_private.pem and signs a JSON payload with RSA-PSS / SHA-256.
+Reads lictool/license_private.pem and signs a JSON payload with RSA-PSS / SHA-256.
 Output is a single line you email to your customer:
 
     <base64(payload_json)>.<base64(signature)>
@@ -10,17 +10,19 @@ Output is a single line you email to your customer:
 USAGE — interactive (prompts you for inputs)
 --------------------------------------------
     pip install cryptography
-    python tools/make_license.py
+    python lictool/make_license.py
 
 USAGE — non-interactive (scriptable)
 ------------------------------------
-    python tools/make_license.py \
-        --fingerprint abc123… \
-        --expiry 2027-12-31 \
-        --customer "Ways Automation" \
+    python lictool/make_license.py ^
+        --fingerprint abc123... ^
+        --expiry 2027-12-31 ^
+        --customer "Ways Automation" ^
         --notes "Office testing batch"
 
-Either way the script appends a row to tools/licenses_issued.csv so you have a
+    Or with --months 6 to compute expiry automatically (today + 6 months).
+
+Either way the script appends a row to lictool/licenses_issued.csv so you have a
 record of every key you've ever issued.
 """
 import argparse
@@ -50,7 +52,7 @@ def b64(data: bytes) -> str:
 
 def load_private_key():
     if not os.path.exists(PRIV_PATH):
-        sys.exit(f"✗ Private key not found at {PRIV_PATH}. Run tools/make_keypair.py first.")
+        sys.exit(f"Private key not found at {PRIV_PATH}. Run lictool/make_keypair.py first.")
     with open(PRIV_PATH, "rb") as f:
         return serialization.load_pem_private_key(f.read(), password=None)
 
@@ -89,31 +91,55 @@ def prompt(label, validator=None, default=None):
             raw = default
         if validator is None or validator(raw):
             return raw
-        print(f"   ↑ that doesn't look right, try again.")
+        print("   ^ that doesn't look right, try again.")
+
+
+def add_months(d: dt.date, months: int) -> dt.date:
+    """Add a number of months to a date, clamping the day if needed."""
+    total = d.year * 12 + (d.month - 1) + months
+    y, m = divmod(total, 12)
+    m += 1
+    # clamp day
+    day = d.day
+    while True:
+        try:
+            return dt.date(y, m, day)
+        except ValueError:
+            day -= 1
+            if day < 1:
+                raise
 
 
 def main():
     ap = argparse.ArgumentParser(description="Issue a signed PMMS license key.")
+    ap.add_argument("fingerprint_positional", nargs="?", help="(Optional) fingerprint as positional arg.")
     ap.add_argument("--fingerprint", help="32-hex-char machine fingerprint from PMMS.")
     ap.add_argument("--expiry", help="YYYY-MM-DD. Leave blank for perpetual.")
+    ap.add_argument("--months", type=int, help="Shortcut: expiry = today + N months.")
     ap.add_argument("--customer", default="", help="Customer/installation name.")
     ap.add_argument("--notes", default="", help="Free-text notes (kept in the license + your CSV log).")
     args = ap.parse_args()
 
     print("PMMS license generator")
-    print("─" * 60)
+    print("-" * 60)
 
-    fp = args.fingerprint or prompt("Machine fingerprint", looks_like_fp)
+    fp = args.fingerprint or args.fingerprint_positional
+    if not fp:
+        fp = prompt("Machine fingerprint", looks_like_fp)
     fp = fp.strip().lower()
+    if not looks_like_fp(fp):
+        sys.exit(f"Bad fingerprint: {fp!r}")
 
-    if args.expiry is not None:
+    if args.months:
+        expiry = add_months(dt.date.today(), args.months).isoformat()
+    elif args.expiry is not None:
         expiry = args.expiry.strip()
     else:
         expiry = prompt("Expiry (YYYY-MM-DD, blank = perpetual)",
                         lambda s: s == "" or looks_like_date(s),
                         default="")
     if expiry and not looks_like_date(expiry):
-        sys.exit(f"✗ Bad expiry: {expiry!r}")
+        sys.exit(f"Bad expiry: {expiry!r}")
 
     customer = args.customer if args.customer is not None else prompt("Customer name (optional)", default="")
     notes    = args.notes if args.notes is not None else prompt("Notes (optional)", default="")

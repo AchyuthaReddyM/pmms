@@ -27,10 +27,10 @@ async function api(method, url, body) {
   if (body !== undefined) opts.body = JSON.stringify(body);
   const r = await fetch(url, opts);
   if (r.status === 402) {
-    // License required — show the license screen and stop the regular flow.
-    const data = await r.json().catch(() => ({}));
-    showLicenseScreen(data.license_state || { reason: 'License required' });
-    throw new Error(data.error || 'License required');
+    // License invalid — server has the truth; bounce the browser to the
+    // standalone activation page. Stays out of the main app entirely.
+    window.location.href = '/license.html';
+    throw new Error('License required');
   }
   if (r.status === 401) {
     // Session expired / DB-side session row no longer exists.
@@ -52,117 +52,12 @@ async function api(method, url, body) {
 
 // ---------- Login flow ----------
 function showLogin() {
-  hideLicenseScreen();
   $('loginModal').classList.remove('hidden');
   $('appShell').classList.add('hidden');
 }
 function showApp() {
-  hideLicenseScreen();
   $('loginModal').classList.add('hidden');
   $('appShell').classList.remove('hidden');
-}
-
-// ---------- License screen ----------
-function hideLicenseScreen() {
-  const el = document.getElementById('licenseScreen');
-  if (el) el.style.display = 'none';
-}
-
-function showLicenseScreen(state) {
-  // Lock everything else away — neither the login modal nor the app shell
-  // should be reachable until a valid license is on disk.
-  $('loginModal').classList.add('hidden');
-  $('appShell').classList.add('hidden');
-  let el = document.getElementById('licenseScreen');
-  if (!el) {
-    el = document.createElement('div');
-    el.id = 'licenseScreen';
-    el.style.cssText = 'position:fixed; inset:0; background:linear-gradient(135deg,#fff7e6 0%, #fff 100%); z-index:9999; overflow:auto; padding:40px 20px;';
-    document.body.appendChild(el);
-  }
-  const reasonText = state.reason || 'License required.';
-  const fp = state.fingerprint || '—';
-  el.innerHTML = `
-    <div style="max-width:680px; margin:0 auto; background:#fff; padding:32px; border-radius:10px; box-shadow:0 8px 30px rgba(0,0,0,0.08);">
-      <h1 style="margin-top:0;">🔒 PMMS License Required</h1>
-      <p style="color:var(--muted); font-size:14px; line-height:1.5;">
-        This installation needs a valid license key to run. Send the machine fingerprint below
-        to your licensor, and paste the returned key into the field at the bottom of this page.
-      </p>
-      <div style="background:#fffbe6; border:1px solid #ffe7ad; border-radius:6px; padding:10px 14px; font-size:12px; margin:14px 0;">
-        <strong>Status:</strong> ${escapeHtml(state.mode || 'unknown')}<br>
-        <strong>Reason:</strong> ${escapeHtml(reasonText)}
-      </div>
-
-      <h3 style="margin-top:22px;">Machine fingerprint</h3>
-      <p style="font-size:12px; color:var(--muted); margin:0 0 6px;">Email this string to your licensor. It identifies this exact Windows install.</p>
-      <div style="display:flex; gap:8px; align-items:stretch;">
-        <input id="licFingerprint" readonly value="${escapeHtml(fp)}" style="flex:1; font-family:monospace; font-size:14px; padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:#f5f5f5;" />
-        <button class="btn ghost sm" type="button" onclick="copyFingerprint()">📋 Copy</button>
-      </div>
-
-      <h3 style="margin-top:22px;">Paste your license key</h3>
-      <p style="font-size:12px; color:var(--muted); margin:0 0 6px;">Single line, format <code>&lt;payload&gt;.&lt;signature&gt;</code>.</p>
-      <textarea id="licInput" rows="4" placeholder="Paste the license key the licensor sent you…"
-                style="width:100%; font-family:monospace; font-size:11px; padding:8px 10px; border:1px solid var(--border); border-radius:6px; box-sizing:border-box;"></textarea>
-      <div id="licError" style="color:var(--red); font-size:12px; min-height:18px; margin-top:6px;"></div>
-      <div style="margin-top:10px; display:flex; gap:8px;">
-        <button class="btn primary" type="button" onclick="uploadLicense()">Activate License</button>
-        <button class="btn ghost" type="button" onclick="checkLicenseAgain()">Re-check</button>
-      </div>
-
-      <hr style="margin:24px 0; border:none; border-top:1px solid var(--border);" />
-      <p style="font-size:11px; color:var(--muted); margin:0;">
-        Once the key is accepted, the page reloads and the app becomes available.
-        If you replace hardware (new drive, OS reinstall) the fingerprint will change and you'll need a fresh key.
-      </p>
-    </div>`;
-  el.style.display = 'block';
-}
-
-async function copyFingerprint() {
-  const el = document.getElementById('licFingerprint');
-  if (!el) return;
-  try {
-    await navigator.clipboard.writeText(el.value);
-    toast('Fingerprint copied. Paste into your email to the licensor.', 'success');
-  } catch (e) {
-    el.select();
-    document.execCommand('copy');
-    toast('Fingerprint copied.', 'success');
-  }
-}
-
-async function uploadLicense() {
-  const input = document.getElementById('licInput');
-  const err = document.getElementById('licError');
-  err.textContent = '';
-  const key = (input.value || '').trim();
-  if (!key) { err.textContent = 'Paste the license key first.'; return; }
-  try {
-    const r = await fetch('/api/license/upload', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ license: key }),
-    });
-    const data = await r.json().catch(() => ({}));
-    if (!r.ok) { err.textContent = data.error || 'Failed to activate.'; return; }
-    toast('License activated. Loading the app…', 'success');
-    setTimeout(() => window.location.reload(), 800);
-  } catch (e) {
-    err.textContent = e.message || 'Network error.';
-  }
-}
-
-async function checkLicenseAgain() {
-  try {
-    const r = await fetch('/api/license/info');
-    const s = await r.json();
-    if (s.valid) { window.location.reload(); return; }
-    showLicenseScreen(s);
-  } catch (e) {
-    document.getElementById('licError').textContent = 'Could not reach server. Is PMMS running?';
-  }
 }
 
 async function tryAutoLogin() {
@@ -3817,22 +3712,4 @@ async function openReassignExpiredModal(assignment) {
 // ===========================================================
 // BOOT
 // ===========================================================
-// Bootstrap: check license first. If invalid, show the license screen and stop.
-// Otherwise show the expiry banner if applicable, then proceed to login.
-(async () => {
-  try {
-    const r = await fetch('/api/license/info');
-    const s = await r.json();
-    if (!s.valid) { showLicenseScreen(s); return; }
-    if (s.expiring_soon && s.days_remaining != null) {
-      // Persistent amber banner above the topbar
-      setTimeout(() => {
-        const banner = document.createElement('div');
-        banner.style.cssText = 'background:#fff7e6; color:#7a5400; border-bottom:1px solid #ffe7ad; padding:8px 16px; text-align:center; font-size:13px;';
-        banner.innerHTML = `⚠ License expires in <strong>${s.days_remaining}</strong> day(s) on <strong>${escapeHtml(s.expiry)}</strong>. Request a renewed key from your licensor.`;
-        document.body.insertBefore(banner, document.body.firstChild);
-      }, 500);
-    }
-  } catch (e) { /* server unreachable; tryAutoLogin will error too */ }
-  tryAutoLogin();
-})();
+tryAutoLogin();

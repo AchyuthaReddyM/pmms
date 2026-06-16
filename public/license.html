@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PMMS — Activation</title>
+  <link rel="icon" href="/logo-icon.svg" />
+  <style>
+    :root {
+      --brand:#8a5a32; --brown-700:#6b4422; --cream-100:#f7eedd; --border:#e6d8c0;
+      --muted:#7c7565; --green:#2f7a44; --red:#c53030;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      color: #2a261d; background: linear-gradient(135deg, #fff7e6 0%, #fffaf0 100%);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 720px; margin: 0 auto; padding: 40px 20px; }
+    .card {
+      background: #fff; border-radius: 12px; padding: 32px 36px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.08);
+    }
+    h1 { margin: 0 0 8px; font-size: 24px; }
+    h3 { margin: 22px 0 6px; font-size: 14px; color: var(--brown-700); text-transform: uppercase; letter-spacing: .5px; }
+    p { color: var(--muted); margin: 0 0 10px; font-size: 13px; }
+    code { background: #f5efe2; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+    .status {
+      background: #fffbe6; border: 1px solid #ffe7ad; border-radius: 6px;
+      padding: 10px 14px; font-size: 12px; margin: 14px 0;
+    }
+    .status.ok { background: #eaf6ea; border-color: #c3e0c5; color: var(--green); }
+    .status.bad { background: #fdecec; border-color: #f5c2c2; color: var(--red); }
+    .row { display: flex; gap: 8px; align-items: stretch; }
+    input[type="text"], textarea {
+      flex: 1; font-family: 'Menlo','Consolas',monospace; font-size: 12px;
+      padding: 9px 11px; border: 1px solid var(--border); border-radius: 6px;
+      background: #f8f4ec; width: 100%;
+    }
+    textarea { min-height: 100px; resize: vertical; }
+    .btn {
+      padding: 9px 16px; border-radius: 6px; cursor: pointer; font-size: 13px;
+      border: 1px solid var(--border); background: #fff; color: #2a261d;
+    }
+    .btn:hover { background: #f5efe2; }
+    .btn.primary { background: var(--brand); color: #fff; border-color: var(--brand); }
+    .btn.primary:hover { background: var(--brown-700); }
+    .btn:disabled { opacity: .55; cursor: not-allowed; }
+    .err { color: var(--red); font-size: 12px; min-height: 18px; margin-top: 6px; }
+    .ok  { color: var(--green); font-size: 12px; min-height: 18px; margin-top: 6px; }
+    .hr  { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+    .header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+    .header .logo { width: 46px; height: 46px; background: var(--brand); border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 600; font-size: 18px; }
+    .small { font-size: 11px; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="header">
+        <div class="logo">PMMS</div>
+        <div>
+          <h1>License Activation</h1>
+          <div class="small">PMMS · Ways Automation</div>
+        </div>
+      </div>
+
+      <p>This PMMS installation needs a valid license key to run. Send the machine fingerprint below to your licensor, and paste the returned key into the field at the bottom.</p>
+
+      <div id="statusBox" class="status">Checking license status…</div>
+
+      <h3>Machine fingerprint</h3>
+      <p>Email this string to your licensor. It identifies this exact Windows install.</p>
+      <div class="row">
+        <input id="fp" type="text" readonly value="…loading…" />
+        <button class="btn" type="button" onclick="copyFp()">📋 Copy</button>
+      </div>
+
+      <h3>Paste your license key</h3>
+      <p>Single line, format <code>&lt;payload&gt;.&lt;signature&gt;</code>.</p>
+      <textarea id="lic" placeholder="Paste the license key the licensor sent you…"></textarea>
+      <div id="msg" class="err"></div>
+      <div style="margin-top: 10px; display: flex; gap: 8px;">
+        <button class="btn primary" type="button" onclick="activate()">Activate License</button>
+        <button class="btn" type="button" onclick="recheck()">Re-check</button>
+        <span style="flex:1;"></span>
+        <button class="btn" type="button" onclick="window.location.href='/'">Back to App</button>
+      </div>
+
+      <hr class="hr" />
+      <p class="small">
+        Once the key is accepted, the page reloads and the app becomes available.
+        If you replace hardware (new drive, OS reinstall) the fingerprint changes and you'll need a fresh key.
+      </p>
+    </div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    async function loadInfo() {
+      try {
+        const r = await fetch('/api/license/info');
+        const s = await r.json();
+        $('fp').value = s.fingerprint || '(unavailable)';
+
+        const box = $('statusBox');
+        if (s.valid) {
+          box.className = 'status ok';
+          const exp = s.expiry ? ` until ${s.expiry}` : ' (perpetual)';
+          const cust = s.customer ? ` for "${s.customer}"` : '';
+          box.innerHTML = `✓ License is <strong>active</strong>${exp}${cust}.${s.days_remaining!=null?` ${s.days_remaining} day(s) remaining.`:''} You can <a href="/">return to the app</a>.`;
+        } else if (s.mode === 'unconfigured') {
+          box.className = 'status';
+          box.innerHTML = '⚠ This build was shipped without a public key — licensing is disabled. The app is running unrestricted.';
+        } else if (s.mode === 'dev') {
+          box.className = 'status';
+          box.innerHTML = 'ℹ Dev mode — license enforcement is bypassed for non-packaged runs.';
+        } else {
+          box.className = 'status bad';
+          box.innerHTML = `<strong>Status:</strong> ${escape(s.mode || 'unknown')}<br><strong>Reason:</strong> ${escape(s.reason || 'License required.')}`;
+        }
+      } catch (e) {
+        $('statusBox').className = 'status bad';
+        $('statusBox').textContent = 'Could not reach server. Is PMMS running?';
+      }
+    }
+
+    function escape(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
+    async function copyFp() {
+      const v = $('fp').value;
+      try {
+        await navigator.clipboard.writeText(v);
+        flashMsg('Fingerprint copied to clipboard.', 'ok');
+      } catch (e) {
+        $('fp').select(); document.execCommand('copy');
+        flashMsg('Fingerprint copied.', 'ok');
+      }
+    }
+
+    function flashMsg(text, kind) {
+      const el = $('msg');
+      el.className = kind === 'ok' ? 'ok' : 'err';
+      el.textContent = text;
+      if (kind === 'ok') setTimeout(() => { if (el.textContent === text) el.textContent = ''; }, 3000);
+    }
+
+    async function activate() {
+      const key = ($('lic').value || '').trim();
+      if (!key) { flashMsg('Paste the license key first.', 'err'); return; }
+      flashMsg('Verifying…', 'ok');
+      try {
+        const r = await fetch('/api/license/upload', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ license: key }),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) { flashMsg(data.error || 'Activation failed.', 'err'); return; }
+        flashMsg('License activated. Loading the app…', 'ok');
+        setTimeout(() => window.location.href = '/', 700);
+      } catch (e) {
+        flashMsg(e.message || 'Network error.', 'err');
+      }
+    }
+
+    async function recheck() {
+      flashMsg('Re-checking…', 'ok');
+      await loadInfo();
+      const s = await (await fetch('/api/license/info')).json();
+      if (s.valid) window.location.href = '/';
+    }
+
+    loadInfo();
+  </script>
+</body>
+</html>

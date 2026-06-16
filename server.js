@@ -55,6 +55,18 @@ app.post('/api/license/upload', (req, res) => {
 // circuits to allow /api/license/* through unconditionally.
 app.use('/api/', license.requireValidLicense);
 
+// When the browser asks for the app root (index.html) AND the license is
+// invalid, send it straight to the standalone activation page instead. This
+// matches the WaysApp pattern — main app.js doesn't know anything about
+// licensing; the gate is purely server-side.
+app.get(['/', '/index.html'], (req, res, next) => {
+  const s = license.getState();
+  if (!s.valid) {
+    return res.redirect('/license.html');
+  }
+  next();
+});
+
 // ---------- Helpers ----------
 function audit(user, action, entity, entity_id, details = '') {
   db.prepare('INSERT INTO audit_log(user_id,user_name,action,entity,entity_id,details) VALUES (?,?,?,?,?,?)')

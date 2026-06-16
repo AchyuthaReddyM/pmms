@@ -183,28 +183,38 @@ PMMS ships with an offline license system. Each `.exe` install is locked to one 
 
 ```bash
 pip install cryptography
-python tools/make_keypair.py
+python lictool/make_keypair.py
 ```
 
-This produces `tools/license_private.pem` (keep secret) and `tools/license_public.pem` (safe to commit/share). The script prints the public key — paste the body (between `-----BEGIN PUBLIC KEY-----` and `-----END PUBLIC KEY-----`) into `license.js` over the `__REPLACE_WITH_OUTPUT_FROM_make_keypair_py__` placeholder. Rebuild the exe.
+This produces `lictool/license_private.pem` (keep secret) and `lictool/license_public.pem` (safe to commit/share). The script prints the public key — paste the body (between `-----BEGIN PUBLIC KEY-----` and `-----END PUBLIC KEY-----`) into `license.js` over the `__REPLACE_WITH_OUTPUT_FROM_make_keypair_py__` placeholder. Rebuild the exe.
 
 Until the placeholder is replaced, licensing runs in "unconfigured" mode — the app starts unrestricted and prints a warning. After replacement, the app enforces a valid license at every API call when running as a packaged exe.
 
+### How it works at runtime
+
+The licensing layer is fully server-side. When the customer first opens `PMMS.exe`:
+
+1. Express serves `/` → sees the license is invalid → 302-redirects the browser to `/license.html`.
+2. `public/license.html` is a standalone activation page (separate from the main app) that fetches `/api/license/info`, shows the machine fingerprint, accepts a pasted key, and POSTs to `/api/license/upload`.
+3. On a valid key, the browser redirects back to `/` → license check passes → the main app loads normally.
+
+The main app's `public/app.js` is **not** modified for licensing — it only knows to bounce to `/license.html` if it ever sees an `HTTP 402` response (defensive fallback for AJAX calls).
+
 ### Issuing a license for a customer
 
-1. They install PMMS and double-click `PMMS.exe`. The license screen appears showing a 32-char fingerprint (e.g. `7a9f3c…`).
+1. They install PMMS and double-click `PMMS.exe`. The activation page opens automatically with a 32-char fingerprint (e.g. `7a9f3c…`).
 2. They email you the fingerprint.
-3. You run:
+3. You run, on your dev machine:
    ```bash
-   python tools/make_license.py
+   python lictool/make_license.py 7a9f3c... --months 6 --customer "Their Plant"
    ```
-   It prompts for: fingerprint, expiry (`YYYY-MM-DD` or blank for perpetual), customer name, notes. Outputs a single-line key like:
+   Or just `python lictool/make_license.py` and answer the prompts. Outputs a single-line key:
    ```
    eyJ2IjoxLCJmcCI6IjdhOWYzYy…ZUUw==.cVdN2MlpY…dG8=
    ```
-4. Email it back. The customer pastes it into the license screen → click Activate → the app reloads.
+4. Email it back. The customer pastes it into the activation page → click Activate → the app reloads.
 
-Every issued key is appended to `tools/licenses_issued.csv` (gitignored) so you have a paper trail.
+Every issued key is appended to `lictool/licenses_issued.csv` (gitignored) so you have a paper trail.
 
 ### Where the license lives on the customer's machine
 
@@ -230,9 +240,9 @@ For internal pharma deployment to a known testing team, this is appropriate. For
 
 | What's safe to commit / share | What's NEVER shared |
 |---|---|
-| `license.js` (contains public key) | `tools/license_private.pem` |
-| `tools/license_public.pem` | The private key, on any medium |
-| `tools/make_keypair.py` / `make_license.py` | `tools/licenses_issued.csv` |
+| `license.js` (contains public key) | `lictool/license_private.pem` |
+| `lictool/license_public.pem` | The private key, on any medium |
+| `lictool/make_keypair.py` / `make_license.py` | `lictool/licenses_issued.csv` |
 | The compiled `PMMS.exe` | A copy of your dev machine |
 
 If `license_private.pem` ever leaks, generate a new keypair, paste the new public key into license.js, rebuild, and re-issue every active license against the new keypair. Existing keys signed with the leaked private key will silently stop working on the rebuilt exe (the verify step fails).
