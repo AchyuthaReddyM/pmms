@@ -14,3 +14,11 @@ Thumbs.db
 # pkg build output — the .exe is generated, not committed
 dist/
 *.exe
+
+# Licensing
+# NEVER commit the private key — anyone with it can forge unlimited licenses.
+tools/license_private.pem
+# Runtime license file (sits next to the .exe on each install)
+license.txt
+# CSV ledger of licenses you've issued — sensitive but you decide whether to keep it.
+tools/licenses_issued.csv

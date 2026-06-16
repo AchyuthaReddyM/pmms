@@ -26,7 +26,8 @@
   "pkg": {
     "scripts": [
       "server.js",
-      "db.js"
+      "db.js",
+      "license.js"
     ],
     "assets": [
       "public/**/*",

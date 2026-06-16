@@ -3,6 +3,7 @@ const path = require('path');
 const crypto = require('crypto');
 const express = require('express');
 const { db, hashPassword, verifyPassword } = require('./db');
+const license = require('./license');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -13,6 +14,46 @@ app.set('trust proxy', 1);
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// ---------- Licensing ----------
+// Print the license state once at boot so the operator can tell at a glance.
+(() => {
+  const s = license.getState();
+  if (s.mode === 'unconfigured') {
+    console.log('[license] ⚠  Public key not configured — running unrestricted. Run tools/make_keypair.py and paste the public key into license.js.');
+  } else if (s.mode === 'dev') {
+    console.log('[license] ℹ  Dev mode — license enforcement skipped.');
+  } else if (s.valid) {
+    console.log(`[license] ✓ Active${s.expiry?` until ${s.expiry}`:''}${s.customer?` for "${s.customer}"`:''}${s.days_remaining!=null?` · ${s.days_remaining} days remaining`:''}`);
+  } else {
+    console.log(`[license] ✗ Invalid: ${s.reason} · fingerprint ${s.fingerprint}`);
+  }
+})();
+
+// License info + upload endpoints — public (no auth) so a fresh install can
+// see the fingerprint and accept a key BEFORE any user has signed in.
+app.get('/api/license/info', (req, res) => {
+  const s = license.getState();
+  res.json(s);
+});
+
+app.post('/api/license/upload', (req, res) => {
+  const { license: licStr } = req.body || {};
+  if (!licStr) return res.status(400).json({ error: 'license string required in body.license' });
+  try {
+    const s = license.saveLicense(licStr);
+    audit({ id: null, name: 'License upload' }, 'LICENSE_UPDATE', 'License', '-',
+      `Activated${s.expiry?` until ${s.expiry}`:''}${s.customer?` for "${s.customer}"`:''}`);
+    res.json(s);
+  } catch (e) {
+    audit({ id: null, name: 'License upload' }, 'LICENSE_REJECTED', 'License', '-', e.message);
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Gate every other /api/* route on a valid license. The middleware short-
+// circuits to allow /api/license/* through unconditionally.
+app.use('/api/', license.requireValidLicense);
 
 // ---------- Helpers ----------
 function audit(user, action, entity, entity_id, details = '') {

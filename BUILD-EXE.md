@@ -175,4 +175,68 @@ Built as a single portable executable — drop it on any Windows 10/11 machine a
 
 ---
 
+## Licensing (RSA-signed, machine-locked)
+
+PMMS ships with an offline license system. Each `.exe` install is locked to one Windows machine using a hash of MachineGuid + C: volume serial. License keys are signed with RSA-2048 so they can't be forged without the private key (which never leaves your dev machine).
+
+### One-time setup (you, the licensor)
+
+```bash
+pip install cryptography
+python tools/make_keypair.py
+```
+
+This produces `tools/license_private.pem` (keep secret) and `tools/license_public.pem` (safe to commit/share). The script prints the public key — paste the body (between `-----BEGIN PUBLIC KEY-----` and `-----END PUBLIC KEY-----`) into `license.js` over the `__REPLACE_WITH_OUTPUT_FROM_make_keypair_py__` placeholder. Rebuild the exe.
+
+Until the placeholder is replaced, licensing runs in "unconfigured" mode — the app starts unrestricted and prints a warning. After replacement, the app enforces a valid license at every API call when running as a packaged exe.
+
+### Issuing a license for a customer
+
+1. They install PMMS and double-click `PMMS.exe`. The license screen appears showing a 32-char fingerprint (e.g. `7a9f3c…`).
+2. They email you the fingerprint.
+3. You run:
+   ```bash
+   python tools/make_license.py
+   ```
+   It prompts for: fingerprint, expiry (`YYYY-MM-DD` or blank for perpetual), customer name, notes. Outputs a single-line key like:
+   ```
+   eyJ2IjoxLCJmcCI6IjdhOWYzYy…ZUUw==.cVdN2MlpY…dG8=
+   ```
+4. Email it back. The customer pastes it into the license screen → click Activate → the app reloads.
+
+Every issued key is appended to `tools/licenses_issued.csv` (gitignored) so you have a paper trail.
+
+### Where the license lives on the customer's machine
+
+In a file named `license.txt` next to `PMMS.exe`. If they re-install, deleting `pmms.db` resets the database but `license.txt` survives. If they move the .exe to a different machine, the fingerprint won't match and the app will block with a clear error.
+
+### Dev / cloud / non-packaged mode
+
+When PMMS runs from source (`node server.js`) or on Render, licensing is automatically bypassed (the check uses `process.pkg` to detect packaging). To test the license screen locally, set `PMMS_ENFORCE_LICENSE=1` before starting the server.
+
+### Renewing or replacing a license
+
+The expiry date is checked at every page load. The app shows an amber banner when within 14 days of expiry. After expiry, every API call returns 402 and the license screen takes over — paste a fresh key to unlock. No service interruption beyond pasting the new key.
+
+### What licensing does NOT protect
+
+- A determined reverse-engineer can patch the binary to skip the `if (license.valid)` branch — RSA only prevents key forgery, not patching. For a stronger guarantee you'd need online activation/heartbeat (out of scope here).
+- A perfect clone of the Windows install (same MachineGuid, same volume serial — e.g. a cloned disk image) will accept the same license.
+- Clock rollback works around expiry. If you care, set up a Windows scheduled task to NTP-sync.
+
+For internal pharma deployment to a known testing team, this is appropriate. For broad commercial distribution against active piracy, consider online activation instead.
+
+### Quick threat-model reminder
+
+| What's safe to commit / share | What's NEVER shared |
+|---|---|
+| `license.js` (contains public key) | `tools/license_private.pem` |
+| `tools/license_public.pem` | The private key, on any medium |
+| `tools/make_keypair.py` / `make_license.py` | `tools/licenses_issued.csv` |
+| The compiled `PMMS.exe` | A copy of your dev machine |
+
+If `license_private.pem` ever leaks, generate a new keypair, paste the new public key into license.js, rebuild, and re-issue every active license against the new keypair. Existing keys signed with the leaked private key will silently stop working on the rebuilt exe (the verify step fails).
+
+---
+
 © 2026 Ways Automation · PMMS
