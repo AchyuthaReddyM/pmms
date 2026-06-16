@@ -279,7 +279,7 @@ function openESignatureModal({ title, meaning, onConfirm }) {
         </label>
       </div>
     `,
-    submitLabel: '✍ Sign &amp; Submit',
+    submitLabel: '✍ Sign & Submit',
     onSubmit: async (data) => {
       if (!data.esig_meaning_ack) throw new Error('You must tick the acknowledgement checkbox to sign.');
       if (!data.esig_password) throw new Error('Password is required.');
