@@ -1770,6 +1770,41 @@ app.put('/api/checklists/:id/approve', requireAuth, requireActivity('approve_che
   res.json({ ok: true });
 });
 
+// ---- Drop / Reactivate ----------------------------------------------------
+// An Approved checklist can be dropped (deactivated) so it's no longer
+// available for new assignments. Existing assignments referencing it are left
+// alone. Dropped checklists can be reactivated. Both actions require e-sig.
+app.put('/api/checklists/:id/drop', requireAuth, requireActivity('approve_checklist','manage_checklists'), requireESignature, (req, res) => {
+  const { remarks } = req.body || {};
+  const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
+  if (!cl) return res.status(404).json({ error: 'Not found' });
+  if (cl.status !== 'Approved') return res.status(409).json({ error: `Only Approved checklists can be dropped (currently ${cl.status})` });
+  if (!remarks || !remarks.trim()) return res.status(400).json({ error: 'Remarks are required to drop a checklist (regulatory traceability)' });
+  db.prepare("UPDATE checklists SET status='Inactive', dropped_at=datetime('now'), drop_remarks=? WHERE id=?").run(remarks, req.params.id);
+  if (cl.created_by && cl.created_by !== req.user.id) {
+    notify(cl.created_by, 'Checklist dropped',
+      `${cl.name} (${cl.version}) has been dropped: ${remarks}`,
+      'checklist_dropped', `/checklists/${req.params.id}`);
+  }
+  audit(req.user, 'DROP', 'Checklist', req.params.id, `Dropped "${cl.name}" (${cl.version}): ${remarks}`);
+  res.json({ ok: true });
+});
+
+app.put('/api/checklists/:id/reactivate', requireAuth, requireActivity('approve_checklist','manage_checklists'), requireESignature, (req, res) => {
+  const { remarks } = req.body || {};
+  const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
+  if (!cl) return res.status(404).json({ error: 'Not found' });
+  if (cl.status !== 'Inactive') return res.status(409).json({ error: `Only Inactive checklists can be reactivated (currently ${cl.status})` });
+  db.prepare("UPDATE checklists SET status='Approved', dropped_at=NULL, drop_remarks=NULL WHERE id=?").run(req.params.id);
+  if (cl.created_by && cl.created_by !== req.user.id) {
+    notify(cl.created_by, 'Checklist reactivated',
+      `${cl.name} (${cl.version}) is now Active again.`,
+      'checklist_reactivated', `/checklists/${req.params.id}`);
+  }
+  audit(req.user, 'REACTIVATE', 'Checklist', req.params.id, `Reactivated "${cl.name}" (${cl.version})${remarks?': '+remarks:''}`);
+  res.json({ ok: true });
+});
+
 // =============================================================
 // CHECKLIST ASSIGNMENTS — manager assigns checklist to user; user is notified
 // =============================================================

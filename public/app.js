@@ -1074,6 +1074,10 @@ async function previewChecklist(id) {
       buttons.push(`<button class="btn ghost sm" onclick="openChecklistBuilder(${cl.id})">Edit</button>`);
       buttons.push(`<button class="btn primary sm" onclick="openSubmitChecklistModal(${cl.id})">Submit for Review →</button>`);
     }
+    // Copy-as-new: available on any checklist (clone the structure into a new draft).
+    if (can('manage_checklists')) {
+      buttons.push(`<button class="btn ghost sm" onclick="openChecklistBuilder(null, ${cl.id})">📋 Copy as new</button>`);
+    }
     if (cl.status === 'Pending Review' && (isReviewer || CURRENT_USER.is_admin) && can('review_checklist')) {
       buttons.push(`<button class="btn primary sm" onclick="reviewChecklistDecision(${cl.id},'approve')">✓ Pass Review</button>`);
       buttons.push(`<button class="btn ghost sm" onclick="reviewChecklistDecision(${cl.id},'reject')">✗ Reject</button>`);
@@ -1084,6 +1088,12 @@ async function previewChecklist(id) {
     }
     if (cl.status === 'Approved' && can('assign_checklist')) {
       buttons.push(`<button class="btn primary sm" onclick="openAssignChecklistModal(${cl.id})">Assign…</button>`);
+    }
+    if (cl.status === 'Approved' && (can('approve_checklist') || can('manage_checklists') || CURRENT_USER.is_admin)) {
+      buttons.push(`<button class="btn ghost sm" style="color:#c53030;" onclick="dropChecklist(${cl.id},'${escapeHtml(cl.name)}')">⊘ Drop / Deactivate…</button>`);
+    }
+    if (cl.status === 'Inactive' && (can('approve_checklist') || can('manage_checklists') || CURRENT_USER.is_admin)) {
+      buttons.push(`<button class="btn primary sm" onclick="reactivateChecklist(${cl.id},'${escapeHtml(cl.name)}')">↻ Reactivate…</button>`);
     }
     $('checklistPreviewActions').innerHTML = buttons.join(' ');
 
@@ -1875,7 +1885,7 @@ const REQUIRED_FIELD_DEFS = [
   { key:'external_report',  label:'External Service Report',           auto: false, desc:'Reference / notes for an external service report' },
 ];
 
-async function openChecklistBuilder(existingId) {
+async function openChecklistBuilder(existingId, copyFromId) {
   try {
     const [groups, cats, freqs] = await Promise.all([
       api('GET','/api/checklist-groups?active=1'),
@@ -1884,7 +1894,15 @@ async function openChecklistBuilder(existingId) {
     ]);
     const activeFreqs = freqs.filter(f => (f.status || 'Active') === 'Active');
     let cl = null;
-    if (existingId) cl = await api('GET', `/api/checklists/${existingId}/full`);
+    if (existingId)        cl = await api('GET', `/api/checklists/${existingId}/full`);
+    else if (copyFromId)   cl = await api('GET', `/api/checklists/${copyFromId}/full`);
+    // When copying, blank out the code (user must pick a new one) and reset version + status fields
+    // so the copy is treated as a brand-new Draft. The original record is untouched.
+    if (cl && copyFromId && !existingId) {
+      cl = { ...cl, code: '', name: cl.name + ' (Copy)', version: 'v1.0', status: 'Draft', id: null,
+             created_by: null, reviewer_id: null, approver_id: null,
+             submitted_at: null, reviewed_at: null, approved_at: null, rejection_reason: null };
+    }
     const existingFreqIds = new Set(((cl && cl.frequencies) || []).map(f => f.id));
     const existingReqd    = new Set(((cl && cl.required_fields) || []));
     // Seed initial sections data
@@ -1990,7 +2008,7 @@ async function openChecklistBuilder(existingId) {
             <select class="cb-qtype">
               ${['text','number','dropdown','checkbox','yesno'].map(t => `<option value="${t}" ${t===q.qtype?'selected':''}>${t}</option>`).join('')}
             </select>
-            <input class="cb-qopts" placeholder="opt1 | opt2 (for dropdown)" value="${escapeHtml(q.options || '')}" />
+            <input class="cb-qopts" placeholder="opt1 | opt2 (dropdown / checkbox)" value="${escapeHtml(q.options || '')}" />
             <label style="font-size:11px; display:flex; gap:3px; align-items:center;"><input type="checkbox" class="cb-qreq" ${q.required?'checked':''} /> req</label>
             <button type="button" class="btn ghost sm" onclick="__cbDelQ(${si}, ${qi})">×</button>
           </div>
@@ -2052,16 +2070,20 @@ async function openChecklistBuilder(existingId) {
     };
 
     openModal({
-      title: existingId ? `Edit Checklist — ${escapeHtml(cl.name)}` : 'New Checklist',
+      title: existingId ? `Edit Checklist — ${escapeHtml(cl.name)}`
+                        : (copyFromId ? `Copy of ${escapeHtml(cl ? cl.name : '')} — New Checklist` : 'New Checklist'),
       width: 820,
       body: renderBuilder(),
-      submitLabel: existingId ? 'Save Changes' : 'Create Checklist',
+      submitLabel: existingId ? 'Save Changes' : (copyFromId ? 'Create Copy' : 'Create Checklist'),
       onSubmit: async (data) => {
         const built = window.__cbReadDOM().map(s => ({
           name: s.name, description: s.description,
           questions: s.questions.filter(q => q.label.trim()).map(q => ({
             label: q.label, qtype: q.qtype,
-            options: q.qtype === 'dropdown' ? q.options.split('|').map(x => x.trim()).filter(Boolean) : null,
+            // Checkbox + Dropdown both use the pipe-separated options field. Yes/No is built-in.
+            options: (q.qtype === 'dropdown' || q.qtype === 'checkbox')
+              ? q.options.split('|').map(x => x.trim()).filter(Boolean)
+              : null,
             required: q.required, min_value: q.min_value, max_value: q.max_value, unit: q.unit,
             frequencies: q.frequencies || []
           }))
@@ -2080,11 +2102,16 @@ async function openChecklistBuilder(existingId) {
           required_fields: reqdKeys,
           frequency_ids: freqIds,
         };
-        if (existingId) await api('PUT', `/api/checklists/${existingId}`, payload);
-        else            await api('POST','/api/checklists', payload);
-        toast('Checklist saved.', 'success');
+        let resultId = existingId;
+        if (existingId) {
+          await api('PUT', `/api/checklists/${existingId}`, payload);
+        } else {
+          const created = await api('POST','/api/checklists', payload);
+          resultId = created && created.id;
+        }
+        toast(copyFromId ? 'Copy created as a new Draft.' : 'Checklist saved.', 'success');
         loadChecklists();
-        if (existingId) previewChecklist(existingId);
+        if (resultId) previewChecklist(resultId);
       }
     });
   } catch (e) { toast(e.message,'error'); }
@@ -2628,6 +2655,39 @@ async function reviewChecklistDecision(checklistId, decision) {
   });
 }
 
+async function dropChecklist(checklistId, name) {
+  const remarks = prompt(`Reason for dropping (deactivating) "${name}" — required for GMP traceability:`);
+  if (!remarks || !remarks.trim()) return;
+  const meaning = `I drop checklist "${name}" — it will no longer be available for new assignments. Reason: ${remarks}`;
+  openESignatureModal({
+    title: `Sign — Drop Checklist`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/checklists/${checklistId}/drop`, { remarks, ...esig });
+      toast('Checklist dropped. Status set to Inactive.', 'success');
+      previewChecklist(checklistId);
+      loadChecklists();
+      refreshNotifBadge();
+    }
+  });
+}
+
+async function reactivateChecklist(checklistId, name) {
+  const remarks = prompt(`Reactivation notes for "${name}" (optional):`) || '';
+  const meaning = `I reactivate checklist "${name}". It is available for new assignments again.${remarks?' Notes: '+remarks:''}`;
+  openESignatureModal({
+    title: `Sign — Reactivate Checklist`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/checklists/${checklistId}/reactivate`, { remarks, ...esig });
+      toast('Checklist reactivated.', 'success');
+      previewChecklist(checklistId);
+      loadChecklists();
+      refreshNotifBadge();
+    }
+  });
+}
+
 async function approveChecklistDecision(checklistId, decision) {
   let reason = null;
   if (decision === 'reject') {
@@ -2771,7 +2831,24 @@ async function openAssignment(assignmentId) {
           let inp = '';
           const dis = formEditable ? '' : 'disabled';
           if (q.qtype === 'number')        inp = `<input type="number" name="q_${q.id}" min="${q.min_value ?? ''}" max="${q.max_value ?? ''}" value="${escapeHtml(val)}" ${q.required?'required':''} ${dis}/>${q.unit?` <span style='color:var(--muted); font-size:11px;'>${escapeHtml(q.unit)}</span>`:''}`;
-          else if (q.qtype === 'checkbox') inp = `<label><input type="checkbox" name="q_${q.id}" ${val?'checked':''} ${dis}/> Yes</label>`;
+          else if (q.qtype === 'checkbox') {
+            // Render one checkbox per configured option. When no options are configured
+            // we fall back to a single boolean checkbox labeled "Yes" (legacy behavior).
+            const opts = (q.options && q.options.length) ? q.options : ['Yes'];
+            // The stored value can be an array (new multi format), a string (legacy/dropdown-style),
+            // or a boolean (legacy single-checkbox). Normalize to a Set of strings.
+            let selectedSet;
+            if (Array.isArray(val))              selectedSet = new Set(val.map(String));
+            else if (val === true || val === 'true' || val === 'on') selectedSet = new Set(['Yes']);
+            else if (typeof val === 'string' && val) selectedSet = new Set([val]);
+            else                                 selectedSet = new Set();
+            inp = `<div data-q-multi="q_${q.id}" style="display:flex; flex-direction:column; gap:4px;">${
+              opts.map(o => `<label style="display:inline-flex; align-items:center; gap:5px; font-size:13px;">
+                <input type="checkbox" name="q_${q.id}__opt" data-opt-value="${escapeHtml(o)}" ${selectedSet.has(o)?'checked':''} ${dis} />
+                ${escapeHtml(o)}
+              </label>`).join('')
+            }</div>`;
+          }
           else if (q.qtype === 'yesno')    inp = `<select name="q_${q.id}" ${q.required?'required':''} ${dis}><option value="">—</option><option ${val==='Yes'?'selected':''}>Yes</option><option ${val==='No'?'selected':''}>No</option></select>`;
           else if (q.qtype === 'dropdown') inp = `<select name="q_${q.id}" ${q.required?'required':''} ${dis}><option value="">—</option>${(q.options||[]).map(o => `<option ${o===val?'selected':''}>${escapeHtml(o)}</option>`).join('')}</select>`;
           else                             inp = `<input type="text" name="q_${q.id}" value="${escapeHtml(val)}" ${q.required?'required':''} ${dis}/>`;
@@ -2887,10 +2964,21 @@ async function openAssignment(assignmentId) {
 // ---- Executor actions ----
 function _collectAssignmentResponses() {
   const resp = {};
+  // First, walk all multi-option checkbox groups (rendered as data-q-multi="q_<id>")
+  // and assemble each group into an array of the ticked options' values.
+  document.querySelectorAll('[data-q-multi]').forEach(group => {
+    const key = group.getAttribute('data-q-multi');
+    const picked = Array.from(group.querySelectorAll('input[type="checkbox"]:checked'))
+                        .map(cb => cb.getAttribute('data-opt-value') ?? cb.value);
+    resp[key] = picked; // empty array when none ticked
+  });
+  // Then walk every other q_ / rf_ input. Skip the multi-checkbox children
+  // (they have name="q_<id>__opt" so the parent key is preserved untouched).
   document.querySelectorAll(
     'input[name^="q_"], select[name^="q_"], textarea[name^="q_"], ' +
     'input[name^="rf_"], select[name^="rf_"], textarea[name^="rf_"]'
   ).forEach(el => {
+    if (el.name.endsWith('__opt')) return; // child of a multi-checkbox group, already collected
     if (el.type === 'checkbox') resp[el.name] = el.checked;
     else                        resp[el.name] = el.value;
   });

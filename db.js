@@ -511,6 +511,8 @@ function migrateSchema() {
   addColIfMissing('checklists', 'reviewed_at', 'TEXT');
   addColIfMissing('checklists', 'approved_at', 'TEXT');
   addColIfMissing('checklists', 'rejection_reason', 'TEXT');
+  addColIfMissing('checklists', 'dropped_at', 'TEXT');
+  addColIfMissing('checklists', 'drop_remarks', 'TEXT');
   addColIfMissing('checklist_questions', 'frequencies_json', 'TEXT');
   addColIfMissing('checklist_assignments', 'target_type', 'TEXT');
   addColIfMissing('checklist_assignments', 'target_id', 'TEXT');
