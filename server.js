@@ -20,7 +20,7 @@ app.use(express.urlencoded({ extended: true }));
 (() => {
   const s = license.getState();
   if (s.mode === 'unconfigured') {
-    console.log('[license] ⚠  Public key not configured — running unrestricted. Run tools/make_keypair.py and paste the public key into license.js.');
+    console.log('[license] !  Public key not configured - running unrestricted. Run lictool/make_keypair.py and paste the public key into license.js.');
   } else if (s.mode === 'dev') {
     console.log('[license] ℹ  Dev mode — license enforcement skipped.');
   } else if (s.valid) {

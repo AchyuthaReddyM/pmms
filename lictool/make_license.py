@@ -63,10 +63,13 @@ def sign_payload(priv, payload: dict) -> str:
     payload_b64 = b64(payload_json)
 
     # Sign the BASE64-ENCODED payload bytes (matches what license.js verifies).
+    # IMPORTANT: salt_length MUST equal SHA-256 digest size (32 bytes) so the
+    # Node-side `RSA_PSS_SALTLEN_DIGEST` verifier accepts the signature.
+    # Using PSS.MAX_LENGTH here would produce ~222-byte salts that Node rejects.
     signature = priv.sign(
         payload_b64.encode("ascii"),
         padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
-                    salt_length=padding.PSS.MAX_LENGTH),
+                    salt_length=hashes.SHA256.digest_size),
         hashes.SHA256(),
     )
     return f"{payload_b64}.{b64(signature)}"
@@ -147,7 +150,7 @@ def main():
     payload = {
         "v": 1,
         "fp": fp,
-        "iat": dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "iat": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     if expiry:   payload["exp"]      = expiry
     if customer: payload["customer"] = customer

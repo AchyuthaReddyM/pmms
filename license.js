@@ -24,12 +24,18 @@ const path   = require('path');
 const { execSync } = require('child_process');
 
 // ---------------------------------------------------------------------------
-// PUBLIC KEY — REPLACE THIS BLOCK AFTER RUNNING tools/make_keypair.py
+// PUBLIC KEY — REPLACED ONCE BY RUNNING lictool/make_keypair.py
 // ---------------------------------------------------------------------------
 // Until you replace this with a real key, licensing is DISABLED — the app
 // will print a warning at startup and run unrestricted.
 const PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
-__REPLACE_WITH_OUTPUT_FROM_make_keypair_py__
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw/nUe1fvWkD81VpNSTBD
+16tTTmMNoQ0mZLnWWmMJjtWE0iaMs9DN1rX3AuN7tRXEXFBPVYXmTdjwXn0YpCmV
+Bpnv32VNZfSavcRUlHkOzRLHfaFTfm9b089ApyfgmSc/x+ys+K1sfzxBofOVsFUR
+MPpESgUlnFbL2Ifypj8+dWlxh274gfstpzw1TmidptRt+ci24CNim/5s+RZOowkN
+/Qnj88vbIrJGataVheb3NuS8gh6d/4AubfL/meJeW+A5kGNL9jbyFL9yKHMdEwKW
+cG//qaFExCB/o/BFJMR5X4QACqQ6TMQ1eMtPi8/+FKySyridN52uVZa8KS3NbEXk
+TQIDAQAB
 -----END PUBLIC KEY-----`;
 
 const KEY_IS_PLACEHOLDER = PUBLIC_KEY_PEM.includes('__REPLACE_WITH_OUTPUT_FROM_make_keypair_py__');
@@ -141,7 +147,7 @@ function computeLicenseState() {
     return {
       valid: true,
       mode: 'unconfigured',
-      reason: 'Public key not yet generated. Run tools/make_keypair.py and paste the public key into license.js.',
+      reason: 'Public key not yet generated. Run lictool/make_keypair.py and paste the public key into license.js.',
       fingerprint: getFingerprint().fingerprint,
     };
   }
