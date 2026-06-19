@@ -111,8 +111,8 @@ function onLoggedIn() {
 }
 
 // ---------- Routing ----------
-const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','workflow','execution','tasks','pmstatus','expired','calendar','breakdown','reports','audit','compliance','about'];
-const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', workflow:'PM Workflow', execution:'PM Execution', tasks:'My Tasks', pmstatus:'PM Status', expired:'Expired Equipment', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
+const PAGES = ['dashboard','services','masters','users','settings','pmconfig','checklist','assignments','workflow','execution','tasks','pmstatus','pending','expired','calendar','breakdown','reports','audit','compliance','about'];
+const TITLE_MAP = { dashboard:'Dashboard', services:'Modules', masters:'Masters', users:'User Management', settings:'Admin Settings', pmconfig:'PM Configuration', checklist:'Checklists', assignments:'Checklist Assignment', workflow:'PM Workflow', execution:'PM Execution', tasks:'My Tasks', pmstatus:'PM Status', pending:'Pending Equipment', expired:'Expired Equipment', calendar:'Calendar', breakdown:'Breakdown', reports:'Reports', audit:'Audit Trail', compliance:'Compliance', about:'About' };
 
 function goto(name) {
   PAGES.forEach(p => $('page-'+p)?.classList.toggle('active', p === name));
@@ -132,6 +132,7 @@ function goto(name) {
     execution: loadPmList,
     tasks: () => loadTasks('inbox'),
     pmstatus: loadPmStatusPage,
+    pending: loadPendingPage,
     expired: loadExpiredPage,
     calendar: loadCalendar,
     breakdown: loadBreakdowns,
@@ -464,8 +465,13 @@ const MASTER_DEFS = {
       const assignBtn = r.status === 'Active'
         ? `<button class="btn ghost sm" onclick="openAssignChecklistModal(null, '${escapeHtml(r.equipment_id)}')">🎯 Assign</button>`
         : '';
+      // QR cell — a small clickable canvas drawn after render; click to enlarge.
+      const qrCell = `<div class="qr-cell" data-qr="${escapeHtml(r.qr_code || r.equipment_id)}"
+                            title="Click to enlarge QR for ${escapeHtml(r.equipment_id)}"
+                            onclick="openQrModal('${escapeHtml(r.equipment_id)}','${escapeHtml(r.qr_code || r.equipment_id)}','${escapeHtml(r.name || '')}')"
+                            style="cursor:pointer; width:48px; height:48px; display:inline-block;"></div>`;
       return [r.equipment_id, r.name, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status),
-              `<span title="${escapeHtml(r.qr_code)}">▣</span>`,
+              qrCell,
               [wfBtn, assignBtn].filter(Boolean).join(' ')];
     },
     canAdd: true,
@@ -485,7 +491,53 @@ async function loadMasters(which) {
     $('mastersBody').innerHTML = rows.length === 0
       ? `<tr class="empty-row"><td colspan="${def.head.length}">No records</td></tr>`
       : rows.map(r => '<tr>' + def.row(r).map(c => `<td>${c ?? ''}</td>`).join('') + '</tr>').join('');
+    // After rendering, draw any QR placeholders that were emitted.
+    renderQrCells();
   } catch (e) { toast(e.message, 'error'); }
+}
+
+// Walks every .qr-cell placeholder on screen and renders a 48px QR into it.
+// Safe to call multiple times — empties the cell first so a re-render doesn't stack.
+function renderQrCells() {
+  if (typeof QRCode === 'undefined') return; // CDN not loaded yet (offline / blocked)
+  document.querySelectorAll('.qr-cell').forEach(el => {
+    if (el.dataset.rendered === '1') return;
+    const v = el.getAttribute('data-qr') || '';
+    el.innerHTML = '';
+    try {
+      new QRCode(el, { text: v, width: 48, height: 48, correctLevel: QRCode.CorrectLevel.M });
+      el.dataset.rendered = '1';
+    } catch (e) {
+      el.textContent = '▣';
+    }
+  });
+}
+
+// Open a larger printable QR in a modal so testers can scan or print it.
+function openQrModal(equipmentId, qrText, equipmentName) {
+  openModal({
+    title: `QR Code — ${equipmentId}`,
+    width: 360,
+    hideDefaultSubmit: true,
+    body: `
+      <div style="text-align:center; padding: 8px 0 16px;">
+        <div id="qrModalCanvas" style="display:inline-block; padding:12px; background:#fff; border:1px solid var(--border); border-radius:6px;"></div>
+        <div style="margin-top:10px; font-size:13px;"><strong>${escapeHtml(equipmentId)}</strong></div>
+        ${equipmentName ? `<div style="font-size:12px; color:var(--muted); margin-top:2px;">${escapeHtml(equipmentName)}</div>` : ''}
+        <div style="font-size:11px; color:var(--muted); margin-top:6px;">Encoded value: <code>${escapeHtml(qrText)}</code></div>
+        <button class="btn primary sm" type="button" style="margin-top:14px;" onclick="window.print()">🖨 Print</button>
+      </div>
+    `,
+  });
+  // Render the larger 240px QR into the modal after openModal injects the DOM
+  setTimeout(() => {
+    const el = document.getElementById('qrModalCanvas');
+    if (!el) return;
+    if (typeof QRCode === 'undefined') { el.textContent = 'QR library not loaded (no internet on first launch).'; return; }
+    try {
+      new QRCode(el, { text: qrText, width: 240, height: 240, correctLevel: QRCode.CorrectLevel.H });
+    } catch (e) { el.textContent = 'Failed to render QR.'; }
+  }, 0);
 }
 
 document.querySelectorAll('#masterTabs button').forEach(b => b.addEventListener('click', () => loadMasters(b.dataset.mt)));
@@ -917,23 +969,47 @@ async function loadPmConfig() {
                                                     <button class="btn ghost sm" onclick="deleteFreq(${f.id})">×</button>` : ''}
           </td></tr>`;
       }).join('');
-    $('catBody').innerHTML = cats.length === 0 ? '<tr class="empty-row"><td colspan="3">No categories</td></tr>' :
-      cats.map(c => `<tr>
-        <td><strong>${escapeHtml(c.name)}</strong></td>
-        <td>${escapeHtml(c.description || '')}</td>
-        <td style="text-align:right;">
-          ${adminCatMode ? `<button class="btn ghost sm" onclick='openCatModal(${escapeHtml(JSON.stringify(c))})'>Edit</button>
-                            <button class="btn ghost sm" onclick="deleteCat(${c.id})">×</button>` : ''}
-        </td></tr>`).join('');
+    const me = CURRENT_USER ? CURRENT_USER.id : null;
+    const adminAll = CURRENT_USER && CURRENT_USER.is_admin;
+    $('catBody').innerHTML = cats.length === 0 ? '<tr class="empty-row"><td colspan="4">No categories</td></tr>' :
+      cats.map(c => {
+        const wfBtns = [];
+        if (c.status === 'Pending Review' && (c.reviewer_id === me || adminAll)) {
+          wfBtns.push(`<button class="btn ghost sm" onclick="openCatDecisionModal(${c.id}, ${escapeHtml(JSON.stringify(c.name))}, 'review')">📝 Review</button>`);
+        }
+        if (c.status === 'Pending Approval' && (c.approver_id === me || adminAll)) {
+          wfBtns.push(`<button class="btn ghost sm" onclick="openCatDecisionModal(${c.id}, ${escapeHtml(JSON.stringify(c.name))}, 'approve')">✅ Approve</button>`);
+        }
+        return `<tr${c.status === 'Pending Review' || c.status === 'Pending Approval' ? ' style="background:#fffbe6;"' : ''}>
+          <td><strong>${escapeHtml(c.name)}</strong></td>
+          <td>${escapeHtml(c.description || '')}</td>
+          <td>${statusPill(c.status || 'Active')}</td>
+          <td style="text-align:right;">
+            ${wfBtns.join(' ')}
+            ${adminCatMode && c.status === 'Active' ? `<button class="btn ghost sm" onclick='openCatModal(${escapeHtml(JSON.stringify(c))})'>Edit</button>
+                                                       <button class="btn ghost sm" onclick="deleteCat(${c.id})">×</button>` : ''}
+          </td></tr>`;
+      }).join('');
     const groupEdit = can('manage_checklists') || can('manage_pm_categories');
-    $('groupBody').innerHTML = groups.length === 0 ? '<tr class="empty-row"><td colspan="3">No groups</td></tr>' :
-      groups.map(g => `<tr>
-        <td><strong>${escapeHtml(g.name)}</strong></td>
-        <td>${escapeHtml(g.department || '')}</td>
-        <td style="text-align:right;">
-          ${groupEdit ? `<button class="btn ghost sm" onclick='openGroupModal(${escapeHtml(JSON.stringify(g))})'>Edit</button>
-                        <button class="btn ghost sm" onclick="deleteGroup(${g.id})">×</button>` : ''}
-        </td></tr>`).join('');
+    $('groupBody').innerHTML = groups.length === 0 ? '<tr class="empty-row"><td colspan="4">No groups</td></tr>' :
+      groups.map(g => {
+        const wfBtns = [];
+        if (g.status === 'Pending Review' && (g.reviewer_id === me || adminAll)) {
+          wfBtns.push(`<button class="btn ghost sm" onclick="openGroupDecisionModal(${g.id}, ${escapeHtml(JSON.stringify(g.name))}, 'review')">📝 Review</button>`);
+        }
+        if (g.status === 'Pending Approval' && (g.approver_id === me || adminAll)) {
+          wfBtns.push(`<button class="btn ghost sm" onclick="openGroupDecisionModal(${g.id}, ${escapeHtml(JSON.stringify(g.name))}, 'approve')">✅ Approve</button>`);
+        }
+        return `<tr${g.status === 'Pending Review' || g.status === 'Pending Approval' ? ' style="background:#fffbe6;"' : ''}>
+          <td><strong>${escapeHtml(g.name)}</strong></td>
+          <td>${escapeHtml(g.department || '')}</td>
+          <td>${statusPill(g.status || 'Active')}</td>
+          <td style="text-align:right;">
+            ${wfBtns.join(' ')}
+            ${groupEdit && g.status === 'Active' ? `<button class="btn ghost sm" onclick='openGroupModal(${escapeHtml(JSON.stringify(g))})'>Edit</button>
+                                                    <button class="btn ghost sm" onclick="deleteGroup(${g.id})">×</button>` : ''}
+          </td></tr>`;
+      }).join('');
 
     fillSelect($('pmEquipment'), equipment, 'equipment_id', e => `${e.equipment_id} · ${e.name}`);
     fillSelect($('pmChecklist'), checklists, 'id', c => `${c.name} (${c.version})`, true);
@@ -1044,18 +1120,31 @@ async function deleteFreq(id) {
 }
 
 // ----- PM Category master CRUD -----
-function openCatModal(existing) {
+async function openCatModal(existing) {
   const c = existing || { name:'', description:'' };
+  const isNew = !existing;
+  const users = isNew ? await loadActiveUsers() : [];
   openModal({
     title: existing ? `Edit Maintenance Category — ${escapeHtml(c.name)}` : 'Add Maintenance Category',
     body: `
       <div class="form-row"><label>Maintenance Category *</label><input name="name" value="${escapeHtml(c.name)}" required placeholder="e.g. Mechanical / Electrical" /></div>
       <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(c.description || '')}</textarea></div>
-    `,
+    ` + (isNew ? masterApproverFields(users) : ''),
+    submitLabel: isNew ? 'Submit for Review' : 'Save Changes',
     onSubmit: async (data) => {
-      if (existing) await api('PUT', `/api/pm-categories/${existing.id}`, data);
-      else          await api('POST','/api/pm-categories', data);
-      toast('Saved.', 'success'); loadPmConfig();
+      const payload = { name: data.name, description: data.description };
+      if (existing) {
+        await api('PUT', `/api/pm-categories/${existing.id}`, payload);
+        toast('Saved.', 'success');
+      } else {
+        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
+        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        payload.reviewer_id = Number(data.reviewer_id);
+        payload.approver_id = Number(data.approver_id);
+        await api('POST','/api/pm-categories', payload);
+        toast('PM Category submitted for review.', 'success');
+      }
+      loadPmConfig();
     }
   });
 }
@@ -1065,11 +1154,73 @@ async function deleteCat(id) {
   catch (e) { toast(e.message,'error'); }
 }
 
+// Review / Approve decision modal — shared shape for any single-name master
+// (Categories, Groups, Frequencies all use the same flow).
+function openConfigDecisionModal({ apiBase, label, rowId, rowName, stage, reload }) {
+  const verb = stage === 'review' ? 'Review' : 'Approve';
+  const approveLabel = stage === 'review' ? 'Forward to Approver…' : 'Approve & Activate…';
+  const performAction = (decision, remarks) => {
+    const meaning = decision === 'approve'
+      ? (stage === 'review'
+         ? `I have reviewed ${label} "${rowName}" and forward it to the Approver.`
+         : `I approve ${label} "${rowName}" for activation. I am responsible for its correctness and GMP impact.`)
+      : `I reject ${label} "${rowName}" at ${verb} stage. Remarks: ${remarks}`;
+    setTimeout(() => {
+      openESignatureModal({
+        title: `Sign — ${verb} ${label} ${rowName}`,
+        meaning,
+        onConfirm: async (esig) => {
+          await api('PUT', `${apiBase}/${rowId}/${stage}`, { decision, remarks, ...esig });
+          toast(decision === 'approve'
+            ? (stage === 'review' ? 'Reviewed — passed to Approver' : 'Approved — now Active')
+            : 'Rejected.', 'success');
+          reload && reload();
+        }
+      });
+    }, 0);
+  };
+  window.__cfgRejectFn = () => {
+    const ta = document.querySelector('textarea[name="cfgRemarks"]');
+    const remarks = ta ? ta.value.trim() : '';
+    if (!remarks) { toast('Remarks are required for rejection', 'error'); return; }
+    performAction('reject', remarks);
+  };
+  openModal({
+    title: `${verb} — ${label} ${rowName}`,
+    width: 500,
+    body: `
+      <p style="font-size:12px; color:var(--muted); margin-top:0;">
+        ${stage === 'review'
+          ? `Reviewing this ${label} will pass it to the assigned Approver. Rejecting sends it back to the creator with your remarks.`
+          : `Approving this ${label} marks it as Active and available for use. Rejecting returns it to the creator with your remarks.`}<br>
+        <strong>You will be asked to sign with your password on the next step.</strong>
+      </p>
+      <div class="form-row"><label>Remarks</label>
+        <textarea name="cfgRemarks" rows="3" placeholder="Optional for Approve · Required for Reject"></textarea>
+      </div>
+    `,
+    submitLabel: approveLabel,
+    actions: `<button type="button" class="btn ghost" style="color:#c53030; border-color:#fbd5d5;" onclick="window.__cfgRejectFn()">✗ Reject…</button>`,
+    onSubmit: async (data) => {
+      performAction('approve', (data.cfgRemarks || '').trim());
+    }
+  });
+}
+
+function openCatDecisionModal(catId, catName, stage) {
+  openConfigDecisionModal({ apiBase: '/api/pm-categories', label: 'PM Category', rowId: catId, rowName: catName, stage, reload: loadPmConfig });
+}
+function openGroupDecisionModal(groupId, groupName, stage) {
+  openConfigDecisionModal({ apiBase: '/api/checklist-groups', label: 'Checklist Group', rowId: groupId, rowName: groupName, stage, reload: loadPmConfig });
+}
+
 // ----- Checklist Group master CRUD -----
 async function openGroupModal(existing) {
   const g = existing || { name:'', department_id:'' };
+  const isNew = !existing;
   let depts = [];
   try { depts = await api('GET','/api/departments'); } catch (e) {}
+  const users = isNew ? await loadActiveUsers() : [];
   openModal({
     title: existing ? `Edit Check List Group — ${escapeHtml(g.name)}` : 'Add Check List Group',
     body: `
@@ -1080,12 +1231,22 @@ async function openGroupModal(existing) {
           ${depts.map(d => `<option value="${d.id}" ${d.id===g.department_id?'selected':''}>${escapeHtml(d.name)}</option>`).join('')}
         </select>
       </div>
-    `,
+    ` + (isNew ? masterApproverFields(users) : ''),
+    submitLabel: isNew ? 'Submit for Review' : 'Save Changes',
     onSubmit: async (data) => {
       const payload = { name: data.name, department_id: data.department_id ? Number(data.department_id) : null };
-      if (existing) await api('PUT', `/api/checklist-groups/${existing.id}`, payload);
-      else          await api('POST','/api/checklist-groups', payload);
-      toast('Saved.', 'success'); loadPmConfig();
+      if (existing) {
+        await api('PUT', `/api/checklist-groups/${existing.id}`, payload);
+        toast('Saved.', 'success');
+      } else {
+        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
+        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        payload.reviewer_id = Number(data.reviewer_id);
+        payload.approver_id = Number(data.approver_id);
+        await api('POST','/api/checklist-groups', payload);
+        toast('Checklist Group submitted for review.', 'success');
+      }
+      loadPmConfig();
     }
   });
 }
@@ -2047,7 +2208,9 @@ async function openChecklistBuilder(existingId, copyFromId) {
       api('GET','/api/pm-categories'),
       api('GET','/api/frequencies'),
     ]);
-    const activeFreqs = freqs.filter(f => (f.status || 'Active') === 'Active');
+    const activeFreqs  = freqs.filter(f => (f.status || 'Active') === 'Active');
+    const activeCats   = cats.filter(c => (c.status || 'Active') === 'Active');
+    const activeGroups = groups.filter(g => (g.status || 'Active') === 'Active');
     let cl = null;
     if (existingId)        cl = await api('GET', `/api/checklists/${existingId}/full`);
     else if (copyFromId)   cl = await api('GET', `/api/checklists/${copyFromId}/full`);
@@ -2077,8 +2240,9 @@ async function openChecklistBuilder(existingId, copyFromId) {
       <div class="form-row"><label>PM Checklist Group *</label>
         <select name="group_id" required>
           <option value="">— select group —</option>
-          ${groups.map(g => `<option value="${g.id}" ${cl && cl.group_id===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}
+          ${activeGroups.map(g => `<option value="${g.id}" ${cl && cl.group_id===g.id?'selected':''}>${escapeHtml(g.name)}</option>`).join('')}
         </select>
+        ${activeGroups.length === 0 ? '<div style="font-size:11px; color:var(--red); margin-top:4px;">No Active groups. Configure in PM Configuration → Check List Group and complete Review &amp; Approve first.</div>' : ''}
       </div>
       <div class="form-row"><label>Checklist ID *</label>
         <input name="code" value="${escapeHtml(cl?.code || '')}" required minlength="2" maxlength="50" pattern="[A-Za-z0-9_\\-]{2,50}"
@@ -2095,18 +2259,23 @@ async function openChecklistBuilder(existingId, copyFromId) {
         </div>
       </div>
       <div class="form-row"><label>Maintenance Category</label>
-        <select name="category_id"><option value="">—</option>${cats.map(c => `<option value="${c.id}" ${cl && cl.category_id===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}</select>
+        <select name="category_id"><option value="">—</option>${activeCats.map(c => `<option value="${c.id}" ${cl && cl.category_id===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}</select>
       </div>
       <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(cl?.description || '')}</textarea></div>
 
       <div class="form-row" style="grid-template-columns:1fr;">
         <label>Frequency * <span style="color:var(--muted); font-weight:400; font-size:11px;">(check all that apply)</span></label>
         <div id="cbFreqs" style="display:flex; flex-wrap:wrap; gap:8px 14px;">
-          ${activeFreqs.map(f => `
-            <label style="display:inline-flex; align-items:center; gap:5px; font-size:13px;">
-              <input type="checkbox" class="cb-freq" value="${f.id}" ${existingFreqIds.has(f.id)?'checked':''} />
-              ${escapeHtml(f.name)} <span style="color:var(--muted); font-size:11px;">(${f.days}d)</span>
-            </label>`).join('')}
+          ${activeFreqs.length === 0
+            ? `<div style="font-size:12px; color:var(--red); background:#fdecec; border:1px solid #f5c2c2; border-radius:6px; padding:8px 12px; line-height:1.5;">
+                 <strong>No Active frequencies available.</strong><br>
+                 Configure them in <strong>PM Configuration → Frequency Master</strong>, then complete the Review &amp; Approve workflow on each one before they can be used here.
+               </div>`
+            : activeFreqs.map(f => `
+                <label style="display:inline-flex; align-items:center; gap:5px; font-size:13px;">
+                  <input type="checkbox" class="cb-freq" value="${f.id}" ${existingFreqIds.has(f.id)?'checked':''} />
+                  ${escapeHtml(f.name)} <span style="color:var(--muted); font-size:11px;">(${f.days}d)</span>
+                </label>`).join('')}
         </div>
       </div>
 
@@ -3609,6 +3778,80 @@ async function fetchPmStatus(equipmentId) {
 }
 
 // ===========================================================
+// PENDING EQUIPMENT ASSIGNMENT
+// ===========================================================
+// PMs past their scheduled date but still within the tolerance window —
+// no PNC/Exception required, just an executor pick.
+async function loadPendingPage() {
+  const body = $('pendingBody');
+  if (body) body.innerHTML = '<tr class="empty-row"><td colspan="9" style="text-align:center; padding:18px; color:var(--muted);">Loading…</td></tr>';
+  try {
+    const { rows, flipped } = await api('GET', '/api/assignments/pending');
+    if (flipped > 0) toast(`${flipped} assignment(s) just crossed tolerance and moved to Expired Equipment.`, 'success');
+    body.innerHTML = (!rows || rows.length === 0)
+      ? '<tr class="empty-row"><td colspan="9" style="text-align:center; padding:18px;">🎉 No pending equipment — everything is on or ahead of schedule.</td></tr>'
+      : rows.map(a => `<tr>
+          <td>${escapeHtml(a.plant_name || '—')}${a.unit_number ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.unit_number)}</div>` : ''}</td>
+          <td><strong>${escapeHtml(a.target_id || '—')}</strong></td>
+          <td>${escapeHtml(a.equipment_description || '—')}</td>
+          <td><strong>${escapeHtml(a.assignment_id)}</strong>${a.checklist_name?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_name)} (${escapeHtml(a.checklist_version || '')})</div>`:''}</td>
+          <td>${escapeHtml(a.frequency || '—')}</td>
+          <td>${escapeHtml(a.due_date || a.effective_date || '—')}</td>
+          <td><span class="pill amber" style="font-size:10px;">${escapeHtml(a.pending_reason || '—')}</span></td>
+          <td>${statusPill(a.status)}${a.assignee_name?`<div style="color:var(--muted); font-size:11px;">→ ${escapeHtml(a.assignee_name)}</div>`:''}</td>
+          <td><button class="btn primary sm" onclick='openAssignPendingModal(${escapeHtml(JSON.stringify(a))})'>${a.assignee_id?'Re-assign':'Assign'}</button></td>
+        </tr>`).join('');
+  } catch (e) {
+    toast(e.message, 'error');
+    if (body) body.innerHTML = `<tr class="empty-row"><td colspan="9" style="text-align:center; padding:18px; color:var(--red);">Couldn't load pending equipment: ${escapeHtml(e.message)}</td></tr>`;
+  }
+}
+
+async function openAssignPendingModal(assignment) {
+  try {
+    const [users, roles] = await Promise.all([api('GET','/api/users'), api('GET','/api/roles')]);
+    const executorSet = usersWithActivity(users, roles, 'execute_checklist','execute_pm');
+    const executors = users
+      .filter(u => executorSet.has(u.id) && u.status === 'Active')
+      .filter(u => u.id !== assignment.reviewer_id && u.id !== assignment.approver_id);
+    if (executors.length === 0) { toast('No active users with execute permission (excluding the reviewer/approver).','error'); return; }
+
+    openModal({
+      title: `${assignment.assignee_id?'Re-assign':'Assign'} Pending PM — ${escapeHtml(assignment.assignment_id)}`,
+      width: 580,
+      body: `
+        <div class="row-gap" style="font-size:12px; margin-bottom: 14px;">
+          <span class="pill amber">${escapeHtml(assignment.pending_reason || 'Pending')}</span>
+          <span class="pill brown">${escapeHtml(assignment.target_id)} · ${escapeHtml(assignment.equipment_description || '')}</span>
+          ${assignment.plant_name ? `<span class="pill brown">${escapeHtml(assignment.plant_name)}${assignment.unit_number?' · '+escapeHtml(assignment.unit_number):''}</span>` : ''}
+          ${assignment.due_date ? `<span class="pill brown">Due: ${escapeHtml(assignment.due_date)}</span>` : ''}
+          ${assignment.frequency ? `<span class="pill brown">${escapeHtml(assignment.frequency)}</span>` : ''}
+        </div>
+        ${assignment.assignee_name ? `<div style="background:#fff7e6; border-left:3px solid #c77b00; padding:8px 12px; border-radius:6px; margin-bottom:14px; font-size:12px;">
+          Currently assigned to <strong>${escapeHtml(assignment.assignee_name)}</strong>. Re-assigning to a different executor will <strong>reset</strong> any in-flight responses and signatures so the new executor starts fresh.
+        </div>` : '<p style="font-size:12px; color:var(--muted); margin-top:0;">This PM is past its scheduled date but still within the tolerance window. No PNC / Exception required — just pick an executor.</p>'}
+        <div class="form-row"><label>Executor *</label>
+          <select name="assignee_id" required>
+            <option value="">— select executor —</option>
+            ${executors.map(u => `<option value="${u.id}" ${u.id===assignment.assignee_id?'selected':''}>${escapeHtml(u.name)} — ${escapeHtml(u.role)}${u.department?' / '+escapeHtml(u.department):''}</option>`).join('')}
+          </select>
+        </div>
+      `,
+      submitLabel: assignment.assignee_id ? 'Re-assign Now' : 'Assign Now',
+      onSubmit: async (data) => {
+        if (!data.assignee_id) throw new Error('Pick an executor.');
+        await api('PUT', `/api/assignments/${assignment.assignment_id}/assign-pending`, {
+          assignee_id: Number(data.assignee_id),
+        });
+        toast(`Pending PM ${assignment.assignment_id} assigned.`, 'success');
+        loadPendingPage();
+        refreshNotifBadge();
+      }
+    });
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ===========================================================
 // EXPIRED EQUIPMENT ASSIGNMENT
 // ===========================================================
 async function loadExpiredPage() {
@@ -3689,9 +3932,11 @@ async function openReassignExpiredModal(assignment) {
         <div class="form-row"><label>New Scheduled Date</label><input name="effective_date" type="date" value="${todayStr}" /></div>
         <div class="form-row"><label>New Due Date</label><input name="due_date" type="date" /></div>
       `,
-      submitLabel: 'Re-assign Now',
+      submitLabel: 'Sign &amp; Re-assign…',
       onSubmit: async (data) => {
-        await api('PUT', `/api/assignments/${assignment.assignment_id}/reassign`, {
+        // GMP traceability: re-assigning an Expired PM requires a signed
+        // electronic attestation that captures the PNC + Exception reasoning.
+        const payload = {
           assignee_id: Number(data.assignee_id),
           reviewer_id: data.reviewer_id ? Number(data.reviewer_id) : null,
           approver_id: data.approver_id ? Number(data.approver_id) : null,
@@ -3700,10 +3945,21 @@ async function openReassignExpiredModal(assignment) {
           exception_description: data.exception_description,
           effective_date: data.effective_date || null,
           due_date: data.due_date || null,
-        });
-        toast(`Expired PM ${assignment.assignment_id} re-assigned.`, 'success');
-        loadExpiredPage();
-        refreshNotifBadge();
+        };
+        const meaning = `I re-assign Expired PM "${assignment.assignment_id}" for ${assignment.target_id || 'equipment'} under PNC ${payload.pnc_number} / Exception ${payload.exception_number}. ${payload.exception_description}`;
+        // Defer past the form auto-close (same pattern as master decision modal)
+        setTimeout(() => {
+          openESignatureModal({
+            title: `Sign — Re-assign Expired PM ${assignment.assignment_id}`,
+            meaning,
+            onConfirm: async (esig) => {
+              await api('PUT', `/api/assignments/${assignment.assignment_id}/reassign`, { ...payload, ...esig });
+              toast(`Expired PM ${assignment.assignment_id} re-assigned.`, 'success');
+              loadExpiredPage();
+              refreshNotifBadge();
+            }
+          });
+        }, 0);
       }
     });
   } catch (e) { toast(e.message, 'error'); }

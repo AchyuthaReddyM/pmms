@@ -298,6 +298,9 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 // DASHBOARD
 // =============================================================
 app.get('/api/dashboard/kpis', requireAuth, (req, res) => {
+  // Auto-expire any assignments that crossed the tolerance window — keeps the
+  // Overdue/Expired count fresh whenever the dashboard is opened.
+  try { markExpiredAssignments(); } catch (e) { /* table may not exist yet on first boot */ }
   // KPIs union pm_schedules (legacy module) + checklist_assignments (current module).
   // Withdrawn / Rejected assignments don't count toward planned totals.
   // Pending = anything still in the active workflow (not Completed / Withdrawn / Rejected / Superseded).
@@ -725,6 +728,8 @@ addMasterApprovalRoutes('areas',        'areas',        'area_id',        'Area'
 addMasterApprovalRoutes('formulations', 'formulations', 'formulation_id', 'Formulation');
 addMasterApprovalRoutes('equipment',    'equipment',    'equipment_id',   'Equipment');
 addMasterApprovalRoutes('frequencies',  'frequencies',  'id',             'Frequency');
+addMasterApprovalRoutes('pm-categories','pm_categories','id',             'PM Category');
+addMasterApprovalRoutes('checklist-groups','checklist_groups','id',       'Checklist Group');
 
 // Per-user "what masters are waiting on me?" — pulled into the bell + dashboard.
 app.get('/api/masters/my-queue', requireAuth, (req, res) => {
@@ -1001,8 +1006,10 @@ app.get('/api/checklist-groups', requireAuth, (req,res) => {
 });
 
 app.post('/api/checklist-groups', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
-  const { name, department_id } = req.body || {};
+  const { name, department_id, reviewer_id, approver_id } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   const exists = db.prepare('SELECT 1 FROM checklist_groups WHERE name=?').get(name);
   if (exists) return res.status(409).json({ error: 'group already exists' });
   let dName = null;
@@ -1011,9 +1018,13 @@ app.post('/api/checklist-groups', requireAuth, requireActivity('manage_pm_catego
     if (!d) return res.status(400).json({ error: 'Unknown department_id' });
     dName = d.name;
   }
-  const r = db.prepare('INSERT INTO checklist_groups(name,department_id,department) VALUES (?,?,?)').run(name, department_id || null, dName);
-  audit(req.user, 'CREATE', 'ChecklistGroup', r.lastInsertRowid, `"${name}"${dName ? ' under ' + dName : ''}`);
-  res.json({ id: r.lastInsertRowid, name, department_id, department: dName });
+  const r = db.prepare(`INSERT INTO checklist_groups(name,department_id,department,status,created_by,reviewer_id,approver_id)
+                        VALUES (?,?,?,'Pending Review',?,?,?)`)
+    .run(name, department_id || null, dName, req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'ChecklistGroup', r.lastInsertRowid, `"${name}"${dName ? ' under ' + dName : ''} — submitted for review`);
+  notify(Number(reviewer_id), 'Checklist Group awaiting your review',
+    `"${name}" submitted by ${req.user.name}`, 'master_review', `/pmconfig/groups/${r.lastInsertRowid}`);
+  res.json({ id: r.lastInsertRowid, name, department_id, department: dName, status: 'Pending Review' });
 });
 
 app.put('/api/checklist-groups/:id', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
@@ -1399,6 +1410,10 @@ app.get('/api/reports/completed-pms', requireAuth, (req, res) => {
 // CALENDAR
 // =============================================================
 app.get('/api/calendar', requireAuth, (req, res) => {
+  // Auto-expire so the monthly + user calendars never show a PM that's silently
+  // crossed its tolerance window (per spec: "Monthly Calendar / User Calendar
+  // page – Post tolerance crossed" triggers Expired flip).
+  try { markExpiredAssignments(); } catch (e) {}
   const { year, month } = req.query; // month is 1-12
   // Union pm_schedules + checklist_assignments — calendar shows EVERY scheduled PM.
   const pmCols = `
@@ -1663,12 +1678,18 @@ app.delete('/api/frequencies/:id', requireAuth, requireActivity('manage_pm_frequ
 // PM CATEGORIES — admin-managed master
 // =============================================================
 app.post('/api/pm-categories', requireAuth, requireActivity('manage_pm_categories'), (req, res) => {
-  const { name, description } = req.body || {};
+  const { name, description, reviewer_id, approver_id } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   const exists = db.prepare('SELECT 1 FROM pm_categories WHERE name=?').get(name);
   if (exists) return res.status(409).json({ error: 'category already exists' });
-  const r = db.prepare('INSERT INTO pm_categories(name,description) VALUES (?,?)').run(name, description || '');
-  audit(req.user, 'CREATE', 'PMCategory', r.lastInsertRowid, `Created "${name}"`);
+  const r = db.prepare(`INSERT INTO pm_categories(name,description,status,created_by,reviewer_id,approver_id)
+                        VALUES (?,?,'Pending Review',?,?,?)`)
+    .run(name, description || '', req.user.id, Number(reviewer_id), Number(approver_id));
+  audit(req.user, 'CREATE', 'PMCategory', r.lastInsertRowid, `Created "${name}" — submitted for review`);
+  notify(Number(reviewer_id), 'PM Category awaiting your review',
+    `"${name}" submitted by ${req.user.name}`, 'master_review', `/pmconfig/categories/${r.lastInsertRowid}`);
   res.json(db.prepare('SELECT * FROM pm_categories WHERE id=?').get(r.lastInsertRowid));
 });
 
@@ -2072,6 +2093,9 @@ function nextAssignmentId() {
 }
 
 app.get('/api/assignments', requireAuth, (req, res) => {
+  // Auto-expire so the assignments list / PM Approval page / My Tasks never
+  // show a row that's silently crossed tolerance (per spec).
+  try { markExpiredAssignments(); } catch (e) {}
   const { mine, status, inbox } = req.query;
   // "inbox=1" — anything awaiting THIS user: executor / reviewer / approver / clearance grantor /
   //                                          assigner whose assignment is now Awaiting Executor.
@@ -2588,6 +2612,126 @@ function markExpiredAssignments() {
   return n;
 }
 
+// ----- Pending (overdue but within tolerance) ------------------------------
+// "Pending" = past scheduled date AND still within (effective_date + tolerance),
+// in any active workflow state (Pending Clearance / Scheduled / Awaiting Executor
+// / Pending / In Progress / Pending Review / Pending Approval / Rejected).
+// The Initiator uses this list to assign or re-assign an executor without
+// invoking the PNC / Exception flow (that's reserved for Expired).
+const PENDING_STATUSES = [
+  'Pending Clearance','Scheduled','Awaiting Executor','Pending',
+  'In Progress','Pending Review','Pending Approval','Rejected'
+];
+
+function pendingReasonFor(a) {
+  switch (a.status) {
+    case 'Scheduled':         return 'Clearance not initiated';
+    case 'Pending Clearance': return 'Awaiting clearance from production';
+    case 'Awaiting Executor': return 'Executor not assigned';
+    case 'Pending':           return a.assignee_id ? 'Assigned — execution not started' : 'Awaiting executor';
+    case 'In Progress':       return 'Execution in progress';
+    case 'Pending Review':    return 'Submitted — awaiting reviewer';
+    case 'Pending Approval':  return 'Reviewed — awaiting approver';
+    case 'Rejected':          return 'Rejected — awaiting re-execution';
+    default:                  return a.status || '—';
+  }
+}
+
+app.get('/api/assignments/pending', requireAuth, (req, res) => {
+  // First flip anything past-tolerance to Expired so it doesn't pollute Pending.
+  const flipped = markExpiredAssignments();
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const placeholders = PENDING_STATUSES.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT ca.assignment_id, ca.checklist_id, ca.target_id,
+           ca.assignee_id, ca.reviewer_id, ca.approver_id,
+           ca.frequency_id, ca.effective_date, ca.due_date, ca.status,
+           ca.rejection_reason, ca.reviewed_at, ca.submitted_at,
+           cl.name AS checklist_name, cl.version AS checklist_version,
+           f.name AS frequency, f.days AS frequency_days, f.tolerance_days,
+           e.name AS equipment_name, e.make, e.model, e.capacity,
+           a.area_id, a.name AS area_name,
+           l.location_id, l.description AS location_name,
+           b.block_id, b.name AS block_name,
+           p.plant_id, p.unit_number, p.name AS plant_name,
+           u.name AS assignee_name,
+           rv.name AS reviewer_name, ap.name AS approver_name
+    FROM checklist_assignments ca
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    LEFT JOIN equipment e   ON e.equipment_id = ca.target_id
+    LEFT JOIN areas a       ON a.area_id      = e.area_id
+    LEFT JOIN locations l   ON l.location_id  = a.location_id
+    LEFT JOIN blocks b      ON b.block_id     = l.block_id
+    LEFT JOIN plants p      ON p.plant_id     = b.plant_id
+    LEFT JOIN users u   ON u.id   = ca.assignee_id
+    LEFT JOIN users rv  ON rv.id  = ca.reviewer_id
+    LEFT JOIN users ap  ON ap.id  = ca.approver_id
+    WHERE ca.target_type='equipment'
+      AND ca.status IN (${placeholders})
+      AND (
+        ca.effective_date IS NULL
+        OR date(ca.effective_date) <= date(?)
+      )
+    ORDER BY date(ca.effective_date) ASC, ca.id ASC
+  `).all(...PENDING_STATUSES, todayStr);
+  rows.forEach(r => {
+    r.equipment_description = [r.make, r.model, r.capacity].filter(Boolean).join(' / ') || r.equipment_name || '—';
+    r.pending_reason = pendingReasonFor(r);
+  });
+  res.json({ flipped, rows });
+});
+
+// Assign / re-assign a pending PM to an executor. No PNC/Exception required —
+// the PM is still within the tolerance window. Re-assigning to a different
+// executor RESETS execution state so the new person starts fresh.
+app.put('/api/assignments/:assignment_id/assign-pending', requireAuth, requireActivity('assign_checklist'), (req, res) => {
+  const { assignee_id } = req.body || {};
+  if (!assignee_id) return res.status(400).json({ error: 'assignee_id required' });
+  const a = db.prepare(`
+    SELECT ca.*, u.name AS assignee_name
+    FROM checklist_assignments ca
+    LEFT JOIN users u ON u.id = ca.assignee_id
+    WHERE assignment_id=?
+  `).get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (!PENDING_STATUSES.includes(a.status)) {
+    return res.status(409).json({ error: `Cannot assign from status "${a.status}". The assignment must be in a pending workflow state.` });
+  }
+  const u = db.prepare('SELECT id, name FROM users WHERE id=? AND status="Active"').get(Number(assignee_id));
+  if (!u) return res.status(400).json({ error: 'Unknown or inactive executor' });
+  if (a.reviewer_id === u.id || a.approver_id === u.id) {
+    return res.status(400).json({ error: 'Executor cannot also be the assigned reviewer or approver.' });
+  }
+
+  const isReassign = a.assignee_id && a.assignee_id !== u.id;
+  if (isReassign) {
+    // Re-assign to a different person — wipe in-flight execution state so the
+    // new executor doesn't inherit someone else's partial responses.
+    db.prepare(`UPDATE checklist_assignments SET
+        status='Pending',
+        assignee_id=?,
+        response_data=NULL,
+        executor_sig=NULL, reviewer_sig=NULL, approver_sig=NULL,
+        submitted_at=NULL, reviewed_at=NULL, started_at=NULL,
+        rejection_reason=NULL
+      WHERE assignment_id=?`).run(u.id, req.params.assignment_id);
+  } else {
+    // First-time assignment (or no-op same person) — just put it on the
+    // executor's plate without touching prior data.
+    db.prepare(`UPDATE checklist_assignments SET
+        status='Pending',
+        assignee_id=?
+      WHERE assignment_id=?`).run(u.id, req.params.assignment_id);
+  }
+  notify(u.id, 'PM assignment received',
+    `${req.params.assignment_id} (${a.target_id || ''}) ${isReassign ? 're-assigned to you' : 'assigned to you'} from Pending Equipment list.`,
+    'assignment', `/assignments/${req.params.assignment_id}`);
+  audit(req.user, isReassign ? 'REASSIGN_PENDING' : 'ASSIGN_PENDING', 'Assignment', req.params.assignment_id,
+    `${isReassign?'Re-assigned':'Assigned'} pending PM to ${u.name}${a.assignee_name?` (was ${a.assignee_name})`:''} from status "${a.status}"`);
+  res.json({ ok: true });
+});
+
 app.get('/api/assignments/expired', requireAuth, (req, res) => {
   const flipped = markExpiredAssignments();
   const rows = db.prepare(`
@@ -2659,7 +2803,7 @@ app.put('/api/assignments/:assignment_id/withdraw', requireAuth, requireActivity
   res.json({ ok: true });
 });
 
-app.put('/api/assignments/:assignment_id/reassign', requireAuth, requireActivity('assign_checklist'), (req, res) => {
+app.put('/api/assignments/:assignment_id/reassign', requireAuth, requireActivity('assign_checklist'), requireESignature, (req, res) => {
   const { assignee_id, reviewer_id, approver_id, pnc_number, exception_number, exception_description, effective_date, due_date } = req.body || {};
   if (!pnc_number || !pnc_number.trim()) return res.status(400).json({ error: 'PNC Number is required to re-assign an expired PM' });
   if (!exception_number || !exception_number.trim()) return res.status(400).json({ error: 'Exception Number is required' });

@@ -79,6 +79,7 @@
       <a data-page="execution"><span class="ico">🛠️</span> PM Execution</a>
       <a data-page="tasks"><span class="ico">📌</span> My Tasks</a>
       <a data-page="pmstatus"><span class="ico">📍</span> PM Status</a>
+      <a data-page="pending"><span class="ico">⏳</span> Pending Equipment</a>
       <a data-page="expired"><span class="ico">⚠️</span> Expired Equipment</a>
       <a data-page="calendar"><span class="ico">🗓️</span> Calendar</a>
       <a data-page="breakdown"><span class="ico">🚨</span> Breakdown</a>
@@ -269,7 +270,7 @@
             <div class="card-head"><h3>PM Categories</h3>
               <button class="btn primary sm" onclick="openCatModal()">+ Add</button></div>
             <table class="tbl">
-              <thead><tr><th>Maintenance Category</th><th>Description</th><th></th></tr></thead>
+              <thead><tr><th>Maintenance Category</th><th>Description</th><th>Status</th><th></th></tr></thead>
               <tbody id="catBody"></tbody>
             </table>
           </div>
@@ -277,7 +278,7 @@
             <div class="card-head"><h3>Check List Group</h3>
               <button class="btn primary sm" onclick="openGroupModal()">+ Add</button></div>
             <table class="tbl">
-              <thead><tr><th>Group</th><th>Department</th><th></th></tr></thead>
+              <thead><tr><th>Group</th><th>Department</th><th>Status</th><th></th></tr></thead>
               <tbody id="groupBody"></tbody>
             </table>
           </div>
@@ -425,6 +426,33 @@
       </div>
 
       <!-- =========== EXPIRED EQUIPMENT ASSIGNMENT =========== -->
+      <!-- =========== PENDING EQUIPMENT =========== -->
+      <div class="page" id="page-pending">
+        <div class="page-head">
+          <div><h1>Pending Equipment Assignment</h1><p>PM activities past their scheduled date but still within the tolerance window. Assign or re-assign to an executor without PNC/Exception (those are reserved for Expired).</p></div>
+          <div class="actions">
+            <button class="btn ghost" onclick="loadPendingPage()">🔄 Refresh</button>
+          </div>
+        </div>
+        <div class="card">
+          <table class="tbl">
+            <thead><tr>
+              <th>Plant</th>
+              <th>Equipment ID</th>
+              <th>Equipment Description</th>
+              <th>PM Number</th>
+              <th>Frequency</th>
+              <th>Due Date</th>
+              <th>Pending Reason</th>
+              <th>Current Status</th>
+              <th></th>
+            </tr></thead>
+            <tbody id="pendingBody"></tbody>
+          </table>
+        </div>
+        <p style="font-size:11px; color:var(--muted); margin-top:12px;">A PM moves to this list when its scheduled date passes and any of: (1) not assigned to a user, (2) not executed, (3) rejected and not re-executed same day, (4) execution is incomplete. Once it crosses the post-tolerance window it auto-moves to Expired Equipment.</p>
+      </div>
+
       <div class="page" id="page-expired">
         <div class="page-head">
           <div><h1>Expired Equipment Assignment</h1><p>PM activities that crossed their due date plus post-tolerance window. Re-assign with PNC and Exception details to put them back into execution.</p></div>
@@ -613,6 +641,8 @@
 
 <!-- html5-qrcode powers the camera-based equipment-ID scanner on the PM Status page -->
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<!-- qrcodejs renders the visible per-row QR badges on the Equipment master. Cached after first load. -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

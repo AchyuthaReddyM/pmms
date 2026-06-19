@@ -50,7 +50,8 @@
     .ok  { color: var(--green); font-size: 12px; min-height: 18px; margin-top: 6px; }
     .hr  { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
     .header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
-    .header .logo { width: 46px; height: 46px; background: var(--brand); border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #fff; font-weight: 600; font-size: 18px; }
+    .header .logo { width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; }
+    .header .logo img { max-width: 100%; max-height: 100%; object-fit: contain; }
     .small { font-size: 11px; color: var(--muted); }
   </style>
 </head>
@@ -58,7 +59,7 @@
   <div class="wrap">
     <div class="card">
       <div class="header">
-        <div class="logo">PMMS</div>
+        <div class="logo"><img src="/logo.png" alt="Ways Automation" onerror="this.onerror=null; this.src='/logo-icon.svg';" /></div>
         <div>
           <h1>License Activation</h1>
           <div class="small">PMMS · Ways Automation</div>

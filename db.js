@@ -198,19 +198,36 @@ function createSchema() {
       approval_remarks TEXT
     );
 
-    -- PM category master (editable by manage_pm_categories)
+    -- PM category master (editable by manage_pm_categories) — same 2-stage
+    -- review/approve workflow as the other masters.
     CREATE TABLE IF NOT EXISTS pm_categories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL,
       description TEXT,
-      status TEXT NOT NULL DEFAULT 'Active'
+      status TEXT NOT NULL DEFAULT 'Pending Review',
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT,
+      review_remarks TEXT,
+      approved_at TEXT,
+      approval_remarks TEXT
     );
 
+    -- Checklist groups master — same 2-stage review/approve workflow.
     CREATE TABLE IF NOT EXISTS checklist_groups (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL,
       department_id INTEGER REFERENCES departments(id),
-      department TEXT
+      department TEXT,
+      status TEXT NOT NULL DEFAULT 'Pending Review',
+      created_by INTEGER REFERENCES users(id),
+      reviewer_id INTEGER REFERENCES users(id),
+      approver_id INTEGER REFERENCES users(id),
+      reviewed_at TEXT,
+      review_remarks TEXT,
+      approved_at TEXT,
+      approval_remarks TEXT
     );
 
     -- Checklists — Draft / Pending Review / Pending Approval / Approved / Rejected
@@ -567,6 +584,23 @@ function migrateSchema() {
   addColIfMissing('frequencies', 'review_remarks',   'TEXT');
   addColIfMissing('frequencies', 'approved_at',      'TEXT');
   addColIfMissing('frequencies', 'approval_remarks', 'TEXT');
+  // PM Categories — full 2-stage approval workflow.
+  addColIfMissing('pm_categories', 'created_by',       'INTEGER');
+  addColIfMissing('pm_categories', 'reviewer_id',      'INTEGER');
+  addColIfMissing('pm_categories', 'approver_id',      'INTEGER');
+  addColIfMissing('pm_categories', 'reviewed_at',      'TEXT');
+  addColIfMissing('pm_categories', 'review_remarks',   'TEXT');
+  addColIfMissing('pm_categories', 'approved_at',      'TEXT');
+  addColIfMissing('pm_categories', 'approval_remarks', 'TEXT');
+  // Checklist Groups — full 2-stage approval workflow.
+  addColIfMissing('checklist_groups', 'status',           "TEXT NOT NULL DEFAULT 'Active'");
+  addColIfMissing('checklist_groups', 'created_by',       'INTEGER');
+  addColIfMissing('checklist_groups', 'reviewer_id',      'INTEGER');
+  addColIfMissing('checklist_groups', 'approver_id',      'INTEGER');
+  addColIfMissing('checklist_groups', 'reviewed_at',      'TEXT');
+  addColIfMissing('checklist_groups', 'review_remarks',   'TEXT');
+  addColIfMissing('checklist_groups', 'approved_at',      'TEXT');
+  addColIfMissing('checklist_groups', 'approval_remarks', 'TEXT');
   addColIfMissing('pm_categories', 'status', "TEXT NOT NULL DEFAULT 'Active'");
   addColIfMissing('pm_categories', 'description', 'TEXT');
 
