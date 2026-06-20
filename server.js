@@ -662,7 +662,46 @@ app.put('/api/areas/:area_id', requireAuth, requireActivity('manage_plants'), (r
 });
 
 // EQUIPMENT
-app.get('/api/equipment', requireAuth, (req,res) => res.json(db.prepare('SELECT * FROM equipment ORDER BY equipment_id').all()));
+app.get('/api/equipment', requireAuth, (req, res) => {
+  // Join the equipment hierarchy so the row carries everything needed to render
+  // a meaningful QR payload (Plant → Block → Location → Area → Equipment) and
+  // populate Pending/Expired UIs without further round-trips.
+  const rows = db.prepare(`
+    SELECT e.*,
+           a.name AS area_name,
+           l.location_id, l.description AS location_name,
+           b.block_id, b.name AS block_name,
+           p.plant_id, p.unit_number, p.name AS plant_name
+    FROM equipment e
+    LEFT JOIN areas a     ON a.area_id     = e.area_id
+    LEFT JOIN locations l ON l.location_id = a.location_id
+    LEFT JOIN blocks b    ON b.block_id    = l.block_id
+    LEFT JOIN plants p    ON p.plant_id    = b.plant_id
+    ORDER BY e.equipment_id
+  `).all();
+  // Build a compact QR payload — ASCII-only because qrcodejs (the library that
+  // renders the QR in the browser) doesn't handle multi-byte UTF-8 and throws
+  // on any non-ASCII char. We also strip non-ASCII from any user-entered field
+  // (names that contain em-dashes, smart quotes, etc.) so a stray special
+  // character doesn't break the whole label.
+  const asAscii = (s) => String(s == null ? '' : s)
+    .replace(/[–—]/g, '-')   // en/em-dash -> hyphen
+    .replace(/[‘’]/g, "'")   // smart single quotes -> apostrophe
+    .replace(/[“”]/g, '"')   // smart double quotes -> quote
+    .replace(/[^\x00-\x7F]/g, '');     // drop anything else outside ASCII
+  for (const r of rows) {
+    const eqLine    = `${r.equipment_id}${r.name ? ' - ' + asAscii(r.name) : ''}`;
+    const specLine  = [asAscii(r.make), asAscii(r.model), r.serial ? 'SN ' + asAscii(r.serial) : null].filter(Boolean).join(' / ');
+    const chainLine = [r.plant_id, r.block_id, r.location_id, r.area_id].filter(Boolean).join(' > ');
+    const lines = [eqLine];
+    if (specLine)   lines.push(specLine);
+    if (r.capacity) lines.push(asAscii(r.capacity));
+    if (chainLine)  lines.push(chainLine);
+    lines.push(r.status || 'Active');
+    r.qr_payload = lines.join('\n');
+  }
+  res.json(rows);
+});
 app.get('/api/equipment/:equipment_id', requireAuth, (req,res) => {
   const row = db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(req.params.equipment_id);
   if (!row) return res.status(404).json({ error: 'Not found' });

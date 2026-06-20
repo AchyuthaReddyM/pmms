@@ -11,6 +11,29 @@ let CALENDAR_CURSOR = new Date(); // year/month being shown
 const $ = (id) => document.getElementById(id);
 const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, m => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
 
+// SQLite stores timestamps as UTC strings like 'YYYY-MM-DD HH:MM:SS' (no
+// timezone marker). Treat them as UTC and format to the user's local time.
+// Returns the raw value as a fallback if parsing fails.
+function formatLocalTime(ts) {
+  if (!ts) return '';
+  const str = String(ts).trim();
+  if (!str) return '';
+  // If it already has a 'Z' or '+HH:MM' offset, Date parses correctly.
+  // Otherwise we treat the bare 'YYYY-MM-DD HH:MM:SS' as UTC.
+  const iso = /[zZ]|[+-]\d{2}:?\d{2}$/.test(str)
+    ? str.replace(' ', 'T')
+    : str.replace(' ', 'T') + 'Z';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return str; // unparseable — show raw
+  // Locale-aware: e.g. "16/06/2026, 11:42:30 PM" in India, "6/16/2026, 11:42:30 AM" in US.
+  return d.toLocaleString();
+}
+// Shorter variant: drops seconds for table cells.
+function formatLocalTimeShort(ts) {
+  const full = formatLocalTime(ts);
+  return full.replace(/(:\d{2})(\s*[AP]M)?$/, '$2'); // drop ":SS"
+}
+
 function toast(msg, type='') {
   const t = document.createElement('div');
   t.className = 'toast ' + type;
@@ -465,11 +488,17 @@ const MASTER_DEFS = {
       const assignBtn = r.status === 'Active'
         ? `<button class="btn ghost sm" onclick="openAssignChecklistModal(null, '${escapeHtml(r.equipment_id)}')">🎯 Assign</button>`
         : '';
-      // QR cell — a small clickable canvas drawn after render; click to enlarge.
-      const qrCell = `<div class="qr-cell" data-qr="${escapeHtml(r.qr_code || r.equipment_id)}"
-                            title="Click to enlarge QR for ${escapeHtml(r.equipment_id)}"
-                            onclick="openQrModal('${escapeHtml(r.equipment_id)}','${escapeHtml(r.qr_code || r.equipment_id)}','${escapeHtml(r.name || '')}')"
-                            style="cursor:pointer; width:48px; height:48px; display:inline-block;"></div>`;
+      // QR cell — encodes the structured equipment payload. 96 px so each QR
+      // module is large enough for an average phone camera to scan it from
+      // the screen. Click for a bigger 240 px version to print on a label.
+      // Stash the payload globally so the click handler can read it without
+      // escaping a multi-line string into HTML attrs.
+      window.__qrPayloads = window.__qrPayloads || {};
+      window.__qrPayloads[r.equipment_id] = r.qr_payload || ('PMMS Equipment\nID: ' + r.equipment_id);
+      const qrCell = `<div class="qr-cell" data-qr-key="${escapeHtml(r.equipment_id)}"
+                            title="Click to enlarge / print QR for ${escapeHtml(r.equipment_id)}"
+                            onclick="openQrModalForEquipment('${escapeHtml(r.equipment_id)}','${escapeHtml(r.name || '')}')"
+                            style="cursor:pointer; width:96px; height:96px; display:inline-block; vertical-align:middle; padding:2px; background:#fff; border:1px solid var(--border); border-radius:4px;"></div>`;
       return [r.equipment_id, r.name, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status),
               qrCell,
               [wfBtn, assignBtn].filter(Boolean).join(' ')];
@@ -496,47 +525,85 @@ async function loadMasters(which) {
   } catch (e) { toast(e.message, 'error'); }
 }
 
-// Walks every .qr-cell placeholder on screen and renders a 48px QR into it.
-// Safe to call multiple times — empties the cell first so a re-render doesn't stack.
+// Walks every .qr-cell placeholder on screen and renders a small QR into it.
+// Each placeholder either carries its payload directly via data-qr, or — for
+// equipment rows — looks it up by data-qr-key in window.__qrPayloads (so we
+// avoid escaping multi-line text into HTML attributes).
 function renderQrCells() {
   if (typeof QRCode === 'undefined') return; // CDN not loaded yet (offline / blocked)
   document.querySelectorAll('.qr-cell').forEach(el => {
     if (el.dataset.rendered === '1') return;
-    const v = el.getAttribute('data-qr') || '';
-    el.innerHTML = '';
-    try {
-      new QRCode(el, { text: v, width: 48, height: 48, correctLevel: QRCode.CorrectLevel.M });
-      el.dataset.rendered = '1';
-    } catch (e) {
-      el.textContent = '▣';
-    }
+    const key = el.getAttribute('data-qr-key');
+    const direct = el.getAttribute('data-qr');
+    const v = key && window.__qrPayloads && window.__qrPayloads[key]
+              ? window.__qrPayloads[key]
+              : (direct || '');
+    // 90 px effective canvas (cell is 96 px with 2 px padding + 1 px border on each side).
+    if (safeRenderQR(el, v, 90)) el.dataset.rendered = '1';
   });
+}
+
+// Try to draw a QR into `el`. Returns true on success, false on failure.
+// qrcodejs auto-picks the smallest QR version that fits the data at the given
+// correction level — but at level H, anything beyond ~250 ASCII chars overflows
+// and the library throws. We fall back H → M → L → just show the text.
+function safeRenderQR(el, text, size) {
+  if (!el || typeof QRCode === 'undefined') {
+    if (el) el.textContent = '▣';
+    return false;
+  }
+  const levels = [QRCode.CorrectLevel.H, QRCode.CorrectLevel.M, QRCode.CorrectLevel.L];
+  for (const lvl of levels) {
+    try {
+      el.innerHTML = '';
+      new QRCode(el, { text, width: size, height: size, correctLevel: lvl });
+      return true;
+    } catch (e) { /* try next */ }
+  }
+  // All correction levels failed — payload is too big for QR Version 40 (max).
+  el.innerHTML = '<div style="font-size:10px; color:var(--red); padding:4px; text-align:center;">Data too long for QR — print as label.</div>';
+  return false;
+}
+
+// Convenience: open the enlarged QR modal for a piece of equipment using the
+// payload that was stashed at row-render time.
+function openQrModalForEquipment(equipmentId, equipmentName) {
+  const payload = (window.__qrPayloads && window.__qrPayloads[equipmentId]) || ('PMMS Equipment\nID: ' + equipmentId);
+  openQrModal(equipmentId, payload, equipmentName);
 }
 
 // Open a larger printable QR in a modal so testers can scan or print it.
 function openQrModal(equipmentId, qrText, equipmentName) {
+  const lines = String(qrText || '').split('\n');
   openModal({
     title: `QR Code — ${equipmentId}`,
-    width: 360,
+    width: 420,
     hideDefaultSubmit: true,
     body: `
-      <div style="text-align:center; padding: 8px 0 16px;">
+      <div style="text-align:center; padding: 8px 0 6px;">
         <div id="qrModalCanvas" style="display:inline-block; padding:12px; background:#fff; border:1px solid var(--border); border-radius:6px;"></div>
-        <div style="margin-top:10px; font-size:13px;"><strong>${escapeHtml(equipmentId)}</strong></div>
+        <div style="margin-top:10px; font-size:14px;"><strong>${escapeHtml(equipmentId)}</strong></div>
         ${equipmentName ? `<div style="font-size:12px; color:var(--muted); margin-top:2px;">${escapeHtml(equipmentName)}</div>` : ''}
-        <div style="font-size:11px; color:var(--muted); margin-top:6px;">Encoded value: <code>${escapeHtml(qrText)}</code></div>
-        <button class="btn primary sm" type="button" style="margin-top:14px;" onclick="window.print()">🖨 Print</button>
+      </div>
+      <div style="margin-top:14px; padding:10px 12px; background:#fafafa; border:1px solid var(--border); border-radius:6px; font-size:11px; line-height:1.6;">
+        <div style="font-weight:600; margin-bottom:4px;">Embedded data (what shows up on scan):</div>
+        <pre style="margin:0; font-family:'Menlo','Consolas',monospace; font-size:11px; white-space:pre-wrap; word-break:break-word;">${escapeHtml(qrText)}</pre>
+      </div>
+      <div style="display:flex; gap:8px; justify-content:center; margin-top:14px;">
+        <button class="btn primary sm" type="button" onclick="window.print()">🖨 Print</button>
       </div>
     `,
   });
-  // Render the larger 240px QR into the modal after openModal injects the DOM
+  // Render the larger 240px QR into the modal after openModal injects the DOM.
+  // safeRenderQR auto-degrades correction level until the payload fits.
   setTimeout(() => {
     const el = document.getElementById('qrModalCanvas');
     if (!el) return;
-    if (typeof QRCode === 'undefined') { el.textContent = 'QR library not loaded (no internet on first launch).'; return; }
-    try {
-      new QRCode(el, { text: qrText, width: 240, height: 240, correctLevel: QRCode.CorrectLevel.H });
-    } catch (e) { el.textContent = 'Failed to render QR.'; }
+    if (typeof QRCode === 'undefined') {
+      el.textContent = 'QR library not loaded (no internet on first launch).';
+      return;
+    }
+    safeRenderQR(el, qrText, 240);
   }, 0);
 }
 
@@ -1011,20 +1078,9 @@ async function loadPmConfig() {
           </td></tr>`;
       }).join('');
 
-    fillSelect($('pmEquipment'), equipment, 'equipment_id', e => `${e.equipment_id} · ${e.name}`);
-    fillSelect($('pmChecklist'), checklists, 'id', c => `${c.name} (${c.version})`, true);
-    fillSelect($('pmFrequency'), freqs, 'name', f => f.name);
-    fillSelect($('pmCategory'), cats, 'name', c => c.name, true);
-    fillSelect($('pmDept'), depts, 'name', d => d.name, true);
-    const techs = users.filter(u => u.role === 'Technician');
-    const revs = users.filter(u => u.role === 'Reviewer' || u.role === 'QA');
-    const apps = users.filter(u => u.role === 'Approver' || u.role === 'System Administrator' || u.role === 'Engineering');
-    fillSelect($('pmTech'), techs, 'id', u => `${u.name} (${u.department || u.role})`, true);
-    fillSelect($('pmReviewer'), revs, 'id', u => `${u.name} (${u.role})`, true);
-    fillSelect($('pmApprover'), apps, 'id', u => `${u.name} (${u.role})`, true);
-
-    // Default schedule date = today
-    $('pmDate').value = new Date().toISOString().slice(0,10);
+    // (The legacy "Create PM Schedule" form was removed from this page —
+    // scheduling is done via Checklist Assignment now. Fillers below were
+    // intentionally deleted along with the form they populated.)
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -1261,26 +1317,8 @@ function fillSelect(el, rows, valKey, labelFn, allowEmpty=false) {
     rows.map(r => `<option value="${escapeHtml(r[valKey])}">${escapeHtml(labelFn(r))}</option>`).join('');
 }
 
-$('newPmForm').addEventListener('submit', async (ev) => {
-  ev.preventDefault();
-  const payload = {
-    equipment_id: $('pmEquipment').value,
-    checklist_id: $('pmChecklist').value || null,
-    frequency: $('pmFrequency').value,
-    category: $('pmCategory').value || null,
-    scheduled_date: $('pmDate').value,
-    department: $('pmDept').value || null,
-    technician_id: $('pmTech').value ? Number($('pmTech').value) : null,
-    reviewer_id: $('pmReviewer').value ? Number($('pmReviewer').value) : null,
-    approver_id: $('pmApprover').value ? Number($('pmApprover').value) : null,
-  };
-  try {
-    const created = await api('POST','/api/pm',payload);
-    toast(`PM ${created.pm_id} created.`, 'success');
-    ev.target.reset();
-    goto('execution');
-  } catch (e) { toast(e.message, 'error'); }
-});
+// Legacy "Create PM Schedule" submit handler removed along with the form.
+// PMs are now created via Checklist Assignment exclusively.
 
 // ===========================================================
 // CHECKLISTS
@@ -1363,9 +1401,9 @@ async function previewChecklist(id) {
         Initiator <em>${escapeHtml(cl.created_by_name || '—')}</em>
         ${cl.reviewer_name ? `&nbsp;→&nbsp; Reviewer <em>${escapeHtml(cl.reviewer_name)}</em>` : ''}
         ${cl.approver_name ? `&nbsp;→&nbsp; Approver <em>${escapeHtml(cl.approver_name)}</em>` : ''}
-        ${cl.submitted_at ? `<div style="color:var(--muted); margin-top:3px;">Submitted ${escapeHtml(cl.submitted_at)}</div>` : ''}
-        ${cl.reviewed_at ? `<div style="color:var(--muted);">Reviewed ${escapeHtml(cl.reviewed_at)}</div>` : ''}
-        ${cl.approved_at ? `<div style="color:var(--muted);">Approved ${escapeHtml(cl.approved_at)}</div>` : ''}
+        ${cl.submitted_at ? `<div style="color:var(--muted); margin-top:3px;">Submitted ${escapeHtml(formatLocalTime(cl.submitted_at))}</div>` : ''}
+        ${cl.reviewed_at ? `<div style="color:var(--muted);">Reviewed ${escapeHtml(formatLocalTime(cl.reviewed_at))}</div>` : ''}
+        ${cl.approved_at ? `<div style="color:var(--muted);">Approved ${escapeHtml(formatLocalTime(cl.approved_at))}</div>` : ''}
         ${cl.rejection_reason ? `<div style="color:var(--red); margin-top:3px;"><strong>Rejected:</strong> ${escapeHtml(cl.rejection_reason)}</div>` : ''}
         ${freqsHtml}${reqdHtml}
       </div>`;
@@ -1697,7 +1735,7 @@ async function loadAudit(limit=100) {
       ? '<tr class="empty-row"><td colspan="6">No audit entries</td></tr>'
       : rows.map(a => `
       <tr>
-        <td>${escapeHtml(a.ts)}</td>
+        <td>${escapeHtml(formatLocalTime(a.ts))}</td>
         <td>${escapeHtml(a.user_name)}</td>
         <td><span class="pill ${dotColorPill(a.action)}">${escapeHtml(a.action)}</span></td>
         <td>${escapeHtml(a.entity)}</td>
@@ -2645,7 +2683,7 @@ function computeToleranceMeta(a) {
 // Formats the clearance line shown inside My Tasks rows.
 function renderClearanceLine(a, meta) {
   if (a.clearance_status === 'Granted' && a.clearance_responded_at) {
-    const ts = String(a.clearance_responded_at).replace(' ', ' ').slice(0, 16); // YYYY-MM-DD HH:MM
+    const ts = formatLocalTime(a.clearance_responded_at);
     const tolBadge = meta.withinTol === false
       ? '<span class="pill red" style="font-size:9px; margin-left:4px;">OUT OF TOLERANCE</span>'
       : (meta.withinTol === true
@@ -2656,7 +2694,7 @@ function renderClearanceLine(a, meta) {
             </div>`;
   }
   if (a.clearance_status === 'Denied' && a.clearance_responded_at) {
-    const ts = String(a.clearance_responded_at).slice(0, 16);
+    const ts = formatLocalTime(a.clearance_responded_at);
     return `<div style="font-size:11px; color:var(--red); margin-top:3px;">
               ✗ Clearance denied ${escapeHtml(ts)}
             </div>`;
@@ -3270,7 +3308,7 @@ async function openAssignment(assignmentId) {
       </div>
       ${a.clearance_status === 'Granted' ? (() => {
         const meta = computeToleranceMeta(a);
-        const ts = String(a.clearance_responded_at || '').slice(0, 16);
+        const ts = formatLocalTime(a.clearance_responded_at);
         const tolBadge = meta.withinTol === false
           ? '<span class="pill red" style="margin-left:6px;">OUT OF TOLERANCE</span>'
           : (meta.withinTol === true
@@ -3297,7 +3335,7 @@ async function openAssignment(assignmentId) {
       ? `<div style="padding:6px 10px; background:var(--cream-100); border-radius:6px; font-size:11px; min-width:160px;">
           <div style="color:var(--muted); text-transform:uppercase; letter-spacing:1px;">${label}</div>
           <div style="font-weight:600;">${escapeHtml(sig)}</div>
-          ${ts ? `<div style="color:var(--muted);">${escapeHtml(ts)}</div>` : ''}
+          ${ts ? `<div style="color:var(--muted);">${escapeHtml(formatLocalTime(ts))}</div>` : ''}
          </div>`
       : '';
     const sigsHtml = (a.executor_sig || a.reviewer_sig || a.approver_sig) ? `
@@ -3632,14 +3670,49 @@ async function loadPmStatusPage() {
       scan.onkeydown = (ev) => {
         if (ev.key === 'Enter') {
           ev.preventDefault();
-          const v = (scan.value || '').trim();
-          if (v) fetchPmStatus(v);
+          // Run through the same parser as the camera scanner — handles users
+          // who paste a full multi-line QR payload here too.
+          const id = parseEquipmentIdFromScan(scan.value);
+          if (id) {
+            scan.value = id;
+            fetchPmStatus(id);
+          }
         }
       };
     }
     // Clear any previous result
     $('pmStatusResult').innerHTML = '<div class="card"><p style="color:var(--muted); margin:0;">Scan an Equipment ID barcode (Enter to confirm) or pick from the dropdown to load its current PM status.</p></div>';
   } catch (e) { toast(e.message, 'error'); }
+}
+
+// Pull just the equipment ID out of whatever text a QR scanner decoded.
+// Handles:
+//   "EQ-AHU-08"                          -> "EQ-AHU-08"
+//   "QR:EQ-AHU-08"                       -> "EQ-AHU-08"  (legacy seeded prefix)
+//   "EQ-AHU-08 - Air Handling Unit (8)\n..."        (current rich payload)
+//   "PMMS Equipment\nID: EQ-AHU-08\n..." (older rich payload variant)
+// Returns the first token that looks like an equipment ID (uppercase
+// alphanumerics + dashes/underscores). Falls back to the raw input if no
+// pattern matches so the user at least sees what was scanned.
+function parseEquipmentIdFromScan(scannedText) {
+  if (!scannedText) return '';
+  let s = String(scannedText).trim();
+  // 1) Legacy "QR:" seeded prefix.
+  if (/^QR:/i.test(s)) s = s.slice(3).trim();
+  // 2) Older "ID: <id>" line format — find the line and extract.
+  const idLine = s.split(/\r?\n/).find(l => /^ID\s*:/i.test(l));
+  if (idLine) {
+    const m = idLine.match(/ID\s*:\s*([A-Za-z0-9_-]+)/i);
+    if (m) return m[1];
+  }
+  // 3) Current rich payload: first line is "<EQ-ID> - <Name>" or just "<EQ-ID>".
+  const firstLine = s.split(/\r?\n/)[0].trim();
+  const firstToken = firstLine.split(/\s+/)[0];
+  // Loose validation — equipment IDs are user-defined, but they're almost
+  // always uppercase alphanumeric + dashes/underscores, 2-50 chars.
+  if (/^[A-Za-z0-9_-]{2,50}$/.test(firstToken)) return firstToken;
+  // Last resort — return whatever we got so the user can see and edit.
+  return firstToken || s;
 }
 
 async function openQrCameraScanner() {
@@ -3682,9 +3755,7 @@ async function openQrCameraScanner() {
     window.__pmsScanner = scanner;
 
     const onSuccess = (decodedText) => {
-      // Strip the seeded "QR:" prefix if present.
-      let id = String(decodedText || '').trim();
-      if (/^QR:/i.test(id)) id = id.slice(3);
+      const id = parseEquipmentIdFromScan(decodedText);
       // Stop the camera, close modal, run lookup.
       scanner.stop().catch(()=>{}).finally(() => {
         window.__pmsScanner = null;
@@ -3790,17 +3861,30 @@ async function loadPendingPage() {
     if (flipped > 0) toast(`${flipped} assignment(s) just crossed tolerance and moved to Expired Equipment.`, 'success');
     body.innerHTML = (!rows || rows.length === 0)
       ? '<tr class="empty-row"><td colspan="9" style="text-align:center; padding:18px;">🎉 No pending equipment — everything is on or ahead of schedule.</td></tr>'
-      : rows.map(a => `<tr>
-          <td>${escapeHtml(a.plant_name || '—')}${a.unit_number ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.unit_number)}</div>` : ''}</td>
-          <td><strong>${escapeHtml(a.target_id || '—')}</strong></td>
-          <td>${escapeHtml(a.equipment_description || '—')}</td>
-          <td><strong>${escapeHtml(a.assignment_id)}</strong>${a.checklist_name?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_name)} (${escapeHtml(a.checklist_version || '')})</div>`:''}</td>
-          <td>${escapeHtml(a.frequency || '—')}</td>
-          <td>${escapeHtml(a.due_date || a.effective_date || '—')}</td>
-          <td><span class="pill amber" style="font-size:10px;">${escapeHtml(a.pending_reason || '—')}</span></td>
-          <td>${statusPill(a.status)}${a.assignee_name?`<div style="color:var(--muted); font-size:11px;">→ ${escapeHtml(a.assignee_name)}</div>`:''}</td>
-          <td><button class="btn primary sm" onclick='openAssignPendingModal(${escapeHtml(JSON.stringify(a))})'>${a.assignee_id?'Re-assign':'Assign'}</button></td>
-        </tr>`).join('');
+      : rows.map(a => {
+          // Build location chain: Plant › Block › Location › Area
+          const chain = [a.plant_name, a.block_name, a.location_name, a.area_name].filter(Boolean).join(' › ');
+          const eqDetails = [a.make, a.model, a.serial ? 'SN '+a.serial : null].filter(Boolean).join(' · ');
+          return `<tr>
+            <td>
+              <strong>${escapeHtml(a.plant_name || '—')}</strong>
+              ${a.unit_number ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.unit_number)}</div>` : ''}
+              ${chain ? `<div style="color:var(--muted); font-size:10px; margin-top:2px;">${escapeHtml(chain)}</div>` : ''}
+            </td>
+            <td><strong>${escapeHtml(a.target_id || '—')}</strong></td>
+            <td>
+              <strong>${escapeHtml(a.equipment_name || a.equipment_description || '—')}</strong>
+              ${eqDetails ? `<div style="color:var(--muted); font-size:11px; margin-top:2px;">${escapeHtml(eqDetails)}</div>` : ''}
+              ${a.capacity ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.capacity)}</div>` : ''}
+            </td>
+            <td><strong>${escapeHtml(a.assignment_id)}</strong>${a.checklist_name?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_name)} (${escapeHtml(a.checklist_version || '')})</div>`:''}</td>
+            <td>${escapeHtml(a.frequency || '—')}${a.tolerance_days != null ? `<div style="color:var(--muted); font-size:10px;">±${a.tolerance_days}d</div>` : ''}</td>
+            <td>${escapeHtml(a.due_date || a.effective_date || '—')}</td>
+            <td><span class="pill amber" style="font-size:10px;">${escapeHtml(a.pending_reason || '—')}</span></td>
+            <td>${statusPill(a.status)}${a.assignee_name?`<div style="color:var(--muted); font-size:11px;">→ ${escapeHtml(a.assignee_name)}</div>`:''}</td>
+            <td><button class="btn primary sm" onclick='openAssignPendingModal(${escapeHtml(JSON.stringify(a))})'>${a.assignee_id?'Re-assign':'Assign'}</button></td>
+          </tr>`;
+        }).join('');
   } catch (e) {
     toast(e.message, 'error');
     if (body) body.innerHTML = `<tr class="empty-row"><td colspan="9" style="text-align:center; padding:18px; color:var(--red);">Couldn't load pending equipment: ${escapeHtml(e.message)}</td></tr>`;
@@ -3862,16 +3946,28 @@ async function loadExpiredPage() {
     if (flipped > 0) toast(`${flipped} assignment(s) just expired and moved to this list.`, 'success');
     body.innerHTML = (!rows || rows.length === 0)
       ? '<tr class="empty-row"><td colspan="8" style="text-align:center; padding:18px;">🎉 No expired equipment — everything is on schedule.</td></tr>'
-      : rows.map(a => `<tr>
-          <td><strong>${escapeHtml(a.assignment_id)}</strong>${a.checklist_name?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_name)} (${escapeHtml(a.checklist_version || '')})</div>`:''}</td>
-          <td>${escapeHtml(a.plant_name || '—')}${a.unit_number ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.unit_number)}</div>` : ''}</td>
-          <td><strong>${escapeHtml(a.target_id || '—')}</strong></td>
-          <td>${escapeHtml(a.equipment_description || '—')}</td>
-          <td>${escapeHtml(a.frequency || '—')}</td>
-          <td>${escapeHtml(a.due_date || '—')}${a.expired_at?`<div style="color:var(--red); font-size:11px;">expired ${escapeHtml(a.expired_at)}</div>`:''}</td>
-          <td>${statusPill('Expired')}</td>
-          <td><button class="btn primary sm" onclick='openReassignExpiredModal(${escapeHtml(JSON.stringify(a))})'>Re-assign</button></td>
-        </tr>`).join('');
+      : rows.map(a => {
+          const chain = [a.plant_name, a.block_name, a.location_name, a.area_name].filter(Boolean).join(' › ');
+          const eqDetails = [a.make, a.model, a.serial ? 'SN '+a.serial : null].filter(Boolean).join(' · ');
+          return `<tr>
+            <td><strong>${escapeHtml(a.assignment_id)}</strong>${a.checklist_name?`<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.checklist_name)} (${escapeHtml(a.checklist_version || '')})</div>`:''}</td>
+            <td>
+              <strong>${escapeHtml(a.plant_name || '—')}</strong>
+              ${a.unit_number ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.unit_number)}</div>` : ''}
+              ${chain ? `<div style="color:var(--muted); font-size:10px; margin-top:2px;">${escapeHtml(chain)}</div>` : ''}
+            </td>
+            <td><strong>${escapeHtml(a.target_id || '—')}</strong></td>
+            <td>
+              <strong>${escapeHtml(a.equipment_name || a.equipment_description || '—')}</strong>
+              ${eqDetails ? `<div style="color:var(--muted); font-size:11px; margin-top:2px;">${escapeHtml(eqDetails)}</div>` : ''}
+              ${a.capacity ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(a.capacity)}</div>` : ''}
+            </td>
+            <td>${escapeHtml(a.frequency || '—')}${a.tolerance_days != null ? `<div style="color:var(--muted); font-size:10px;">±${a.tolerance_days}d</div>` : ''}</td>
+            <td>${escapeHtml(a.due_date || '—')}${a.expired_at?`<div style="color:var(--red); font-size:11px;">expired ${escapeHtml(a.expired_at)}</div>`:''}</td>
+            <td>${statusPill('Expired')}</td>
+            <td><button class="btn primary sm" onclick='openReassignExpiredModal(${escapeHtml(JSON.stringify(a))})'>Re-assign</button></td>
+          </tr>`;
+        }).join('');
   } catch (e) {
     toast(e.message, 'error');
     if (body) body.innerHTML = `<tr class="empty-row"><td colspan="8" style="text-align:center; padding:18px; color:var(--red);">Couldn't load expired equipment: ${escapeHtml(e.message)}</td></tr>`;
