@@ -62,32 +62,35 @@
     </div>
 
     <nav class="nav">
+      <!-- data-needs lists the activities required to see this page. If the user
+           has none of them (and isn't admin), the entry is hidden by the
+           applyNavPermissions() pass that runs on login. -->
       <div class="nav-section">Overview</div>
       <a class="active" data-page="dashboard"><span class="ico">📊</span> Dashboard</a>
       <a data-page="services"><span class="ico">🧩</span> Modules</a>
 
-      <div class="nav-section">Configuration</div>
-      <a data-page="masters"><span class="ico">🏭</span> Masters</a>
-      <a data-page="users"><span class="ico">👥</span> User Management</a>
-      <a data-page="settings"><span class="ico">🛡️</span> Admin Settings</a>
-      <a data-page="pmconfig"><span class="ico">⚙️</span> PM Configuration</a>
-      <a data-page="checklist"><span class="ico">📋</span> Checklists</a>
-      <a data-page="assignments"><span class="ico">🎯</span> Checklist Assignment</a>
+      <div class="nav-section" data-section="config">Configuration</div>
+      <a data-page="masters"  data-needs="manage_plants,manage_equipment"><span class="ico">🏭</span> Masters</a>
+      <a data-page="users"    data-needs="manage_users"><span class="ico">👥</span> User Management</a>
+      <a data-page="settings" data-needs="ADMIN_ONLY"><span class="ico">🛡️</span> Admin Settings</a>
+      <a data-page="pmconfig" data-needs="manage_pm_frequencies,manage_pm_categories,manage_checklists"><span class="ico">⚙️</span> PM Configuration</a>
+      <a data-page="checklist" data-needs="manage_checklists,review_checklist,approve_checklist"><span class="ico">📋</span> Checklists</a>
+      <a data-page="assignments" data-needs="assign_checklist"><span class="ico">🎯</span> Checklist Assignment</a>
       <a data-page="workflow"><span class="ico">🔄</span> PM Workflow</a>
 
-      <div class="nav-section">Operations</div>
-      <a data-page="execution"><span class="ico">🛠️</span> PM Execution</a>
+      <div class="nav-section" data-section="ops">Operations</div>
+      <a data-page="execution"  data-needs="execute_checklist,execute_pm,review_pm,approve_pm"><span class="ico">🛠️</span> PM Execution</a>
       <a data-page="tasks"><span class="ico">📌</span> My Tasks</a>
       <a data-page="pmstatus"><span class="ico">📍</span> PM Status</a>
-      <a data-page="pending"><span class="ico">⏳</span> Pending Equipment</a>
-      <a data-page="expired"><span class="ico">⚠️</span> Expired Equipment</a>
+      <a data-page="pending"  data-needs="assign_checklist"><span class="ico">⏳</span> Pending Equipment</a>
+      <a data-page="expired"  data-needs="assign_checklist"><span class="ico">⚠️</span> Expired Equipment</a>
       <a data-page="calendar"><span class="ico">🗓️</span> Calendar</a>
-      <a data-page="breakdown"><span class="ico">🚨</span> Breakdown</a>
+      <a data-page="breakdown" data-needs="manage_breakdowns,view_breakdowns,execute_checklist,execute_pm"><span class="ico">🚨</span> Breakdown</a>
 
-      <div class="nav-section">Insights</div>
+      <div class="nav-section" data-section="insights">Insights</div>
       <a data-page="reports"><span class="ico">📑</span> Reports</a>
-      <a data-page="audit"><span class="ico">📜</span> Audit Trail</a>
-      <a data-page="compliance"><span class="ico">🔒</span> Compliance</a>
+      <a data-page="audit" data-needs="ADMIN_ONLY"><span class="ico">📜</span> Audit Trail</a>
+      <a data-page="compliance" data-needs="ADMIN_ONLY"><span class="ico">🔒</span> Compliance</a>
 
       <div class="nav-section">About</div>
       <a data-page="about"><span class="ico">🦅</span> Why Ways Automation</a>
@@ -110,7 +113,7 @@
         <button class="bell-btn" id="bellBtn" title="Notifications" onclick="toggleNotifPanel()" style="background:var(--cream-100); border:1px solid var(--border); border-radius:10px; padding:8px 10px; cursor:pointer; font-size:16px;">
           🔔<span id="bellBadge" class="bell-badge" style="display:none; position:absolute; top:-4px; right:-4px; background:var(--red); color:#fff; border-radius:10px; min-width:18px; height:18px; font-size:10px; padding:0 5px; line-height:18px; text-align:center; font-weight:700;">0</span>
         </button>
-        <div id="notifPanel" class="notif-panel hidden" style="display:none; position:absolute; right:0; top:44px; width:340px; max-height:440px; overflow:auto; background:#fff; border:1px solid var(--border); border-radius:10px; box-shadow:0 12px 28px rgba(0,0,0,0.18); z-index:50;">
+        <div id="notifPanel" class="notif-panel" style="display:none; position:absolute; right:0; top:44px; width:340px; max-height:440px; overflow:auto; background:#fff; border:1px solid var(--border); border-radius:10px; box-shadow:0 12px 28px rgba(0,0,0,0.18); z-index:50;">
           <div style="display:flex; justify-content:space-between; align-items:center; padding:12px 14px; border-bottom:1px solid var(--border);">
             <strong>Notifications</strong>
             <button class="btn ghost sm" onclick="markAllNotifRead()">Mark all read</button>
@@ -124,7 +127,7 @@
           <div style="font-weight:600;" id="topUserName">—</div>
           <div style="color:var(--muted); font-size:11px;" id="topUserRole">—</div>
         </div>
-        <button class="logout" title="Sign out" onclick="logout()">⎋</button>
+        <button class="logout" title="Sign out" onclick="logout()" style="padding:6px 12px; background:var(--cream-100); border:1px solid var(--border); border-radius:6px; cursor:pointer; font-size:12px; font-weight:600; color:var(--brown-700);">⎋ Logout</button>
       </div>
     </div>
 
@@ -148,8 +151,11 @@
         </div>
 
         <div class="grid cols-4" id="kpiRow">
-          <!-- KPI cards rendered by JS -->
+          <!-- KPI cards rendered by JS (each clickable to drill down) -->
         </div>
+
+        <!-- Why-behind-schedule panel — breakdown of every in-flight PM by category. -->
+        <div id="delayReasonsCard" style="margin-top:16px;"></div>
 
         <div class="grid cols-2" style="margin-top:16px;">
           <div class="card">
@@ -161,8 +167,12 @@
           </div>
 
           <div class="card">
-            <div class="card-head"><h3>Recent Activity (Audit Trail)</h3><button class="btn ghost sm" onclick="goto('audit')">View all</button></div>
-            <ul class="audit" id="recentAuditList"></ul>
+            <div class="card-head">
+              <h3>Equipment by Date</h3>
+              <input type="date" id="dashDatePicker" style="padding:5px 8px; border:1px solid var(--border); border-radius:6px; font-size:12px;" />
+            </div>
+            <div id="dashDayPanel" style="font-size:12px;"><em style="color:var(--muted);">Pick a date to see equipment Completed / Pending / Expired on that day.</em></div>
+            <div style="margin-top:10px; font-size:11px; color:var(--muted);"><button class="btn ghost sm" onclick="goto('calendar')">Open full calendar</button> · <button class="btn ghost sm" onclick="goto('audit')">View audit trail</button></div>
           </div>
         </div>
 
@@ -217,7 +227,7 @@
           <button data-mt="formulations">Formulations</button>
           <button data-mt="locations">Locations</button>
           <button data-mt="areas">Areas</button>
-          <button data-mt="equipment">Equipment</button>
+          <button data-mt="equipment">EQUIPMENT MASTER</button>
         </div>
         <div class="card">
           <table class="tbl">
@@ -248,6 +258,7 @@
           <button class="active" data-st="departments">Departments</button>
           <button data-st="roles">Roles</button>
           <button data-st="activities">Activities</button>
+          <button data-st="workflows">Approval Workflows</button>
         </div>
         <div id="settingsPanel"></div>
       </div>
@@ -543,11 +554,30 @@
 
       <!-- =========== AUDIT =========== -->
       <div class="page" id="page-audit">
-        <div class="page-head">
-          <div><h1>Audit Trail</h1><p>Immutable record of every action in the system.</p></div>
-          <div class="actions"><button class="btn ghost" onclick="loadAudit(500)">Load 500</button></div>
+        <div class="page-head no-print">
+          <div><h1>Audit Trail</h1><p>Immutable record of every action in the system. WAL-mode SQLite (atomic + crash-safe) — audit rows are append-only and cannot be edited.</p></div>
+          <div class="actions">
+            <button class="btn ghost" onclick="loadAudit(500)">Load 500</button>
+            <button class="btn ghost" onclick="loadAudit(2000)">Load 2000</button>
+            <button class="btn primary" onclick="window.print()">🖨 Print / Save as PDF</button>
+          </div>
+        </div>
+        <div class="card no-print" style="margin-bottom:12px;">
+          <div style="display:flex; gap:12px; flex-wrap:wrap; align-items:end;">
+            <div><label style="font-size:11px; color:var(--muted); display:block; margin-bottom:3px;">From</label><input type="date" id="auditFrom" /></div>
+            <div><label style="font-size:11px; color:var(--muted); display:block; margin-bottom:3px;">To</label><input type="date" id="auditTo" /></div>
+            <div><label style="font-size:11px; color:var(--muted); display:block; margin-bottom:3px;">User</label><input type="text" id="auditUser" placeholder="any" /></div>
+            <div><label style="font-size:11px; color:var(--muted); display:block; margin-bottom:3px;">Action</label><input type="text" id="auditAction" placeholder="e.g. APPROVE" /></div>
+            <button class="btn primary sm" onclick="applyAuditFilter()">Apply</button>
+            <button class="btn ghost sm" onclick="clearAuditFilter()">Clear</button>
+          </div>
+          <div style="font-size:11px; color:var(--muted); margin-top:8px;">Tip: leave From/To blank to load most-recent. The displayed rows are what gets printed/PDF-exported.</div>
         </div>
         <div class="card">
+          <div id="auditPrintHeader" class="print-only" style="display:none; padding:8px 0 12px;">
+            <h2 style="margin:0 0 4px;">PMMS — Audit Trail</h2>
+            <div id="auditPrintMeta" style="font-size:12px; color:#555;"></div>
+          </div>
           <table class="tbl">
             <thead><tr><th>Time</th><th>User</th><th>Action</th><th>Entity</th><th>ID</th><th>Details</th></tr></thead>
             <tbody id="auditBody"></tbody>

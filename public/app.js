@@ -127,10 +127,114 @@ function onLoggedIn() {
   $('topUserName').textContent = CURRENT_USER.name;
   $('topUserRole').textContent = `${CURRENT_USER.role} · ${CURRENT_USER.department || ''}`;
   $('userAvatar').textContent = CURRENT_USER.name.split(/\s+/).map(s => s[0]).slice(0,2).join('').toUpperCase();
+  applyNavPermissions();
   refreshNotifBadge();
+  refreshAlerts();
   if (window._notifTimer) clearInterval(window._notifTimer);
   window._notifTimer = setInterval(refreshNotifBadge, 30000);
+  if (window._alertTimer) clearInterval(window._alertTimer);
+  // Re-fetch alerts every 5 minutes so newly-overdue items pop up without a manual reload.
+  window._alertTimer = setInterval(refreshAlerts, 5 * 60 * 1000);
   loadDashboard();
+}
+
+// ---- Hybrid alert system --------------------------------------------------
+// Blocking modal for OVERDUE/EXPIRED assigned to the user (with required
+// comment). Top banner for upcoming PMs. Re-runs on login + every 5 minutes.
+async function refreshAlerts() {
+  try {
+    const data = await api('GET', '/api/alerts');
+    renderAlertBanner(data.upcoming || []);
+    if (data.blocking && data.blocking.length > 0) {
+      // Show the first blocking item that hasn't been shown yet this session.
+      const shown = window.__alertShown = window.__alertShown || new Set();
+      const next = data.blocking.find(b => !shown.has(b.assignment_id));
+      if (next) showBlockingAlertModal(next, data.blocking.length);
+    }
+  } catch (e) { /* silent — alert system shouldn't be noisy */ }
+}
+
+function renderAlertBanner(upcoming) {
+  let bar = document.getElementById('alertBanner');
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'alertBanner';
+    document.body.insertBefore(bar, document.body.firstChild);
+  }
+  if (!upcoming || upcoming.length === 0) { bar.style.display = 'none'; return; }
+  // Count today vs next-7-days
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const today = upcoming.filter(u => u.effective_date && u.effective_date.slice(0, 10) === todayStr).length;
+  bar.style.cssText = 'background:#fff7e6; border-bottom:1px solid #ffe7ad; color:#7a5400; padding:6px 16px; font-size:12px; cursor:pointer;';
+  bar.innerHTML = `⏰ <strong>${upcoming.length}</strong> upcoming PM${upcoming.length===1?'':'s'} in the next 7 days${today>0?` (<strong>${today} due today</strong>)`:''} — click to view in My Tasks`;
+  bar.onclick = () => goto('tasks');
+  bar.style.display = 'block';
+}
+
+function showBlockingAlertModal(item, totalCount) {
+  window.__alertShown = window.__alertShown || new Set();
+  window.__alertShown.add(item.assignment_id);
+  const isExpired = item.status === 'Expired';
+  const tone = isExpired ? 'red' : 'amber';
+  openModal({
+    title: `⚠ Acknowledge Required — ${escapeHtml(item.assignment_id)}`,
+    width: 540,
+    hideDefaultSubmit: false,
+    body: `
+      <div style="background:${isExpired?'#fdecec':'#fff7e6'}; border-left:3px solid var(--${isExpired?'red':'amber'},#c77b00); padding:10px 14px; border-radius:6px; margin-bottom:14px;">
+        <strong style="font-size:13px;">${isExpired ? 'EXPIRED' : 'OVERDUE'}: ${escapeHtml(item.equipment_id)} — ${escapeHtml(item.equipment_name || '')}</strong>
+        <div style="font-size:12px; margin-top:4px;">
+          ${escapeHtml(item.checklist_name || '—')} ${escapeHtml(item.checklist_version || '')}
+          ${item.frequency ? ` · ${escapeHtml(item.frequency)}` : ''}
+          <br>Scheduled: <strong>${escapeHtml(item.effective_date || item.due_date || '—')}</strong>
+          ${item.tolerance_days != null ? ` (±${item.tolerance_days}d tolerance)` : ''}
+          ${item.expired_at ? `<br>Expired: <strong>${escapeHtml(formatLocalTime(item.expired_at))}</strong>` : ''}
+        </div>
+      </div>
+      <p style="font-size:12px; color:var(--muted); margin-top:0;">A comment is required to acknowledge this alert. ${totalCount > 1 ? `<br><strong>${totalCount - 1} more</strong> alert(s) will follow after you acknowledge this one.` : ''}</p>
+      <div class="form-row" style="grid-template-columns:1fr;"><label>Comment *</label>
+        <textarea name="ackComment" required rows="3" placeholder="Why is this PM overdue? What is the plan to complete it?"></textarea>
+      </div>
+    `,
+    submitLabel: 'Acknowledge',
+    actions: `<button type="button" class="btn ghost sm" onclick="goto('tasks'); setTimeout(() => openAssignment('${escapeHtml(item.assignment_id)}'), 250); closeModal();">Open the PM →</button>`,
+    onSubmit: async (data) => {
+      if (!data.ackComment || !data.ackComment.trim()) throw new Error('A comment is required');
+      await api('PUT', `/api/assignments/${item.assignment_id}/acknowledge`, { comment: data.ackComment.trim() });
+      toast('Acknowledged. Refreshing alerts…', 'success');
+      setTimeout(refreshAlerts, 300);
+    }
+  });
+}
+
+// Hide sidebar entries the current user doesn't have access to.
+// Each <a data-page=…> can carry a comma-separated `data-needs` list of
+// activity codes. The entry stays visible if the user has ANY of them.
+// Special sentinel "ADMIN_ONLY" means: must be the System Administrator role.
+function applyNavPermissions() {
+  if (!CURRENT_USER) return;
+  const isAdmin = !!CURRENT_USER.is_admin;
+  const perms = new Set(CURRENT_USER.permissions || []);
+  let visibleBySection = {};
+  document.querySelectorAll('.nav a[data-page]').forEach(link => {
+    const needs = (link.dataset.needs || '').split(',').map(s => s.trim()).filter(Boolean);
+    let allow = true;
+    if (needs.length > 0) {
+      if (needs.includes('ADMIN_ONLY')) allow = isAdmin;
+      else allow = isAdmin || needs.some(n => perms.has(n));
+    }
+    link.style.display = allow ? '' : 'none';
+  });
+  // Hide section headers whose entries are all hidden — keeps the nav tidy.
+  document.querySelectorAll('.nav-section[data-section]').forEach(section => {
+    let next = section.nextElementSibling;
+    let anyVisible = false;
+    while (next && next.tagName === 'A') {
+      if (next.style.display !== 'none') { anyVisible = true; break; }
+      next = next.nextElementSibling;
+    }
+    section.style.display = anyVisible ? '' : 'none';
+  });
 }
 
 // ---------- Routing ----------
@@ -179,32 +283,64 @@ document.querySelectorAll('.nav a').forEach(a => a.addEventListener('click', () 
 // ===========================================================
 async function loadDashboard() {
   try {
-    const [kpis, byDept, audit, pmList, breakdowns] = await Promise.all([
+    const [kpis, byDept, pmList, breakdowns, delayReasons] = await Promise.all([
       api('GET', '/api/dashboard/kpis'),
       api('GET', '/api/dashboard/compliance-by-dept'),
-      api('GET', '/api/audit?limit=8'),
       api('GET', '/api/pm'),
       api('GET', '/api/breakdowns'),
+      api('GET', '/api/dashboard/delay-reasons'),
     ]);
 
-    // KPI tiles
+    // KPI tiles — every tile is a click target taking the user to the
+    // relevant drill-down page so they can act on the number, not just see it.
     $('kpiRow').innerHTML = `
-      <div class="card kpi compliance"><div class="icon-pill">✓</div>
+      <div class="card kpi compliance" style="cursor:pointer;" onclick="goto('reports')" title="Click to view PM reports">
+        <div class="icon-pill">✓</div>
         <div class="label">PM Compliance</div><div class="value">${kpis.compliance}%</div>
         <div class="progress green" style="margin-top:12px;"><span style="width:${kpis.compliance}%"></span></div>
       </div>
-      <div class="card kpi overdue"><div class="icon-pill">!</div>
+      <div class="card kpi overdue" style="cursor:pointer;" onclick="goto('expired')" title="Click to view Expired Equipment">
+        <div class="icon-pill">!</div>
         <div class="label">Overdue / Expired</div><div class="value">${kpis.overdue}</div>
-        <div class="delta bad">${kpis.overdue > 0 ? 'Needs attention' : 'All clear'}</div>
+        <div class="delta bad">${kpis.overdue > 0 ? 'Needs attention — click to drill down' : 'All clear'}</div>
       </div>
-      <div class="card kpi pending"><div class="icon-pill">⌛</div>
+      <div class="card kpi pending" style="cursor:pointer;" onclick="goto('pending')" title="Click to view Pending Equipment">
+        <div class="icon-pill">⌛</div>
         <div class="label">Pending Activities</div><div class="value">${kpis.pending}</div>
-        <div class="delta">Awaiting approval / execution</div>
+        <div class="delta">Awaiting approval / execution — click to drill down</div>
       </div>
-      <div class="card kpi completed"><div class="icon-pill">★</div>
+      <div class="card kpi completed" style="cursor:pointer;" onclick="openCompletedPmsReport()" title="Click to open Completed PMs report">
+        <div class="icon-pill">★</div>
         <div class="label">Completed (MTD)</div><div class="value">${kpis.completed_mtd}</div>
-        <div class="delta">Total schedules: ${kpis.total_pms}</div>
+        <div class="delta">Total schedules: ${kpis.total_pms} — click for details</div>
       </div>`;
+
+    // Why behind schedule? — categorical breakdown of every in-flight PM,
+    // each row clickable to take the user to the page where they can act on it.
+    const reasonsCard = $('delayReasonsCard');
+    if (reasonsCard) {
+      if (!delayReasons || delayReasons.length === 0) {
+        reasonsCard.innerHTML = `<div class="card"><h3 style="margin-top:0;">Why behind schedule?</h3><p style="color:var(--muted); margin:0;">🎉 Nothing pending — every PM is either completed or ahead of schedule.</p></div>`;
+      } else {
+        const totalDelayed = delayReasons.reduce((s, r) => s + r.count, 0);
+        reasonsCard.innerHTML = `
+          <div class="card">
+            <h3 style="margin-top:0;">Why behind schedule?</h3>
+            <p style="font-size:12px; color:var(--muted); margin:0 0 12px;">${totalDelayed} PM(s) in-flight. Click any row to jump to the page where you can act on them.</p>
+            <table class="tbl" style="margin:0;">
+              <thead><tr><th>Reason</th><th style="text-align:right;">Count</th><th style="width:40%;">Share</th></tr></thead>
+              <tbody>${delayReasons.map(r => {
+                const pct = Math.round((r.count / totalDelayed) * 100);
+                return `<tr style="cursor:pointer;" onclick="goto('${escapeHtml(r.page)}')" title="Open ${escapeHtml(r.page)}">
+                  <td><span class="pill ${escapeHtml(r.tone)}" style="font-size:10px;">${escapeHtml(r.reason)}</span></td>
+                  <td style="text-align:right;"><strong>${r.count}</strong></td>
+                  <td><div class="progress ${r.tone === 'red' ? 'red' : (r.tone === 'amber' ? '' : 'green')}"><span style="width:${pct}%;"></span></div></td>
+                </tr>`;
+              }).join('')}</tbody>
+            </table>
+          </div>`;
+      }
+    }
 
     // Dept compliance table
     $('deptComplianceBody').innerHTML = byDept.length === 0
@@ -215,12 +351,16 @@ async function loadDashboard() {
                 <td><div class="progress ${cls}"><span style="width:${r.pct}%"></span></div></td></tr>`;
       }).join('');
 
-    // Recent activity
-    $('recentAuditList').innerHTML = audit.map(a => `
-      <li><div class="dot ${dotColor(a.action)}"></div>
-        <div><strong>${escapeHtml(a.action)}</strong> · ${escapeHtml(a.entity)} ${escapeHtml(a.entity_id)} by <strong>${escapeHtml(a.user_name)}</strong>
-        <div style="color:var(--muted); font-size:11px;">${escapeHtml(a.ts)} — ${escapeHtml(a.details)}</div></div></li>
-    `).join('');
+    // Equipment-by-date panel — replaces the old Recent Activity feed.
+    // Defaults to today, user can pick any date to see equipment that was
+    // scheduled, completed, or expired on that day.
+    const picker = $('dashDatePicker');
+    if (picker) {
+      const today = new Date().toISOString().slice(0, 10);
+      picker.value = today;
+      picker.onchange = () => loadDashboardByDate(picker.value);
+      loadDashboardByDate(today);
+    }
 
     // Upcoming PMs (status approved/assigned/pending, sched in future)
     const upcoming = pmList
@@ -244,6 +384,36 @@ async function loadDashboard() {
         <td>${statusPill(b.status)}</td></tr>`).join('');
 
   } catch (e) { toast(e.message, 'error'); }
+}
+
+// Fetches a single date's Completed/Pending/Expired breakdown and renders
+// it into the Dashboard panel. Each row is clickable to drill into the
+// assignment detail.
+async function loadDashboardByDate(date) {
+  const panel = $('dashDayPanel');
+  if (!panel) return;
+  panel.innerHTML = `<em style="color:var(--muted);">Loading ${escapeHtml(date)}…</em>`;
+  try {
+    const data = await api('GET', `/api/dashboard/by-date?date=${encodeURIComponent(date)}`);
+    const renderGroup = (label, items, tone) => {
+      if (!items || items.length === 0) return `<div style="padding:6px 0; color:var(--muted);"><span class="pill ${tone}" style="font-size:10px;">${label}</span> none on ${escapeHtml(date)}</div>`;
+      return `<div style="padding:6px 0; border-bottom:1px dashed var(--border);">
+        <div><span class="pill ${tone}" style="font-size:10px;">${label}</span> <strong>${items.length}</strong> equipment</div>
+        ${items.slice(0, 5).map(a => `<div style="font-size:11px; padding:2px 0 2px 4px; color:var(--muted); cursor:pointer;" onclick="goto('tasks'); setTimeout(() => openAssignment('${escapeHtml(a.assignment_id)}'), 250);" title="Click to open ${escapeHtml(a.assignment_id)}">
+          <strong style="color:#2a261d;">${escapeHtml(a.equipment_id)}</strong>${a.equipment_name?' · '+escapeHtml(a.equipment_name):''}
+          ${a.checklist_code?` <span style="color:var(--muted);">— ${escapeHtml(a.checklist_code)}</span>`:''}
+        </div>`).join('')}
+        ${items.length > 5 ? `<div style="font-size:11px; color:var(--muted); margin-top:4px;">+ ${items.length - 5} more — open Calendar to see all</div>` : ''}
+      </div>`;
+    };
+    panel.innerHTML = `
+      ${renderGroup('Completed', data.completed, 'green')}
+      ${renderGroup('Pending',   data.pending,   'amber')}
+      ${renderGroup('Expired',   data.expired,   'red')}
+    `;
+  } catch (e) {
+    panel.innerHTML = `<div style="color:var(--red); font-size:12px;">Couldn't load: ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 function dotColor(action) {
@@ -434,14 +604,13 @@ const MASTER_DEFS = {
   plants: {
     api: '/api/plants', pk: 'plant_id',
     head: ['Plant ID','Plant Name','Plant Location','Status','Modified','Actions'],
-    row: r => { r.__pk = r.plant_id; return [r.plant_id, r.name, r.location, statusPill(r.status), r.modified_at, masterRowActions('plants', r)]; },
+    row: r => {
+      r.__pk = r.plant_id;
+      const wfBtn = workflowAwareRowActions('Plant', r);
+      return [r.plant_id, r.name, r.location, statusPill(r.status), r.modified_at, wfBtn];
+    },
     canAdd: true,
-    addFields: [
-      { id:'plant_id', label:'Plant ID', required:true, placeholder:'e.g., PL-001, Unit-1, U-Hyd' },
-      { id:'name', label:'Plant Name', required:true },
-      { id:'location', label:'Plant Location' },
-    ],
-    create: (data) => api('POST','/api/plants',data),
+    customAdd: () => openPlantModal(),  // workflow-aware modal
   },
   blocks: {
     api: '/api/blocks', pk: 'block_id',
@@ -481,7 +650,7 @@ const MASTER_DEFS = {
   },
   equipment: {
     api: '/api/equipment', pk: 'equipment_id',
-    head: ['Equipment ID','Equipment Name','Make','Model','Serial','Area','Status','QR','Actions'],
+    head: ['Equipment ID','Equipment Name','Department','Make','Model','Serial','Area','Status','QR','Actions'],
     row: r => {
       r.__pk = r.equipment_id;
       const wfBtn = masterRowActions('equipment', r);
@@ -499,7 +668,10 @@ const MASTER_DEFS = {
                             title="Click to enlarge / print QR for ${escapeHtml(r.equipment_id)}"
                             onclick="openQrModalForEquipment('${escapeHtml(r.equipment_id)}','${escapeHtml(r.name || '')}')"
                             style="cursor:pointer; width:96px; height:96px; display:inline-block; vertical-align:middle; padding:2px; background:#fff; border:1px solid var(--border); border-radius:4px;"></div>`;
-      return [r.equipment_id, r.name, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status),
+      const deptCell = r.department
+        ? `<span class="pill brown" style="font-size:10px;">${escapeHtml(r.department)}</span>`
+        : '<span style="color:var(--muted); font-size:11px;">—</span>';
+      return [r.equipment_id, r.name, deptCell, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status),
               qrCell,
               [wfBtn, assignBtn].filter(Boolean).join(' ')];
     },
@@ -509,21 +681,60 @@ const MASTER_DEFS = {
 };
 let CURRENT_MASTER = 'plants';
 
+// Sub-tab state for the Equipment master only (department filter).
+let CURRENT_EQ_DEPT = 'all';
+const EQUIPMENT_DEPTS = ['Mechanical','Electrical','Instrumental','Automation','Other'];
+
 async function loadMasters(which) {
   CURRENT_MASTER = which;
   const def = MASTER_DEFS[which];
   document.querySelectorAll('#masterTabs button').forEach(b => b.classList.toggle('active', b.dataset.mt === which));
   $('mastersHead').innerHTML = '<tr>' + def.head.map(h => `<th>${h}</th>`).join('') + '</tr>';
   $('masterAddBtn').style.display = def.canAdd ? '' : 'none';
+
+  // Equipment master gets a second row of department sub-tabs above the table.
+  renderEquipmentDeptTabs(which);
+
   try {
     const rows = await api('GET', def.api);
-    $('mastersBody').innerHTML = rows.length === 0
-      ? `<tr class="empty-row"><td colspan="${def.head.length}">No records</td></tr>`
-      : rows.map(r => '<tr>' + def.row(r).map(c => `<td>${c ?? ''}</td>`).join('') + '</tr>').join('');
+    // Apply equipment department filter if on equipment master AND a specific tab is selected.
+    let filtered = rows;
+    if (which === 'equipment' && CURRENT_EQ_DEPT !== 'all') {
+      filtered = rows.filter(r => (r.department || 'Other') === CURRENT_EQ_DEPT);
+    }
+    $('mastersBody').innerHTML = filtered.length === 0
+      ? `<tr class="empty-row"><td colspan="${def.head.length}">No records${which === 'equipment' && CURRENT_EQ_DEPT !== 'all' ? ` in ${CURRENT_EQ_DEPT}` : ''}.</td></tr>`
+      : filtered.map(r => '<tr>' + def.row(r).map(c => `<td>${c ?? ''}</td>`).join('') + '</tr>').join('');
     // After rendering, draw any QR placeholders that were emitted.
     renderQrCells();
   } catch (e) { toast(e.message, 'error'); }
 }
+
+// Department sub-tabs for the Equipment master. Shown only when which==='equipment'.
+function renderEquipmentDeptTabs(which) {
+  let host = document.getElementById('eqDeptTabs');
+  if (which !== 'equipment') {
+    if (host) host.style.display = 'none';
+    return;
+  }
+  if (!host) {
+    host = document.createElement('div');
+    host.id = 'eqDeptTabs';
+    host.className = 'tabs';
+    host.style.cssText = 'margin: 6px 0 10px; padding-left:6px;';
+    // Place right above the masters table header
+    const head = document.getElementById('mastersHead');
+    if (head && head.parentElement && head.parentElement.parentElement) {
+      head.parentElement.parentElement.parentElement.insertBefore(host, head.parentElement.parentElement);
+    }
+  }
+  host.style.display = '';
+  const opts = [['all', 'All Departments'], ...EQUIPMENT_DEPTS.map(d => [d, d])];
+  host.innerHTML = opts.map(([key, label]) =>
+    `<button class="${CURRENT_EQ_DEPT === key ? 'active' : ''}" type="button" onclick="window.__eqDeptSelect('${escapeHtml(key)}')">${escapeHtml(label)}</button>`
+  ).join('');
+}
+window.__eqDeptSelect = (dept) => { CURRENT_EQ_DEPT = dept; loadMasters('equipment'); };
 
 // Walks every .qr-cell placeholder on screen and renders a small QR into it.
 // Each placeholder either carries its payload directly via data-qr, or — for
@@ -648,6 +859,172 @@ async function openMasterAddModal() {
       await def.create(data);
       toast('Submitted for review.', 'success');
       loadMasters(CURRENT_MASTER);
+    }
+  });
+}
+
+// ----- Workflow-aware Plant master modal -------------------------------------
+// Plants is the proof-of-concept for the new configurable workflow system.
+// Other masters still use the legacy 2-stage reviewer/approver helper.
+async function openPlantModal() {
+  try {
+    const [workflows, users] = await Promise.all([
+      api('GET','/api/approval-workflows'),
+      loadActiveUsers(),
+    ]);
+    const activeWorkflows = workflows.filter(w => w.status === 'Active');
+    if (activeWorkflows.length === 0) {
+      toast('No active approval workflows. Set one up first in Admin Settings → Approval Workflows.', 'error');
+      return;
+    }
+    const meId = CURRENT_USER && CURRENT_USER.id;
+    const userOpts = users.filter(u => u.id !== meId).map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role || '')}</option>`).join('');
+    // Initial workflow = first one. Render its stage pickers.
+    window.__pmsPlantWfMap = Object.fromEntries(activeWorkflows.map(w => [w.id, w]));
+    const renderStages = (workflowId) => {
+      const wf = window.__pmsPlantWfMap[workflowId];
+      if (!wf || !wf.stages) return '';
+      return wf.stages.map((s, i) => `
+        <div class="form-row">
+          <label>Stage ${i+1}: ${escapeHtml(s.label)} <span class="pill ${s.type==='review'?'blue':'green'}" style="font-size:9px;">${escapeHtml(s.type)}</span></label>
+          <select name="stage_assignee_${i}" required>
+            <option value="">— select assignee —</option>${userOpts}
+          </select>
+        </div>`).join('');
+    };
+    window.__pmsPlantOnWf = () => {
+      const sel = document.getElementById('plantWfSel');
+      document.getElementById('plantStagesArea').innerHTML = renderStages(Number(sel.value));
+    };
+    openModal({
+      title: 'Add Plant',
+      width: 560,
+      body: `
+        <div class="form-row"><label>Plant ID *</label><input name="plant_id" required placeholder="e.g., PL-001, Unit-1, U-Hyd" /></div>
+        <div class="form-row"><label>Plant Name *</label><input name="name" required /></div>
+        <div class="form-row"><label>Plant Location</label><input name="location" /></div>
+        <hr class="sep" />
+        <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">APPROVAL WORKFLOW</div>
+        <div class="form-row"><label>Workflow *</label>
+          <select id="plantWfSel" required onchange="window.__pmsPlantOnWf()">
+            ${activeWorkflows.map((w, i) => `<option value="${w.id}" ${i===0?'selected':''}>${escapeHtml(w.name)} (${(w.stages || []).length} stage${(w.stages||[]).length===1?'':'s'})</option>`).join('')}
+          </select>
+        </div>
+        <div id="plantStagesArea">${renderStages(activeWorkflows[0].id)}</div>
+        <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">Each stage requires the assigned user to sign with their password. Stages happen in order. Reject at any stage returns the plant to you with remarks.</p>
+      `,
+      submitLabel: 'Submit for Approval',
+      onSubmit: async (data) => {
+        const workflowId = Number(data.plant_wf_sel || document.getElementById('plantWfSel').value);
+        const wf = window.__pmsPlantWfMap[workflowId];
+        if (!wf) throw new Error('Pick a workflow');
+        const stage_assignees = [];
+        for (let i = 0; i < wf.stages.length; i++) {
+          const v = (data['stage_assignee_' + i] || '').trim();
+          if (!v) throw new Error(`Stage ${i+1} ("${wf.stages[i].label}") needs an assignee`);
+          stage_assignees.push(Number(v));
+        }
+        await api('POST', '/api/plants', {
+          plant_id: data.plant_id,
+          name: data.name,
+          location: data.location,
+          workflow_id: workflowId,
+          stage_assignees,
+        });
+        toast('Plant submitted into approval workflow.', 'success');
+        loadMasters('plants');
+      }
+    });
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// Row actions for workflow-managed records. Reads the per-record approval
+// stages, finds the current pending stage, and shows a Sign button to the
+// assignee (or admin). Falls back to legacy reviewer/approver buttons for
+// records still on the old model.
+function workflowAwareRowActions(entityType, r) {
+  if (!CURRENT_USER) return '';
+  const me = CURRENT_USER.id;
+  // If the record has no `status` starting with "Pending " AND no reviewer_id,
+  // it's already Active/Rejected — nothing to do.
+  if (!r.status || (!r.status.startsWith('Pending ') && r.status !== 'Active' && r.status !== 'Rejected')) return '';
+  // Lazy-load and cache the stages for this row when its row buttons are rendered.
+  // We expose a generic "Sign Stage" button that opens a modal which fetches the
+  // stages and shows a Sign UI for whichever stage is pending and assigned to me.
+  const masterKey = entityType.toLowerCase() + 's';
+  return `<button class="btn ghost sm" onclick="openWorkflowStageModal('${escapeHtml(entityType)}','${escapeHtml(r.__pk)}')">${r.status === 'Active' ? '✓ View' : (r.status === 'Rejected' ? '✗ View' : '📝 Open / Sign')}</button>
+          ${masterRowActions(masterKey, r)}`;  // legacy buttons (for records still on old model)
+}
+
+async function openWorkflowStageModal(entityType, entityId) {
+  try {
+    const stages = await api('GET', `/api/approval-stages?entity_type=${encodeURIComponent(entityType)}&entity_id=${encodeURIComponent(entityId)}`);
+    if (!stages || stages.length === 0) {
+      toast('This record predates the workflow system — use the legacy Review / Approve buttons.', 'error');
+      return;
+    }
+    const me = CURRENT_USER ? CURRENT_USER.id : null;
+    const pendingStage = stages.find(s => s.status === 'Pending');
+    const canSign = pendingStage && (pendingStage.assignee_id === me || (CURRENT_USER && CURRENT_USER.is_admin));
+    const progressHtml = stages.map((s, i) => {
+      const tone = s.status === 'Approved' ? 'green' : (s.status === 'Rejected' ? 'red' : (s.status === 'Pending' ? 'amber' : 'gray'));
+      const icon = s.status === 'Approved' ? '✓' : (s.status === 'Rejected' ? '✗' : '⌛');
+      return `<div style="padding:8px 12px; border-left:3px solid var(--border); margin-bottom:6px; background:${s.status==='Pending'?'#fffbe6':'#fafafa'};">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div>
+            <strong>${icon} Stage ${s.stage_index+1}: ${escapeHtml(s.stage_label)}</strong>
+            <span class="pill ${tone}" style="font-size:9px; margin-left:6px;">${escapeHtml(s.status)}</span>
+            <span class="pill ${s.stage_type==='review'?'blue':'green'}" style="font-size:9px; margin-left:4px;">${escapeHtml(s.stage_type)}</span>
+          </div>
+        </div>
+        <div style="color:var(--muted); font-size:11px; margin-top:3px;">
+          Assignee: <strong>${escapeHtml(s.assignee_name || '—')}</strong>
+          ${s.signed_by_name ? ` · Signed by <strong>${escapeHtml(s.signed_by_name)}</strong> on ${escapeHtml(formatLocalTime(s.signed_at))}` : ''}
+        </div>
+        ${s.remarks ? `<div style="color:var(--muted); font-size:11px; margin-top:3px;"><em>Remarks: ${escapeHtml(s.remarks)}</em></div>` : ''}
+      </div>`;
+    }).join('');
+    const actionsHtml = canSign ? `
+      <hr class="sep" />
+      <p style="font-size:12px;"><strong>Action required:</strong> You are the assignee for Stage ${pendingStage.stage_index+1} ("${escapeHtml(pendingStage.stage_label)}"). Sign to advance the workflow, or reject to return the record to the creator.</p>
+      <div class="form-row"><label>Remarks</label><textarea name="stageRemarks" rows="2" placeholder="Optional for Sign · Required for Reject"></textarea></div>
+    ` : '';
+    window.__wsRejectFn = canSign ? () => {
+      const ta = document.querySelector('textarea[name="stageRemarks"]');
+      const remarks = ta ? ta.value.trim() : '';
+      if (!remarks) { toast('Remarks required for rejection', 'error'); return; }
+      closeModal();
+      setTimeout(() => signWorkflowStage(pendingStage, entityType, entityId, 'reject', remarks), 0);
+    } : null;
+    openModal({
+      title: `${entityType} ${entityId} — Approval Workflow`,
+      width: 580,
+      body: progressHtml + actionsHtml,
+      submitLabel: canSign ? '✍ Sign Stage' : 'Close',
+      hideDefaultSubmit: !canSign,
+      actions: canSign ? `<button type="button" class="btn ghost" style="color:#c53030;" onclick="window.__wsRejectFn()">✗ Reject…</button>` : '',
+      onSubmit: canSign ? async (data) => {
+        const remarks = (data.stageRemarks || '').trim();
+        closeModal();
+        setTimeout(() => signWorkflowStage(pendingStage, entityType, entityId, 'approve', remarks), 0);
+      } : undefined,
+    });
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function signWorkflowStage(stage, entityType, entityId, decision, remarks) {
+  const meaning = decision === 'approve'
+    ? `I sign stage ${stage.stage_index+1} ("${stage.stage_label}") for ${entityType} ${entityId}.${remarks?' Remarks: '+remarks:''}`
+    : `I reject stage ${stage.stage_index+1} ("${stage.stage_label}") for ${entityType} ${entityId}. Reason: ${remarks}`;
+  openESignatureModal({
+    title: `Sign — Stage ${stage.stage_index+1}: ${stage.stage_label}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/approval-stages/${stage.id}/sign`, { decision, remarks, ...esig });
+      toast(decision === 'approve' ? 'Stage signed.' : 'Stage rejected.', 'success');
+      // Reload masters page to reflect new record status
+      if (CURRENT_MASTER) loadMasters(CURRENT_MASTER);
+      refreshNotifBadge();
     }
   });
 }
@@ -791,12 +1168,19 @@ async function openAreaModal() {
 // ----- Custom Equipment Registration modal (cascading Block -> Location -> Area + manual Equipment ID + Make/Model) -----
 async function openEquipmentModal(existing) {
   try {
-    const [blocks, locations, areas, users] = await Promise.all([
+    const [blocks, locations, areas, users, idSuggest, linkedChecklists] = await Promise.all([
       api('GET','/api/blocks'),
       api('GET','/api/locations'),
       api('GET','/api/areas'),
       loadActiveUsers(),
+      existing ? Promise.resolve(null) : api('GET','/api/equipment/next-id').catch(() => null),
+      existing ? api('GET', `/api/equipment/${existing.equipment_id}/linked-checklists`).catch(() => []) : Promise.resolve([]),
     ]);
+    const suggestedId = existing ? null : (idSuggest && idSuggest.suggested) || '';
+    const isQA = CURRENT_USER && (CURRENT_USER.is_admin || /qa/i.test(CURRENT_USER.role || ''));
+    // Equipment ID is editable on create, and only QA can edit it after save.
+    const idReadonly = existing ? !isQA : false;
+    const idValue = existing ? existing.equipment_id : suggestedId;
     const setAuto = (id, label, value) => {
       const el = document.getElementById(id);
       if (!el) return;
@@ -860,33 +1244,70 @@ async function openEquipmentModal(existing) {
           </div>
         </div>
         <div class="form-row"><label>Equipment ID *</label>
-          <input name="equipment_id" required ${existing?'readonly':''} value="${escapeHtml(existing?.equipment_id || '')}" placeholder="e.g., EQ-FBD-04" />
+          <div>
+            <input name="${existing ? 'new_equipment_id' : 'equipment_id'}" required ${idReadonly?'readonly':''} value="${escapeHtml(idValue)}" placeholder="e.g., EQ-FBD-04" />
+            ${!existing ? `<div style="font-size:11px; color:var(--muted); margin-top:3px;">Auto-suggested. Edit before saving if you need a meaningful code (e.g. EQ-AHU-04). After save, only QA can change this.</div>` : (idReadonly ? `<div style="font-size:11px; color:var(--muted); margin-top:3px;">🔒 Locked. Only QA users can rename a saved Equipment ID.</div>` : `<div style="font-size:11px; color:#8a5a32; margin-top:3px;">⚠ QA mode — you can rename this Equipment ID. Audit log will record the change.</div>`)}
+          </div>
         </div>
         <div class="form-row"><label>Equipment Name *</label><input name="name" required value="${escapeHtml(existing?.name || '')}" placeholder="e.g., Fluid Bed Dryer" /></div>
-        <div class="form-row"><label>Make</label><input name="make" value="${escapeHtml(existing?.make || '')}" placeholder="e.g., Gansons" /></div>
-        <div class="form-row"><label>Serial Number</label><input name="serial" value="${escapeHtml(existing?.serial || '')}" /></div>
+        <div class="form-row"><label>Manufacturer</label><input name="make" value="${escapeHtml(existing?.make || '')}" placeholder="e.g., Gansons" /></div>
         <div class="form-row"><label>Model Number</label><input name="model" value="${escapeHtml(existing?.model || '')}" placeholder="e.g., RMG-300" /></div>
+        <div class="form-row"><label>Serial Number</label><input name="serial" value="${escapeHtml(existing?.serial || '')}" /></div>
+        <div class="form-row"><label>Capacity</label><input name="capacity" value="${escapeHtml(existing?.capacity || '')}" placeholder="e.g., 300 kg, 10,000 CFM" /></div>
+        <div class="form-row"><label>Manufacture Date</label><input name="manufacture_date" type="date" value="${escapeHtml(existing?.manufacture_date || '')}" /></div>
+        <div class="form-row"><label>Equipment Type</label><input name="equipment_type" value="${escapeHtml(existing?.equipment_type || '')}" placeholder="e.g., HVAC, Process, Utility" /></div>
+        <div class="form-row"><label>Sub-Type</label><input name="sub_type" value="${escapeHtml(existing?.sub_type || '')}" placeholder="e.g., Air Handling Unit, Granulator" /></div>
+        <div class="form-row"><label>Department *</label>
+          <select name="department" required>
+            <option value="">— select department —</option>
+            ${['Mechanical','Electrical','Instrumental','Automation','Other'].map(d => `<option ${d===(existing?.department||'')?'selected':''}>${d}</option>`).join('')}
+          </select>
+        </div>
         ${existing ? `<div class="form-row"><label>Status</label>
           <select name="status">
             ${['Active','Inactive'].map(s => `<option ${s===(existing?.status||'Active')?'selected':''}>${s}</option>`).join('')}
           </select>
         </div>` : ''}
+        ${existing && linkedChecklists && linkedChecklists.length > 0 ? `
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Linked Checklists</label>
+          <div style="font-size:12px; background:#f8f4ec; border-radius:6px; padding:8px 10px;">
+            ${linkedChecklists.map(c => `<div style="padding:3px 0; border-bottom:1px dashed var(--border);">
+              <strong>${escapeHtml(c.code || c.name || '—')}</strong> <span style="color:var(--muted);">${escapeHtml(c.version || '')}</span>
+              <span class="pill brown" style="font-size:9px; margin-left:6px;">${escapeHtml(c.frequency || '—')}</span>
+              <span class="pill ${c.assignment_status==='Completed'?'gray':'amber'}" style="font-size:9px; margin-left:4px;">${escapeHtml(c.assignment_status || '—')}</span>
+              <div style="color:var(--muted); font-size:11px;">PM ${escapeHtml(c.assignment_id || '')} · scheduled ${escapeHtml(c.effective_date || c.due_date || '—')}</div>
+            </div>`).join('')}
+          </div>
+        </div>` : (existing ? `
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Linked Checklists</label>
+          <div style="font-size:12px; color:var(--muted);">No checklists assigned yet. Assign one from the Equipment row's 🎯 Assign button.</div>
+        </div>` : '')}
         <p style="font-size:11px; color:var(--muted); margin:6px 0 0;">A QR code is generated automatically from the Equipment ID for shop-floor scanning.</p>
       ` + (existing ? '' : masterApproverFields(users)),
       submitLabel: existing ? 'Save Changes' : 'Submit for Review',
       onSubmit: async (data) => {
         if (!data.area_id) throw new Error('Please select an Area');
         const payload = {
-          equipment_id: data.equipment_id,
-          name: data.name, make: data.make, model: data.model,
+          name: data.name,
+          make: data.make,
+          model: data.model,
           serial: data.serial,
+          capacity: data.capacity,
           area_id: data.area_id,
+          manufacture_date: data.manufacture_date || null,
+          equipment_type: data.equipment_type || null,
+          sub_type: data.sub_type || null,
         };
         if (existing) {
           payload.status = data.status;
+          // QA-only Equipment ID rename — server enforces too.
+          if (!idReadonly && data.new_equipment_id && data.new_equipment_id !== existing.equipment_id) {
+            payload.new_equipment_id = data.new_equipment_id;
+          }
           await api('PUT', `/api/equipment/${existing.equipment_id}`, payload);
           toast('Equipment updated.', 'success');
         } else {
+          payload.equipment_id = data.equipment_id;
           if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
           if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
           payload.reviewer_id = Number(data.reviewer_id);
@@ -929,12 +1350,22 @@ async function loadUsers() {
 }
 
 async function setUserStatus(user_id, status) {
-  try { await api('PUT', `/api/users/${user_id}/status`, { status }); toast(`User ${user_id} set to ${status}`, 'success'); loadUsers(); }
-  catch (e) { toast(e.message, 'error'); }
+  // Lock / Deactivate / Activate — sensitive account actions, require e-sig.
+  const action = status === 'Locked' ? 'lock' : (status === 'Inactive' ? 'deactivate' : 'activate');
+  const meaning = `I ${action} user account "${user_id}". I am authorized to perform this action.`;
+  openESignatureModal({
+    title: `Sign — ${action.charAt(0).toUpperCase() + action.slice(1)} ${user_id}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/users/${user_id}/status`, { status, ...esig });
+      toast(`User ${user_id} set to ${status}`, 'success');
+      loadUsers();
+    }
+  });
 }
 
 function confirmDeactivate(user_id, name) {
-  if (!confirm(`Deactivate ${name}? Their active sessions will be terminated and they won't be able to sign in.`)) return;
+  if (!confirm(`Deactivate ${name}? Their active sessions will be terminated. You'll be asked to confirm with your password.`)) return;
   setUserStatus(user_id, 'Inactive');
 }
 
@@ -942,15 +1373,24 @@ function resetUserPasswordPrompt(user_id, name) {
   openModal({
     title: `Reset password for ${escapeHtml(name)}`,
     body: `
-      <p style="font-size:12px; color:var(--muted); margin-top:0;">Setting a new password will sign this user out of all active sessions. They'll need to log in again with the new password.</p>
+      <p style="font-size:12px; color:var(--muted); margin-top:0;">Setting a new password will sign this user out of all active sessions. They'll need to log in again with the new password. <strong>You will be asked to sign with your password on the next step.</strong></p>
       <div class="form-row"><label>New Password *</label><input name="password" type="password" minlength="6" required autofocus /></div>
       <div class="form-row"><label>Confirm *</label><input name="confirm" type="password" minlength="6" required /></div>
     `,
-    submitLabel: 'Reset Password',
+    submitLabel: 'Reset Password →',
     onSubmit: async (data) => {
       if (data.password !== data.confirm) throw new Error('Passwords do not match');
-      await api('PUT', `/api/users/${user_id}/password`, { password: data.password });
-      toast(`Password reset for ${name}.`, 'success');
+      const meaning = `I reset the password for user "${user_id}". This action will terminate their active sessions.`;
+      setTimeout(() => {
+        openESignatureModal({
+          title: `Sign — Reset password for ${name}`,
+          meaning,
+          onConfirm: async (esig) => {
+            await api('PUT', `/api/users/${user_id}/password`, { password: data.password, ...esig });
+            toast(`Password reset for ${name}.`, 'success');
+          }
+        });
+      }, 0);
     }
   });
 }
@@ -1270,6 +1710,16 @@ function openGroupDecisionModal(groupId, groupName, stage) {
   openConfigDecisionModal({ apiBase: '/api/checklist-groups', label: 'Checklist Group', rowId: groupId, rowName: groupName, stage, reload: loadPmConfig });
 }
 
+// Standard checklist-group categories. Surfaced as a datalist so QA can
+// pick a canonical name or override with something custom if needed.
+const STANDARD_CHECKLIST_GROUPS = [
+  'Instrumentation',
+  'Electrical',
+  'Mechanical',
+  'Automation',
+  'Others',
+];
+
 // ----- Checklist Group master CRUD -----
 async function openGroupModal(existing) {
   const g = existing || { name:'', department_id:'' };
@@ -1280,7 +1730,13 @@ async function openGroupModal(existing) {
   openModal({
     title: existing ? `Edit Check List Group — ${escapeHtml(g.name)}` : 'Add Check List Group',
     body: `
-      <div class="form-row"><label>Check List Group *</label><input name="name" value="${escapeHtml(g.name)}" required placeholder="e.g. Mechanical / Electrical / HVAC / Water Systems" /></div>
+      <div class="form-row"><label>Check List Group *</label>
+        <div>
+          <input name="name" value="${escapeHtml(g.name)}" required list="stdGroupList" placeholder="e.g. Instrumentation, Electrical, Mechanical, Automation, Others" />
+          <datalist id="stdGroupList">${STANDARD_CHECKLIST_GROUPS.map(n => `<option value="${escapeHtml(n)}">`).join('')}</datalist>
+          <div style="font-size:11px; color:var(--muted); margin-top:3px;">Standard categories: Instrumentation, Electrical, Mechanical, Automation, Others. Type or pick from the dropdown.</div>
+        </div>
+      </div>
       <div class="form-row"><label>Department</label>
         <select name="department_id">
           <option value="">— none —</option>
@@ -1640,7 +2096,7 @@ async function loadBreakdowns() {
       <tr>
         <td><strong>${escapeHtml(b.bd_id)}</strong></td>
         <td>${escapeHtml(b.equipment_name || b.equipment_id)}</td>
-        <td>${escapeHtml(b.reported_at)}</td>
+        <td>${escapeHtml(formatLocalTime(b.reported_at))}</td>
         <td>${escapeHtml(b.reported_by_name || '')}</td>
         <td>${severityPill(b.severity)}</td>
         <td>${statusPill(b.status)}</td>
@@ -1661,12 +2117,39 @@ async function openBdDetail(bdId) {
     const b = list.find(x => x.bd_id === bdId);
     if (!b) return toast('Not found','error');
     const closed = ['Closed','Resolved'].includes(b.status);
+    const pendingVerify = b.status === 'Pending Verification';
+    const investigating = b.status === 'Investigating';
+    // Action buttons depending on stage
+    let stageActions = '';
+    if (pendingVerify) {
+      stageActions = `
+        <hr class="sep" />
+        <div style="background:#fff7e6; border-left:3px solid #c77b00; padding:8px 12px; border-radius:6px; margin-bottom:10px; font-size:12px;">
+          <strong>Awaiting verification.</strong> Review the report below and either verify (start investigation) or reject (close without action). Both require e-signature.
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn primary sm" type="button" onclick="bdVerify('${bdId}','verify')">✓ Verify — Start Investigation</button>
+          <button class="btn ghost sm" type="button" style="color:#c53030;" onclick="bdVerify('${bdId}','reject')">✗ Reject Report</button>
+        </div>`;
+    } else if (investigating) {
+      stageActions = `
+        <hr class="sep" />
+        <div style="background:#eaf6ea; border-left:3px solid var(--green); padding:8px 12px; border-radius:6px; margin-bottom:10px; font-size:12px;">
+          <strong>Investigation in progress.</strong> Once the resolution is in place, mark it for approval. Requires e-signature.
+        </div>
+        <div style="display:flex; gap:8px;">
+          <button class="btn primary sm" type="button" onclick="bdApproveRes('${bdId}','approve')">✓ Approve Resolution — Close Breakdown</button>
+          <button class="btn ghost sm" type="button" style="color:#c53030;" onclick="bdApproveRes('${bdId}','reject')">✗ Return for Rework</button>
+        </div>`;
+    }
     openModal({
       title: `Breakdown ${b.bd_id}`,
+      width: 600,
       body: `
         <div class="row-gap" style="margin-bottom: 10px;">
           ${severityPill(b.severity)} ${statusPill(b.status)}
           <span class="pill brown">${escapeHtml(b.equipment_id)}</span>
+          <span class="pill brown">Reported ${escapeHtml(formatLocalTime(b.reported_at))}</span>
         </div>
         <div class="form-row"><label>Severity</label>
           <select name="severity" ${closed?'disabled':''}>
@@ -1675,24 +2158,34 @@ async function openBdDetail(bdId) {
         </div>
         <div class="form-row"><label>Status</label>
           <select name="status" ${closed?'disabled':''}>
-            ${['Active','Investigating','Spares Awaited','Resolved','Closed'].map(s => `<option ${s===b.status?'selected':''}>${s}</option>`).join('')}
+            ${['Pending Verification','Investigating','Spares Awaited','Resolved','Closed'].map(s => `<option ${s===b.status?'selected':''}>${s}</option>`).join('')}
           </select>
         </div>
-        <div class="form-row"><label>Description</label>
-          <textarea name="__desc" disabled>${escapeHtml(b.description || '')}</textarea>
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label>
+          <textarea disabled>${escapeHtml(b.description || '')}</textarea>
         </div>
-        <div class="form-row"><label>Root Cause</label>
+        ${b.cause ? `<div class="form-row" style="grid-template-columns:1fr;"><label>Initial Cause (reporter)</label><textarea name="cause" ${closed?'disabled':''}>${escapeHtml(b.cause)}</textarea></div>` : ''}
+        ${b.proposed_resolution ? `<div class="form-row" style="grid-template-columns:1fr;"><label>Proposed Resolution</label><textarea name="proposed_resolution" ${closed?'disabled':''}>${escapeHtml(b.proposed_resolution)}</textarea></div>` : ''}
+        ${b.estimated_duration ? `<div class="form-row"><label>Estimated Duration</label><input name="estimated_duration" ${closed?'disabled':''} value="${escapeHtml(b.estimated_duration)}" /></div>` : ''}
+        ${b.replacement_equipment_id ? `<div class="form-row"><label>Replacement</label><input disabled value="${escapeHtml(b.replacement_equipment_id)}${b.replacement_suitable?' · suitable':''}" /></div>` : ''}
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Root Cause (investigation)</label>
           <textarea name="root_cause" ${closed?'disabled':''}>${escapeHtml(b.root_cause || '')}</textarea>
         </div>
-        <div class="form-row"><label>Resolution</label>
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Resolution (actual)</label>
           <textarea name="resolution" ${closed?'disabled':''}>${escapeHtml(b.resolution || '')}</textarea>
         </div>
-        ${b.mttr_hours ? `<div style="color:var(--muted); font-size:12px; margin-top: 8px;">MTTR: ${b.mttr_hours}h · closed ${escapeHtml(b.closed_at || '')}</div>`:''}`,
-      hideDefaultSubmit: closed,
+        ${b.verified_at ? `<div style="color:var(--muted); font-size:12px;">Verified ${escapeHtml(formatLocalTime(b.verified_at))}${b.verification_remarks?' — '+escapeHtml(b.verification_remarks):''}</div>` : ''}
+        ${b.mttr_hours ? `<div style="color:var(--muted); font-size:12px; margin-top:4px;">MTTR: ${b.mttr_hours}h · closed ${escapeHtml(formatLocalTime(b.closed_at || ''))}</div>` : ''}
+        ${stageActions}
+      `,
+      hideDefaultSubmit: closed || pendingVerify || investigating,
+      submitLabel: 'Save Changes',
       onSubmit: async (data) => {
         await api('PUT', `/api/breakdowns/${bdId}`, {
           severity: data.severity, status: data.status,
-          root_cause: data.root_cause, resolution: data.resolution
+          root_cause: data.root_cause, resolution: data.resolution,
+          cause: data.cause, proposed_resolution: data.proposed_resolution,
+          estimated_duration: data.estimated_duration,
         });
         toast('Breakdown updated.', 'success');
         loadBreakdowns();
@@ -1701,25 +2194,108 @@ async function openBdDetail(bdId) {
   } catch (e) { toast(e.message,'error'); }
 }
 
+// Verify / Reject a Pending-Verification breakdown report (e-sig required).
+async function bdVerify(bdId, decision) {
+  let remarks = '';
+  if (decision === 'reject') {
+    remarks = prompt('Reason for rejecting the breakdown report (required):') || '';
+    if (!remarks) return;
+  } else {
+    remarks = prompt('Verification remarks (optional):') || '';
+  }
+  const meaning = decision === 'verify'
+    ? `I verify breakdown report ${bdId}. Investigation may begin.`
+    : `I reject breakdown report ${bdId}. Reason: ${remarks}`;
+  closeModal();
+  setTimeout(() => openESignatureModal({
+    title: `Sign — ${decision === 'verify' ? 'Verify' : 'Reject'} Breakdown ${bdId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/breakdowns/${bdId}/verify`, { decision, remarks, ...esig });
+      toast(decision === 'verify' ? 'Verified — investigation begins.' : 'Report rejected.', 'success');
+      loadBreakdowns();
+    }
+  }), 0);
+}
+
+// Approve resolution (closes the breakdown) or return for rework. E-sig required.
+async function bdApproveRes(bdId, decision) {
+  let remarks = '';
+  if (decision === 'reject') {
+    remarks = prompt('Reason for returning the resolution (required):') || '';
+    if (!remarks) return;
+  } else {
+    remarks = prompt('Approval remarks (optional):') || '';
+  }
+  const meaning = decision === 'approve'
+    ? `I approve the resolution for breakdown ${bdId}. The equipment is restored to service.`
+    : `I reject the proposed resolution for breakdown ${bdId}. Reason: ${remarks}`;
+  closeModal();
+  setTimeout(() => openESignatureModal({
+    title: `Sign — ${decision === 'approve' ? 'Approve Resolution' : 'Return for Rework'} ${bdId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/breakdowns/${bdId}/approve-resolution`, { decision, remarks, ...esig });
+      toast(decision === 'approve' ? 'Resolution approved — breakdown closed.' : 'Returned for rework.', 'success');
+      loadBreakdowns();
+    }
+  }), 0);
+}
+
 async function openBreakdownModal() {
   try {
     const equipment = await api('GET','/api/equipment');
+    const activeEq = equipment.filter(e => e.status === 'Active');
     openModal({
-      title: 'Log Breakdown',
+      title: 'Report Breakdown',
+      width: 580,
       body: `
+        <p style="font-size:12px; color:var(--muted); margin-top:0;">After you submit, this report goes through one-step verification by QA / Engineering before becoming an active investigation.</p>
         <div class="form-row"><label>Equipment *</label>
-          <select name="equipment_id" required>${equipment.map(e => `<option value="${e.equipment_id}">${e.equipment_id} · ${escapeHtml(e.name)}</option>`).join('')}</select>
+          <select name="equipment_id" required>
+            <option value="">— select equipment —</option>
+            ${activeEq.map(e => `<option value="${escapeHtml(e.equipment_id)}">${escapeHtml(e.equipment_id)} · ${escapeHtml(e.name)}</option>`).join('')}
+          </select>
         </div>
         <div class="form-row"><label>Severity *</label>
           <select name="severity"><option>Critical</option><option selected>Major</option><option>Minor</option></select>
         </div>
-        <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label>
-          <textarea name="description" placeholder="What happened?"></textarea>
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Description *</label>
+          <textarea name="description" required rows="2" placeholder="What happened? When was it noticed?"></textarea>
+        </div>
+        <hr class="sep" />
+        <div style="font-size:11px; color:var(--brown-700); text-transform:uppercase; letter-spacing:1px; margin-bottom:6px;">Initial Assessment</div>
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Cause</label>
+          <textarea name="cause" rows="2" placeholder="Suspected cause — what likely triggered the breakdown?"></textarea>
+        </div>
+        <div class="form-row" style="grid-template-columns:1fr;"><label>Proposed Resolution</label>
+          <textarea name="proposed_resolution" rows="2" placeholder="How do you plan to fix it?"></textarea>
+        </div>
+        <div class="form-row"><label>Estimated Duration</label>
+          <input name="estimated_duration" placeholder="e.g., 4 hours, 2 days, 1 week" />
+        </div>
+        <hr class="sep" />
+        <div style="font-size:11px; color:var(--brown-700); text-transform:uppercase; letter-spacing:1px; margin-bottom:6px;">Replacement Equipment (if any)</div>
+        <div class="form-row"><label>Replacement Equipment</label>
+          <select name="replacement_equipment_id">
+            <option value="">— none —</option>
+            ${activeEq.map(e => `<option value="${escapeHtml(e.equipment_id)}">${escapeHtml(e.equipment_id)} · ${escapeHtml(e.name)}</option>`).join('')}
+          </select>
+        </div>
+        <div class="form-row"><label>&nbsp;</label>
+          <label style="font-size:12px; display:flex; gap:6px; align-items:center;">
+            <input type="checkbox" name="replacement_suitable" />
+            I confirm the replacement is suitable (capacity, validation status, GMP compliance equivalent).
+          </label>
         </div>`,
+      submitLabel: 'Report Breakdown',
       onSubmit: async (data) => {
+        if (!data.equipment_id) throw new Error('Pick the affected equipment');
+        if (!data.description || !data.description.trim()) throw new Error('Description is required');
         await api('POST','/api/breakdowns', data);
-        toast('Breakdown logged.', 'success');
+        toast('Breakdown reported — sent to QA / Engineering for verification.', 'success');
         loadBreakdowns();
+        refreshNotifBadge();
       }
     });
   } catch (e) { toast(e.message,'error'); }
@@ -1731,18 +2307,56 @@ async function openBreakdownModal() {
 async function loadAudit(limit=100) {
   try {
     const rows = await api('GET', `/api/audit?limit=${limit}`);
-    $('auditBody').innerHTML = rows.length === 0
-      ? '<tr class="empty-row"><td colspan="6">No audit entries</td></tr>'
-      : rows.map(a => `
-      <tr>
-        <td>${escapeHtml(formatLocalTime(a.ts))}</td>
-        <td>${escapeHtml(a.user_name)}</td>
-        <td><span class="pill ${dotColorPill(a.action)}">${escapeHtml(a.action)}</span></td>
-        <td>${escapeHtml(a.entity)}</td>
-        <td>${escapeHtml(a.entity_id)}</td>
-        <td>${escapeHtml(a.details || '')}</td>
-      </tr>`).join('');
+    renderAuditRows(rows, { limit });
+    return rows;
   } catch (e) { toast(e.message,'error'); }
+}
+
+function renderAuditRows(rows, meta) {
+  $('auditBody').innerHTML = rows.length === 0
+    ? '<tr class="empty-row"><td colspan="6">No audit entries</td></tr>'
+    : rows.map(a => `
+    <tr>
+      <td>${escapeHtml(formatLocalTime(a.ts))}</td>
+      <td>${escapeHtml(a.user_name)}</td>
+      <td><span class="pill ${dotColorPill(a.action)}">${escapeHtml(a.action)}</span></td>
+      <td>${escapeHtml(a.entity)}</td>
+      <td>${escapeHtml(a.entity_id)}</td>
+      <td>${escapeHtml(a.details || '')}</td>
+    </tr>`).join('');
+  // Print header — shown only in print/PDF media.
+  const printMeta = document.getElementById('auditPrintMeta');
+  if (printMeta) {
+    const parts = [];
+    if (meta && meta.from) parts.push(`From ${meta.from}`);
+    if (meta && meta.to)   parts.push(`To ${meta.to}`);
+    if (meta && meta.user) parts.push(`User: ${meta.user}`);
+    if (meta && meta.action) parts.push(`Action: ${meta.action}`);
+    parts.push(`${rows.length} entries`);
+    parts.push(`Generated ${new Date().toLocaleString()}`);
+    printMeta.textContent = parts.join(' · ');
+  }
+}
+
+// Audit filter — calls the API with from/to/user/action params + renders.
+async function applyAuditFilter() {
+  const from = ($('auditFrom').value || '').trim();
+  const to   = ($('auditTo').value || '').trim();
+  const user = ($('auditUser').value || '').trim();
+  const action = ($('auditAction').value || '').trim();
+  const q = new URLSearchParams({ limit: '2000' });
+  if (from)   q.set('from', from);
+  if (to)     q.set('to', to);
+  if (user)   q.set('user', user);
+  if (action) q.set('action', action);
+  try {
+    const rows = await api('GET', '/api/audit?' + q.toString());
+    renderAuditRows(rows, { from, to, user, action });
+  } catch (e) { toast(e.message, 'error'); }
+}
+function clearAuditFilter() {
+  ['auditFrom','auditTo','auditUser','auditAction'].forEach(id => { const el = $(id); if (el) el.value = ''; });
+  loadAudit(100);
 }
 function dotColorPill(action) {
   if (['APPROVE','COMPLETE','CREATE'].includes(action)) return 'green';
@@ -1949,13 +2563,36 @@ function closeModal() {
 // ===========================================================
 $('globalSearch').addEventListener('keydown', async (ev) => {
   if (ev.key !== 'Enter') return;
-  const q = ev.target.value.trim().toUpperCase();
+  const q = ev.target.value.trim();
   if (!q) return;
+  const Q = q.toUpperCase();
   try {
-    if (q.startsWith('PM-'))  { openPm(q); return; }
-    if (q.startsWith('BD-'))  { openBdDetail(q); return; }
-    if (q.startsWith('EQ-'))  { /* go to equipment list */ goto('masters'); loadMasters('equipment'); return; }
-    toast('Search: try a PM-, BD- or EQ- ID', 'error');
+    // ID prefix → direct navigation
+    if (Q.startsWith('PM-'))  { openPm(Q); return; }
+    if (Q.startsWith('BD-'))  { openBdDetail(Q); return; }
+    if (Q.startsWith('CA-'))  { goto('tasks'); setTimeout(() => openAssignment(Q), 250); return; }
+    if (Q.startsWith('EQ-'))  { goto('masters'); loadMasters('equipment'); return; }
+    if (Q.startsWith('PL-'))  { goto('masters'); loadMasters('plants'); return; }
+    if (Q.startsWith('BLK-')) { goto('masters'); loadMasters('blocks'); return; }
+    if (Q.startsWith('LOC-')) { goto('masters'); loadMasters('locations'); return; }
+    if (Q.startsWith('AR-'))  { goto('masters'); loadMasters('areas'); return; }
+    if (Q.startsWith('CHK-')) {
+      // Look up checklist by code → open preview
+      const list = await api('GET', '/api/checklists');
+      const match = list.find(c => (c.code || '').toUpperCase() === Q);
+      if (match) { goto('checklist'); setTimeout(() => previewChecklist(match.id), 250); return; }
+      toast(`No checklist found with code "${q}"`, 'error');
+      return;
+    }
+    // Free text → try equipment name match
+    const equip = await api('GET', '/api/equipment');
+    const eqMatch = equip.find(e => ((e.name || '') + ' ' + (e.equipment_id || '')).toUpperCase().includes(Q));
+    if (eqMatch) {
+      goto('masters'); loadMasters('equipment');
+      toast(`Found equipment: ${eqMatch.equipment_id} — ${eqMatch.name}`, 'success');
+      return;
+    }
+    toast(`No match for "${q}". Try a prefix: PM- BD- CA- CHK- EQ- PL- BLK- LOC- AR-, or part of an equipment name.`, 'error');
   } catch (e) { toast(e.message, 'error'); }
 });
 
@@ -2033,6 +2670,99 @@ async function loadSettings(tab) {
   if (tab === 'departments') return renderDeptsTab();
   if (tab === 'roles')        return renderRolesTab();
   if (tab === 'activities')   return renderActivitiesTab();
+  if (tab === 'workflows')    return renderWorkflowsTab();
+}
+
+// ----- Approval Workflows tab -----
+async function renderWorkflowsTab() {
+  try {
+    const workflows = await api('GET','/api/approval-workflows');
+    const canEdit = can('manage_pm_categories') || can('manage_checklists') || (CURRENT_USER && CURRENT_USER.is_admin);
+    $('settingsPanel').innerHTML = `
+      <div class="card">
+        <div class="card-head">
+          <h3>Approval Workflows</h3>
+          ${canEdit ? `<button class="btn primary sm" onclick="openWorkflowModal()">+ New Workflow</button>` : ''}
+        </div>
+        <p style="font-size:12px; color:var(--muted); margin-top:0;">
+          Define named approval chains. When creating a master record (Plant / Equipment / Checklist / …), the creator picks a workflow and assigns a user to each stage. The record walks through the stages in order — each requiring an e-signature. Reject at any stage sends the record back to the creator.
+        </p>
+        <table class="tbl">
+          <thead><tr><th>Name</th><th>Stages</th><th>Status</th><th></th></tr></thead>
+          <tbody>${workflows.length === 0
+            ? '<tr class="empty-row"><td colspan="4">No workflows yet.</td></tr>'
+            : workflows.map(w => `<tr>
+                <td><strong>${escapeHtml(w.name)}</strong>${w.is_system?' <span class="pill brown" style="font-size:9px; margin-left:4px;">SYSTEM</span>':''}<div style="color:var(--muted); font-size:11px;">${escapeHtml(w.description || '')}</div></td>
+                <td>${(w.stages || []).map((s, i) => `<div style="font-size:11px;">${i+1}. <strong>${escapeHtml(s.label)}</strong> <span class="pill ${s.type==='review'?'blue':'green'}" style="font-size:9px; margin-left:4px;">${escapeHtml(s.type)}</span></div>`).join('')}</td>
+                <td>${statusPill(w.status)}</td>
+                <td style="text-align:right;">
+                  ${canEdit && !w.is_system ? `<button class="btn ghost sm" onclick='openWorkflowModal(${escapeHtml(JSON.stringify(w))})'>Edit</button>
+                                              <button class="btn ghost sm" onclick="deleteWorkflow(${w.id})">×</button>` : ''}
+                </td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function openWorkflowModal(existing) {
+  const w = existing || { name:'', description:'', stages:[{label:'Reviewer', type:'review'},{label:'Approver', type:'approve'}] };
+  // Stash stages in a global so the +/− buttons can mutate without losing focus on each redraw.
+  window.__wfStages = JSON.parse(JSON.stringify(w.stages || []));
+  const renderStages = () => window.__wfStages.map((s, i) => `
+    <div class="card" style="padding:8px 10px; margin-bottom:6px; display:flex; gap:6px; align-items:center;">
+      <span style="width:24px; text-align:center; color:var(--muted); font-weight:600;">${i+1}.</span>
+      <input class="wf-stage-label" value="${escapeHtml(s.label)}" placeholder="Stage label (e.g. QA Review)" style="flex:1;" />
+      <select class="wf-stage-type" style="width:120px;">
+        <option value="review"  ${s.type==='review'?'selected':''}>Review</option>
+        <option value="approve" ${s.type==='approve'?'selected':''}>Approve</option>
+      </select>
+      <button type="button" class="btn ghost sm" onclick="window.__wfRemStage(${i})">×</button>
+    </div>`).join('');
+  const refresh = () => { document.getElementById('wfStagesList').innerHTML = renderStages(); };
+  window.__wfReadStages = () => {
+    const labels = Array.from(document.querySelectorAll('.wf-stage-label')).map(e => e.value.trim());
+    const types  = Array.from(document.querySelectorAll('.wf-stage-type')).map(e => e.value);
+    return labels.map((l, i) => ({ label: l, type: types[i] }));
+  };
+  window.__wfAddStage = () => { window.__wfStages = window.__wfReadStages(); window.__wfStages.push({ label:'', type:'approve' }); refresh(); };
+  window.__wfRemStage = (idx) => { window.__wfStages = window.__wfReadStages(); window.__wfStages.splice(idx, 1); if (window.__wfStages.length === 0) window.__wfStages.push({label:'',type:'review'}); refresh(); };
+  openModal({
+    title: existing ? `Edit Workflow — ${escapeHtml(w.name)}` : 'New Approval Workflow',
+    width: 620,
+    body: `
+      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(w.name)}" required placeholder="e.g. QA 3-Stage Critical" /></div>
+      <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description" rows="2">${escapeHtml(w.description || '')}</textarea></div>
+      <hr class="sep" />
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+        <strong>Stages</strong>
+        <button type="button" class="btn ghost sm" onclick="window.__wfAddStage()">+ Add Stage</button>
+      </div>
+      <div id="wfStagesList">${renderStages()}</div>
+      <p style="font-size:11px; color:var(--muted); margin:8px 0 0;">Each stage requires an e-signature from its assigned user. The record progresses through stages in order. Reject at any stage returns to the creator.</p>
+    `,
+    submitLabel: existing ? 'Save Changes' : 'Create Workflow',
+    onSubmit: async (data) => {
+      const stages = window.__wfReadStages().filter(s => s.label);
+      if (stages.length === 0) throw new Error('Add at least one stage');
+      const payload = { name: data.name, description: data.description, stages };
+      if (existing) {
+        await api('PUT', `/api/approval-workflows/${existing.id}`, payload);
+        toast('Workflow updated.', 'success');
+      } else {
+        await api('POST', '/api/approval-workflows', payload);
+        toast('Workflow created.', 'success');
+      }
+      renderWorkflowsTab();
+    }
+  });
+}
+
+async function deleteWorkflow(id) {
+  if (!confirm('Delete this workflow? Any records still using it must be re-assigned first.')) return;
+  try { await api('DELETE', `/api/approval-workflows/${id}`); toast('Deleted.', 'success'); renderWorkflowsTab(); }
+  catch (e) { toast(e.message, 'error'); }
 }
 
 // ----- Departments tab -----
@@ -2064,24 +2794,51 @@ async function renderDeptsTab() {
 }
 
 function openDeptModal(existing) {
+  // Only admins (or users with manage_departments) can reach this — sidebar
+  // already hides Admin Settings for everyone else.
+  if (!CURRENT_USER || (!CURRENT_USER.is_admin && !(CURRENT_USER.permissions || []).includes('manage_departments'))) {
+    toast('Only administrators can manage departments.', 'error');
+    return;
+  }
   const d = existing || { name:'', description:'' };
   openModal({
     title: existing ? `Edit Department — ${escapeHtml(d.name)}` : 'Add Department',
     body: `
+      <p style="font-size:12px; color:var(--muted); margin-top:0;">Departments are referenced by every user, role, and master record. <strong>You will be asked to sign with your password on the next step.</strong></p>
       <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(d.name)}" required /></div>
       <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(d.description || '')}</textarea></div>
     `,
+    submitLabel: existing ? 'Save Changes →' : 'Create Department →',
     onSubmit: async (data) => {
-      if (existing) await api('PUT', `/api/departments/${existing.id}`, data);
-      else          await api('POST','/api/departments', data);
-      toast('Saved.', 'success'); renderDeptsTab();
+      const meaning = existing
+        ? `I update department "${d.name}". I am authorized to manage organizational structure.`
+        : `I create department "${data.name}". I am authorized to manage organizational structure.`;
+      setTimeout(() => {
+        openESignatureModal({
+          title: existing ? `Sign — Update Department ${d.name}` : `Sign — Create Department ${data.name}`,
+          meaning,
+          onConfirm: async (esig) => {
+            const payload = { ...data, ...esig };
+            if (existing) await api('PUT', `/api/departments/${existing.id}`, payload);
+            else          await api('POST','/api/departments', payload);
+            toast('Saved.', 'success'); renderDeptsTab();
+          }
+        });
+      }, 0);
     }
   });
 }
 async function deleteDept(id) {
-  if (!confirm('Delete this department?')) return;
-  try { await api('DELETE', `/api/departments/${id}`); toast('Deleted.','success'); renderDeptsTab(); }
-  catch (e) { toast(e.message,'error'); }
+  if (!confirm('Delete this department? You will be asked to sign with your password.')) return;
+  const meaning = `I delete a department (id ${id}). I am authorized to manage organizational structure.`;
+  openESignatureModal({
+    title: `Sign — Delete Department`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('DELETE', `/api/departments/${id}`, esig);  // body via esig
+      toast('Deleted.','success'); renderDeptsTab();
+    }
+  });
 }
 
 // ----- Roles tab -----
@@ -2173,31 +2930,53 @@ async function renderActivitiesTab() {
   try {
     const activities = await api('GET','/api/activities');
     const canEdit = can('manage_activities');
+    // Sort categories alphabetically with "Other" pushed to the end for tidiness.
     const byCat = {};
     activities.forEach(a => { (byCat[a.category || 'Other'] = byCat[a.category || 'Other'] || []).push(a); });
+    const cats = Object.keys(byCat).sort((a, b) => {
+      if (a === 'Other') return 1;
+      if (b === 'Other') return -1;
+      return a.localeCompare(b);
+    });
     $('settingsPanel').innerHTML = `
       <div class="card">
         <div class="card-head"><h3>Activities (Permissions Catalog)</h3>
           ${canEdit ? `<button class="btn primary sm" onclick="openActivityModal()">+ Add Activity</button>` : ''}
         </div>
-        <p style="color:var(--muted); font-size:12px; margin-top:0;">Activities are the fine-grained things a role can do. Built-in activities are referenced by application code and cannot be deleted.</p>
-        ${Object.entries(byCat).map(([cat, list]) => `
-          <div style="margin-top:14px;">
-            <div style="font-weight:600; margin-bottom:6px;">${escapeHtml(cat)}</div>
-            <table class="tbl">
-              <thead><tr><th>Code</th><th>Label</th><th>Type</th><th></th></tr></thead>
-              <tbody>
-                ${list.map(a => `<tr>
-                  <td><code style="font-size:11px;">${escapeHtml(a.code)}</code></td>
-                  <td>${escapeHtml(a.label)}</td>
-                  <td>${a.is_system?'<span class="pill brown" style="font-size:9px;">SYSTEM</span>':'<span class="pill blue" style="font-size:9px;">CUSTOM</span>'}</td>
-                  <td style="text-align:right;">
-                    ${canEdit ? `<button class="btn ghost sm" onclick='openActivityModal(${escapeHtml(JSON.stringify(a))})'>Edit</button>
-                                 ${a.is_system ? '' : `<button class="btn ghost sm" onclick="deleteActivity(${a.id})">×</button>`}` : ''}
-                  </td></tr>`).join('')}
-              </tbody>
-            </table>
-          </div>`).join('')}
+        <p style="color:var(--muted); font-size:12px; margin:0 0 14px;">Activities are the fine-grained things a role can do. Built-in activities are referenced by application code and cannot be deleted.</p>
+        <div style="display:flex; flex-direction:column; gap:18px;">
+          ${cats.map(cat => `
+            <div>
+              <div style="display:flex; align-items:center; gap:8px; padding-bottom:6px; border-bottom:1px solid var(--border); margin-bottom:8px;">
+                <strong style="text-transform:uppercase; letter-spacing:0.5px; font-size:12px; color:var(--brown-700);">${escapeHtml(cat)}</strong>
+                <span class="pill gray" style="font-size:10px;">${byCat[cat].length}</span>
+              </div>
+              <table class="tbl" style="margin:0;">
+                <thead>
+                  <tr>
+                    <th style="width:30%;">Code</th>
+                    <th>Label</th>
+                    <th style="width:90px;">Type</th>
+                    <th style="width:140px; text-align:right;">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${byCat[cat].map(a => `
+                    <tr>
+                      <td style="vertical-align:middle;"><code style="font-size:11px; background:#f5efe2; padding:2px 6px; border-radius:3px;">${escapeHtml(a.code)}</code></td>
+                      <td style="vertical-align:middle;">${escapeHtml(a.label)}</td>
+                      <td style="vertical-align:middle;">${a.is_system
+                        ? '<span class="pill brown" style="font-size:9px;">SYSTEM</span>'
+                        : '<span class="pill blue" style="font-size:9px;">CUSTOM</span>'}</td>
+                      <td style="text-align:right; vertical-align:middle; white-space:nowrap;">
+                        ${canEdit ? `<button class="btn ghost sm" onclick='openActivityModal(${escapeHtml(JSON.stringify(a))})'>Edit</button>
+                                     ${a.is_system ? '' : `<button class="btn ghost sm" onclick="deleteActivity(${a.id})">×</button>`}` : ''}
+                      </td>
+                    </tr>`).join('')}
+                </tbody>
+              </table>
+            </div>`).join('')}
+        </div>
       </div>`;
   } catch (e) { toast(e.message,'error'); }
 }
@@ -2249,6 +3028,12 @@ async function openChecklistBuilder(existingId, copyFromId) {
     const activeFreqs  = freqs.filter(f => (f.status || 'Active') === 'Active');
     const activeCats   = cats.filter(c => (c.status || 'Active') === 'Active');
     const activeGroups = groups.filter(g => (g.status || 'Active') === 'Active');
+    // Auto-suggested Checklist ID for fresh creations
+    let suggestedCode = '';
+    if (!existingId && !copyFromId) {
+      try { const s = await api('GET','/api/checklists/next-code'); suggestedCode = s.suggested || ''; }
+      catch (e) { /* fallback to user-entered if endpoint fails */ }
+    }
     let cl = null;
     if (existingId)        cl = await api('GET', `/api/checklists/${existingId}/full`);
     else if (copyFromId)   cl = await api('GET', `/api/checklists/${copyFromId}/full`);
@@ -2283,8 +3068,11 @@ async function openChecklistBuilder(existingId, copyFromId) {
         ${activeGroups.length === 0 ? '<div style="font-size:11px; color:var(--red); margin-top:4px;">No Active groups. Configure in PM Configuration → Check List Group and complete Review &amp; Approve first.</div>' : ''}
       </div>
       <div class="form-row"><label>Checklist ID *</label>
-        <input name="code" value="${escapeHtml(cl?.code || '')}" required minlength="2" maxlength="50" pattern="[A-Za-z0-9_\\-]{2,50}"
-               placeholder="e.g., CHK-AHU-M (2-50 alphanumeric, - and _ allowed)" />
+        <div>
+          <input name="code" value="${escapeHtml(cl?.code || suggestedCode || '')}" required minlength="2" maxlength="50" pattern="[A-Za-z0-9_\\-]{2,50}"
+                 placeholder="e.g., CHK-001" />
+          ${(!existingId && !copyFromId && suggestedCode) ? `<div style="font-size:11px; color:var(--muted); margin-top:3px;">Auto-suggested next sequential ID. Edit before saving if you prefer a meaningful code.</div>` : ''}
+        </div>
       </div>
       <div class="form-row"><label>Checklist Name *</label>
         <input name="name" value="${escapeHtml(cl?.name || '')}" required minlength="3" maxlength="300" placeholder="3-300 characters" />
@@ -2334,8 +3122,8 @@ async function openChecklistBuilder(existingId, copyFromId) {
 
       <hr class="sep" />
       <div style="display:flex; justify-content:space-between; align-items:center;">
-        <strong>Sections &amp; Questions</strong>
-        <button type="button" class="btn ghost sm" onclick="__cbAddSection()">+ Add Section</button>
+        <strong>Checkpoints &amp; Questions</strong>
+        <button type="button" class="btn ghost sm" onclick="__cbAddSection()">+ Add Checkpoint</button>
       </div>
       <div id="cbSections" style="margin-top:8px;">
         ${sections.map((s, si) => renderSection(s, si)).join('')}
@@ -2344,10 +3132,10 @@ async function openChecklistBuilder(existingId, copyFromId) {
     const renderSection = (s, si) => `
       <div class="card" style="padding:10px 12px; margin-bottom:10px; border-left:3px solid var(--brand);" data-sidx="${si}">
         <div style="display:flex; gap:6px; align-items:center; margin-bottom:6px;">
-          <input class="cb-sname" placeholder="Section name" value="${escapeHtml(s.name)}" style="flex:1; font-weight:600;" />
+          <input class="cb-sname" placeholder="Checkpoint name" value="${escapeHtml(s.name)}" style="flex:1; font-weight:600;" />
           <button type="button" class="btn ghost sm" onclick="__cbDelSection(${si})">×</button>
         </div>
-        <input class="cb-sdesc" placeholder="Section description (optional)" value="${escapeHtml(s.description || '')}" style="width:100%; font-size:12px;" />
+        <input class="cb-sdesc" placeholder="Checkpoint description (optional)" value="${escapeHtml(s.description || '')}" style="width:100%; font-size:12px;" />
         <div class="cb-questions" style="margin-top:8px;">
           ${s.questions.map((q, qi) => renderQuestion(q, si, qi)).join('')}
         </div>
@@ -2857,10 +3645,67 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
         matching.map(e => `<option value="${escapeHtml(e.equipment_id)}">${escapeHtml(e.equipment_id)} · ${escapeHtml(e.name || '')}</option>`).join('');
       setDesc('asnEqDesc', 'Equipment Name', null);
     };
-    window.__asnOnEq = () => {
+    // Walks the equipment hierarchy back to Plant and fills in every upstream
+    // dropdown + Plant info banner. Also pulls last-assigned checklist details
+    // so Frequency / Reviewer / Approver pre-fill where possible.
+    window.__asnOnEq = async () => {
       const sel = document.getElementById('asnEqSel');
-      const e = equipment.find(x => x.equipment_id === sel.value);
-      setDesc('asnEqDesc', 'Equipment Name', e ? e.name : null);
+      const eqId = sel.value;
+      if (!eqId) { setDesc('asnEqDesc', 'Equipment Name', null); return; }
+      const e = equipment.find(x => x.equipment_id === eqId);
+      if (!e) { setDesc('asnEqDesc', 'Equipment Name', null); return; }
+      setDesc('asnEqDesc', 'Equipment Name', e.name);
+
+      // Walk Area → Location → Block back from the equipment.
+      const a = areas.find(x => x.area_id === e.area_id);
+      const l = a ? locations.find(x => x.location_id === a.location_id) : null;
+      const b = l ? blocks.find(x => x.block_id === l.block_id) : null;
+      // Re-populate the parent dropdowns so the cascade is consistent with the chosen equipment.
+      if (b) {
+        const blockSel = document.getElementById('asnBlockSel');
+        if (blockSel) {
+          blockSel.value = b.block_id;
+          setDesc('asnBlockDesc', 'Block Name', b.name);
+        }
+      }
+      if (l) {
+        const locSel = document.getElementById('asnLocSel');
+        if (locSel) {
+          locSel.innerHTML = (b ? locations.filter(x => x.block_id === b.block_id) : [l])
+            .map(x => `<option value="${escapeHtml(x.location_id)}" ${x.location_id === l.location_id ? 'selected' : ''}>${escapeHtml(x.location_id)} · ${escapeHtml(x.description || '')}</option>`).join('');
+          setDesc('asnLocDesc', 'Location Name', l.description);
+        }
+      }
+      if (a) {
+        const areaSel = document.getElementById('asnAreaSel');
+        if (areaSel) {
+          areaSel.innerHTML = (l ? areas.filter(x => x.location_id === l.location_id) : [a])
+            .map(x => `<option value="${escapeHtml(x.area_id)}" ${x.area_id === a.area_id ? 'selected' : ''}>${escapeHtml(x.area_id)} · ${escapeHtml(x.name || x.area_type || '')}</option>`).join('');
+          setDesc('asnAreaDesc', 'Area Name', a.name || a.area_type);
+        }
+      }
+      // Plant info banner (read-only — there's no plant dropdown in the modal).
+      const plantInfo = document.getElementById('asnPlantInfo');
+      if (plantInfo) {
+        const plantText = b && b.plant_id ? `${b.plant_id}` : '—';
+        plantInfo.innerHTML = `<strong style="color:var(--brown-700);">Plant:</strong> ${escapeHtml(plantText)}`;
+      }
+
+      // Try to pre-fill checklist/frequency/reviewer/approver from this
+      // equipment's most recent linked checklist. Best-effort — silent failure
+      // if the endpoint is unavailable.
+      try {
+        const linked = await api('GET', `/api/equipment/${encodeURIComponent(eqId)}/linked-checklists`);
+        if (linked && linked.length > 0) {
+          const last = linked[0]; // most recent first per the endpoint's ORDER BY
+          // Pre-select the same checklist if it's in the dropdown
+          const chSel = document.getElementById('asnChecklistSel');
+          if (chSel && last.id) {
+            const opt = Array.from(chSel.options).find(o => Number(o.value) === Number(last.id));
+            if (opt) { chSel.value = String(last.id); window.__asnOnChecklist && window.__asnOnChecklist(); }
+          }
+        }
+      } catch (e) { /* non-fatal */ }
     };
 
     const catRadios = cats.map(c => `
@@ -2926,9 +3771,11 @@ async function openAssignChecklistModal(presetChecklistId, presetEquipmentId) {
         <div class="form-row"><label>Equipment ID *</label>
           <div>
             <select id="asnEqSel" name="equipment_id" required onchange="window.__asnOnEq()">
-              <option value="">— select area first —</option>
+              <option value="">— select equipment —</option>
+              ${equipment.filter(e => e.status === 'Active').map(e => `<option value="${escapeHtml(e.equipment_id)}">${escapeHtml(e.equipment_id)} · ${escapeHtml(e.name || '')}</option>`).join('')}
             </select>
-            <div id="asnEqDesc" style="font-size:12px; margin-top:5px;"><em style="color:var(--muted);">Equipment Name will appear here once you pick an ID above.</em></div>
+            <div id="asnEqDesc" style="font-size:12px; margin-top:5px;"><em style="color:var(--muted);">Equipment Name + parent Plant / Block / Location / Area will auto-fill when you pick the equipment.</em></div>
+            <div id="asnPlantInfo" style="font-size:12px; margin-top:3px;"></div>
           </div>
         </div>
 
@@ -3162,6 +4009,9 @@ async function openAssignment(assignmentId) {
     const executorEditable      = (a.status === 'Pending' || a.status === 'In Progress') && (amExecutor || amAdmin);
     const planReviewerActing    = a.status === 'Pending Assignment Review'   && (amReviewer || amAdmin);
     const planApproverActing    = a.status === 'Pending Assignment Approval' && (amApprover || amAdmin);
+    // Reschedule loop: requester responds when 'Reschedule Proposed'; reviewer re-decides when 'Reschedule Counter-Proposed'.
+    const rescheduleRequesterActing = a.status === 'Reschedule Proposed'         && (amAssigner || amAdmin || can('assign_checklist'));
+    const rescheduleReviewerActing  = a.status === 'Reschedule Counter-Proposed' && (amReviewer || amAdmin);
     const clearanceInitiatorActing = a.status === 'Scheduled' && (amAssigner || amAdmin || can('assign_checklist'));
     const reviewerActing        = a.status === 'Pending Review' && (amReviewer || amAdmin);
     const approverActing        = a.status === 'Pending Approval' && (amApprover || amAdmin);
@@ -3323,6 +4173,13 @@ async function openAssignment(assignmentId) {
       ${a.status === 'Clearance Denied' ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fdecec; border-left:3px solid var(--red); border-radius:6px; font-size:12px;">
         <strong>Clearance denied:</strong> ${escapeHtml(a.clearance_remarks || '')}
       </div>` : ''}
+      ${(a.status === 'Reschedule Proposed' || a.status === 'Reschedule Counter-Proposed') && a.proposed_date ? `
+      <div style="margin-bottom:10px; padding:10px 14px; background:#eaf2ff; border-left:3px solid var(--blue,#3563ad); border-radius:6px; font-size:12px;">
+        <strong>${a.status === 'Reschedule Proposed' ? 'Reviewer proposed a new date' : 'Requester counter-proposed a different date'}:</strong>
+        <strong style="margin-left:6px;">${escapeHtml(a.proposed_date)}</strong>
+        ${a.proposed_remarks ? `<div style="color:var(--muted); margin-top:3px;">Note: ${escapeHtml(a.proposed_remarks)}</div>` : ''}
+        ${a.proposed_at ? `<div style="color:var(--muted); margin-top:3px;">Proposed ${escapeHtml(formatLocalTime(a.proposed_at))}</div>` : ''}
+      </div>` : ''}
       ${a.rejection_reason ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fdecec; border-left:3px solid var(--red); border-radius:6px; font-size:12px;"><strong>Returned for rework:</strong> ${escapeHtml(a.rejection_reason)}</div>` : ''}
       ${a.pnc_number ? `<div style="margin-bottom:10px; padding:8px 12px; background:#fff5e6; border-left:3px solid #c77b00; border-radius:6px; font-size:12px;">
         <strong>Re-assignment from Expired</strong>
@@ -3354,8 +4211,19 @@ async function openAssignment(assignmentId) {
     // Action buttons by stage
     const acts = [];
     if (planReviewerActing) {
-      acts.push(`<button type="button" class="btn primary" onclick="assignmentPlanReviewDecision('${a.assignment_id}','approve')">✓ Pass Plan Review</button>`);
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentPlanReviewDecision('${a.assignment_id}','approve')">✓ Accept Plan</button>`);
+      acts.push(`<button type="button" class="btn ghost"   onclick="assignmentPlanReviewDecision('${a.assignment_id}','reschedule')">🗓 Reschedule</button>`);
       acts.push(`<button type="button" class="btn ghost"   onclick="assignmentPlanReviewDecision('${a.assignment_id}','reject')">✗ Reject Plan</button>`);
+    }
+    // Reschedule loop — requester sees Accept/Counter-propose when reviewer has proposed a date.
+    if (rescheduleRequesterActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentRescheduleRespond('${a.assignment_id}','accept')">✓ Accept Proposed Date</button>`);
+      acts.push(`<button type="button" class="btn ghost"   onclick="assignmentRescheduleRespond('${a.assignment_id}','counter-propose')">🗓 Counter-Propose</button>`);
+    }
+    // Reschedule loop — reviewer sees Accept/Reject when the requester has counter-proposed.
+    if (rescheduleReviewerActing) {
+      acts.push(`<button type="button" class="btn primary" onclick="assignmentPlanReviewDecision('${a.assignment_id}','approve')">✓ Accept Counter-Proposal</button>`);
+      acts.push(`<button type="button" class="btn ghost"   onclick="assignmentPlanReviewDecision('${a.assignment_id}','reject')">✗ Reject Counter-Proposal</button>`);
     }
     if (planApproverActing) {
       acts.push(`<button type="button" class="btn primary" onclick="assignmentPlanApproveDecision('${a.assignment_id}','approve')">✓ Approve Plan</button>`);
@@ -3459,19 +4327,60 @@ async function submitAssignmentForReview(assignmentId) {
 // ---- Step 4: Assignment-plan review/approval actions ----
 async function assignmentPlanReviewDecision(assignmentId, decision) {
   let reason = null;
+  let proposed_date = null;
   if (decision === 'reject') {
     reason = prompt('Reason for rejecting the assignment plan (required):');
     if (!reason) return;
+  } else if (decision === 'reschedule') {
+    proposed_date = prompt('Propose a new scheduled date (YYYY-MM-DD):');
+    if (!proposed_date || !/^\d{4}-\d{2}-\d{2}$/.test(proposed_date.trim())) {
+      toast('Date must be YYYY-MM-DD', 'error'); return;
+    }
+    proposed_date = proposed_date.trim();
+    reason = prompt('Why are you proposing a different date? (optional)') || '';
   }
   const meaning = decision === 'approve'
     ? `I have reviewed PM assignment plan "${assignmentId}" and forward it to the Approver.`
-    : `I reject PM assignment plan "${assignmentId}" at review. Reason: ${reason}`;
+    : (decision === 'reschedule'
+        ? `I propose rescheduling PM assignment plan "${assignmentId}" to ${proposed_date}.${reason?' Reason: '+reason:''}`
+        : `I reject PM assignment plan "${assignmentId}" at review. Reason: ${reason}`);
   openESignatureModal({
-    title: `Sign — Review Plan ${assignmentId}`,
+    title: `Sign — ${decision === 'reschedule' ? 'Propose Reschedule' : (decision === 'approve' ? 'Review Plan' : 'Reject Plan')} ${assignmentId}`,
     meaning,
     onConfirm: async (esig) => {
-      await api('PUT', `/api/assignments/${assignmentId}/assignment-review`, { decision, reason, ...esig });
-      toast(decision === 'approve' ? 'Plan review passed — sent to Approver.' : 'Assignment plan rejected.', 'success');
+      await api('PUT', `/api/assignments/${assignmentId}/assignment-review`, { decision, reason, proposed_date, ...esig });
+      toast(decision === 'approve' ? 'Plan review passed — sent to Approver.'
+            : (decision === 'reschedule' ? `Proposed new date ${proposed_date} — sent to requester for response.`
+               : 'Assignment plan rejected.'), 'success');
+      closeModal();
+      if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
+      if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
+      refreshNotifBadge();
+    }
+  });
+}
+
+// Creator responds to reviewer's proposed date — accept it or counter-propose.
+async function assignmentRescheduleRespond(assignmentId, decision) {
+  let proposed_date = null;
+  let reason = null;
+  if (decision === 'counter-propose') {
+    proposed_date = prompt('Counter-propose your preferred date (YYYY-MM-DD):');
+    if (!proposed_date || !/^\d{4}-\d{2}-\d{2}$/.test(proposed_date.trim())) {
+      toast('Date must be YYYY-MM-DD', 'error'); return;
+    }
+    proposed_date = proposed_date.trim();
+    reason = prompt('Why this date instead? (optional)') || '';
+  }
+  const meaning = decision === 'accept'
+    ? `I accept the reviewer's proposed reschedule for PM "${assignmentId}".`
+    : `I counter-propose ${proposed_date} for PM "${assignmentId}".${reason?' Reason: '+reason:''}`;
+  openESignatureModal({
+    title: `Sign — ${decision === 'accept' ? 'Accept Reschedule' : 'Counter-Propose'} ${assignmentId}`,
+    meaning,
+    onConfirm: async (esig) => {
+      await api('PUT', `/api/assignments/${assignmentId}/reschedule-respond`, { decision, proposed_date, reason, ...esig });
+      toast(decision === 'accept' ? 'Reschedule accepted — plan moves to Approver.' : 'Counter-proposal sent to reviewer.', 'success');
       closeModal();
       if ($('page-tasks').classList.contains('active'))       loadTasks(CURRENT_TASKS_TAB);
       if ($('page-assignments').classList.contains('active')) loadAssignmentsPage();
@@ -3734,13 +4643,40 @@ async function openQrCameraScanner() {
     title: 'Scan Equipment QR / Barcode',
     width: 480,
     body: `
-      <p style="color:var(--muted); font-size:12px; margin:0 0 8px;">Point the back camera at the QR code or barcode on the equipment. Decoding happens automatically.</p>
+      <p style="color:var(--muted); font-size:12px; margin:0 0 8px;">Point the back camera at the QR code (printed sticker, on-screen, or a photo). Decoding happens automatically.</p>
       <div id="qrReader" style="width:100%; max-width:420px; margin:0 auto; border:1px solid var(--border); border-radius:8px; overflow:hidden;"></div>
       <p id="qrScanStatus" style="color:var(--muted); font-size:11px; margin-top:8px; min-height:18px;">Starting camera…</p>
-      <p style="font-size:11px; color:var(--muted); margin:4px 0 0;">No QR sticker? Close this and type the Equipment ID by hand.</p>
+      <hr class="sep" />
+      <div style="font-size:12px;">
+        <strong>No camera, or scanner not working?</strong>
+        Upload a photo of the QR instead:
+        <input type="file" id="qrFileInput" accept="image/*" style="display:block; margin-top:6px;" onchange="window.__pmsQrFileScan()" />
+      </div>
+      <p style="font-size:11px; color:var(--muted); margin:8px 0 0;">Still stuck? Close this and type the Equipment ID by hand.</p>
     `,
     hideDefaultSubmit: true,
   });
+  // Image-file fallback — uses html5-qrcode's scanFile helper on the uploaded image.
+  window.__pmsQrFileScan = async () => {
+    const inp = document.getElementById('qrFileInput');
+    if (!inp || !inp.files || inp.files.length === 0) return;
+    const file = inp.files[0];
+    const statusEl = document.getElementById('qrScanStatus');
+    if (statusEl) statusEl.textContent = 'Decoding uploaded image…';
+    try {
+      // Use a temporary Html5Qrcode instance for one-shot file decoding.
+      const tmp = new Html5Qrcode('qrReader', { verbose: false });
+      const decoded = await tmp.scanFile(file, false);
+      tmp.clear();
+      const id = parseEquipmentIdFromScan(decoded);
+      closeModal();
+      const inp2 = $('pmStatusScan'); if (inp2) inp2.value = id;
+      toast(`Scanned: ${id}`, 'success');
+      fetchPmStatus(id);
+    } catch (err) {
+      if (statusEl) statusEl.innerHTML = `<span style="color:var(--red);">Couldn't decode that image: ${escapeHtml(err.message || err)}</span>`;
+    }
+  };
 
   // Boot the scanner after the modal is in the DOM.
   setTimeout(async () => {
@@ -3814,6 +4750,20 @@ async function fetchPmStatus(equipmentId) {
         <div style="font-size:13px; font-weight:600; margin-top:3px;">${val == null || val === '' ? '—' : escapeHtml(String(val))}</div>
       </div>`;
 
+    // Stash QR payload for the on-screen render
+    window.__qrPayloads = window.__qrPayloads || {};
+    window.__qrPayloads[s.equipment_id] = s.qr_payload || s.equipment_id;
+
+    // Signatures card — shown only when at least one signature is present.
+    const sigBlock = (label, sig, ts) => sig
+      ? `<div style="padding:8px 12px; background:var(--cream-100); border-radius:6px;">
+           <div style="font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:1px;">${escapeHtml(label)}</div>
+           <div style="font-weight:600; font-size:13px;">${escapeHtml(sig)}</div>
+           ${ts ? `<div style="color:var(--muted); font-size:11px;">${escapeHtml(formatLocalTime(ts))}</div>` : ''}
+         </div>`
+      : '';
+    const hasAnySig = s.executor_sig || s.reviewer_sig || s.approver_sig;
+
     $('pmStatusResult').innerHTML = `
       <div class="card" style="border-left:4px solid var(--brand);">
         <div style="display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; margin-bottom: 14px;">
@@ -3824,25 +4774,53 @@ async function fetchPmStatus(equipmentId) {
             </div>
             ${s.reason ? `<div style="color:var(--muted); font-size:12px; margin-top:6px;">${escapeHtml(s.reason)}</div>` : ''}
           </div>
-          ${s.latest_assignment_id
-            ? `<button class="btn ghost sm" onclick="goto('tasks'); setTimeout(() => openAssignment('${escapeHtml(s.latest_assignment_id)}'), 200);">Open PM ${escapeHtml(s.latest_assignment_id)} →</button>`
-            : ''}
+          <div style="display:flex; gap:10px; align-items:center;">
+            <div class="qr-cell" data-qr-key="${escapeHtml(s.equipment_id)}"
+                 onclick="openQrModalForEquipment('${escapeHtml(s.equipment_id)}','${escapeHtml(s.equipment_name || '')}')"
+                 title="Click to enlarge / print QR"
+                 style="cursor:pointer; width:96px; height:96px; padding:2px; background:#fff; border:1px solid var(--border); border-radius:6px;"></div>
+            ${s.latest_assignment_id
+              ? `<button class="btn ghost sm" onclick="goto('tasks'); setTimeout(() => openAssignment('${escapeHtml(s.latest_assignment_id)}'), 200);">Open PM ${escapeHtml(s.latest_assignment_id)} →</button>`
+              : ''}
+          </div>
         </div>
+
+        <div style="font-size:11px; color:var(--brown-700); text-transform:uppercase; letter-spacing:1px; margin: 8px 0 6px;">Master record</div>
         <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px;">
           ${fld('Plant ID', s.plant_id)}
           ${fld('Unit ID',  s.unit_number)}
+          ${fld('Block / Location / Area', [s.block_name, s.location_name, s.area_name].filter(Boolean).join(' · '))}
           ${fld('Equipment ID', s.equipment_id)}
           ${fld('Equipment Name', s.equipment_name)}
-          ${fld('Equipment Description', s.equipment_description)}
-          ${fld('PM Number', s.pm_number)}
-          ${fld('Frequency', s.frequency)}
-          ${fld('Assigned User / PM Done By', s.assignee_name)}
-          ${fld('Last Execution Date', s.last_execution_date)}
-          ${fld('Next Due Date', s.next_due_date)}
-          ${fld('Block / Location / Area', [s.block_name, s.location_name, s.area_name].filter(Boolean).join(' · '))}
+          ${fld('Equipment Type / Sub-Type', [s.equipment_type, s.sub_type].filter(Boolean).join(' / '))}
+          ${fld('Manufacturer / Model', [s.make, s.model].filter(Boolean).join(' / '))}
+          ${fld('Serial / Capacity', [s.serial, s.capacity].filter(Boolean).join(' · '))}
+          ${fld('Manufacture Date', s.manufacture_date)}
         </div>
-        <p style="font-size:11px; color:var(--muted); margin:12px 0 0;">Status is auto-computed from the PM workflow and cannot be edited manually.</p>
+
+        <div style="font-size:11px; color:var(--brown-700); text-transform:uppercase; letter-spacing:1px; margin: 14px 0 6px;">Maintenance schedule</div>
+        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap:10px;">
+          ${fld('PM Number', s.pm_number)}
+          ${fld('Frequency', s.frequency ? `${s.frequency}${s.frequency_days?' ('+s.frequency_days+'d)':''}${s.tolerance_days!=null?' ±'+s.tolerance_days+'d':''}` : null)}
+          ${fld('Assigned User / PM Done By', s.assignee_name)}
+          ${fld('Reviewer (Engineering)', s.reviewer_name)}
+          ${fld('Approver (QA)', s.approver_name)}
+          ${fld('Last Execution Date', s.last_execution_date ? formatLocalTime(s.last_execution_date) : null)}
+          ${fld('Next Due Date', s.next_due_date)}
+        </div>
+
+        ${hasAnySig ? `
+        <div style="font-size:11px; color:var(--brown-700); text-transform:uppercase; letter-spacing:1px; margin: 14px 0 6px;">Signatures (latest PM cycle)</div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          ${sigBlock('Executor', s.executor_sig, s.submitted_at)}
+          ${sigBlock('Reviewer', s.reviewer_sig, s.reviewed_at)}
+          ${sigBlock('Approver', s.approver_sig, s.approved_at)}
+        </div>` : ''}
+
+        <p style="font-size:11px; color:var(--muted); margin:12px 0 0;">Status is auto-computed from the PM workflow and cannot be edited manually. Click the QR to enlarge or print.</p>
       </div>`;
+    // Render the QR badge after DOM injection
+    setTimeout(renderQrCells, 0);
   } catch (e) {
     $('pmStatusResult').innerHTML = `<div class="card" style="border-left:4px solid var(--red);"><strong style="color:var(--red);">${escapeHtml(e.message)}</strong></div>`;
   }

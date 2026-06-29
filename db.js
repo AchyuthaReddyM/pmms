@@ -183,6 +183,47 @@ function createSchema() {
     );
 
     -- PM frequency master (editable by manage_pm_frequencies)
+    -- =====================================================================
+    -- CONFIGURABLE APPROVAL WORKFLOWS
+    -- ---------------------------------------------------------------------
+    -- Admins define named workflows (e.g. "Standard 2-Stage", "GMP 3-Stage",
+    -- "Engineering 4-Stage"). Each workflow has an ordered list of stages
+    -- stored as JSON. When a master record is created, the creator picks a
+    -- workflow and assigns a user to each stage. The record then walks
+    -- through the stages in order, with each stage requiring an e-signature.
+    -- =====================================================================
+    CREATE TABLE IF NOT EXISTS approval_workflows (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      description TEXT,
+      stages_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'Active',
+      is_system INTEGER NOT NULL DEFAULT 0,
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- Per-record approval progress. One row per (entity, stage). When the
+    -- record is first created, N rows get inserted (one per workflow stage)
+    -- with status='Pending'. Each row gets signed in order.
+    CREATE TABLE IF NOT EXISTS record_approval_stages (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      workflow_id INTEGER NOT NULL REFERENCES approval_workflows(id),
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      stage_index INTEGER NOT NULL,
+      stage_label TEXT NOT NULL,
+      stage_type TEXT NOT NULL,
+      assignee_id INTEGER REFERENCES users(id),
+      status TEXT NOT NULL DEFAULT 'Pending',
+      signed_by_id INTEGER REFERENCES users(id),
+      signed_at TEXT,
+      remarks TEXT,
+      signature_meaning TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ras_entity ON record_approval_stages(entity_type, entity_id, stage_index);
+
     CREATE TABLE IF NOT EXISTS frequencies (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE NOT NULL,
@@ -488,9 +529,36 @@ function seed() {
          hashPassword(adminPw), adminRole.id, adminRole.department_id,
          'System Administrator', 'IT');
 
-  // 5. One audit row marking the clean seed. Audit log otherwise starts empty.
+  // 5. Seed two standard approval workflows so the system has something to
+  //    pick from out of the box. Admins can add more in Admin Settings.
+  const standardWorkflows = [
+    {
+      name: 'Standard 2-Stage (Reviewer → Approver)',
+      description: 'Default workflow. One Reviewer signs, then one Approver signs.',
+      stages_json: JSON.stringify([
+        { label: 'Reviewer',  type: 'review'  },
+        { label: 'Approver',  type: 'approve' },
+      ]),
+    },
+    {
+      name: 'GMP 3-Stage (Reviewer → Approver → Final QA)',
+      description: 'GMP-grade workflow. Adds a Final QA sign-off after the Approver.',
+      stages_json: JSON.stringify([
+        { label: 'Reviewer',          type: 'review'  },
+        { label: 'Approver',          type: 'approve' },
+        { label: 'Final QA Sign-off', type: 'approve' },
+      ]),
+    },
+  ];
+  const insWf = db.prepare(`INSERT INTO approval_workflows(name, description, stages_json, status, is_system, created_by)
+                            VALUES (?, ?, ?, 'Active', 1, ?)`);
+  for (const w of standardWorkflows) {
+    try { insWf.run(w.name, w.description, w.stages_json, null); } catch (e) { /* may already exist */ }
+  }
+
+  // 6. One audit row marking the clean seed. Audit log otherwise starts empty.
   db.prepare('INSERT INTO audit_log(user_name,action,entity,entity_id,details) VALUES (?,?,?,?,?)')
-    .run('System', 'SEED', 'SYSTEM', '-', 'Clean seed: System Administrator role + admin user; no other data');
+    .run('System', 'SEED', 'SYSTEM', '-', 'Clean seed: System Administrator role + admin user + 2 standard approval workflows; no other data');
 
   // No further seed data. Departments, roles, users, plants, blocks, locations, areas,
   // formulations, equipment, frequencies, PM categories, checklist groups, checklists,
@@ -529,6 +597,14 @@ function migrateSchema() {
   } catch (e) { console.error('[db] migration: area_type backfill failed:', e.message); }
   addColIfMissing('equipment', 'make', 'TEXT');
   addColIfMissing('equipment', 'model', 'TEXT');
+  addColIfMissing('equipment', 'manufacture_date', 'TEXT');
+  addColIfMissing('equipment', 'equipment_type',   'TEXT');
+  addColIfMissing('equipment', 'sub_type',         'TEXT');
+  // Engineering department this equipment belongs to — drives the
+  // sub-tabs in Equipment Master (Mechanical / Electrical / Instrumental /
+  // Automation / Other). Stored as a free-text label rather than an FK so the
+  // five canonical values are enforced by the UI dropdown.
+  addColIfMissing('equipment', 'department',       'TEXT');
   addColIfMissing('checklist_groups', 'department_id', 'INTEGER');
   addColIfMissing('checklists', 'code', 'TEXT');
   addColIfMissing('checklists', 'description', 'TEXT');
@@ -601,8 +677,55 @@ function migrateSchema() {
   addColIfMissing('checklist_groups', 'review_remarks',   'TEXT');
   addColIfMissing('checklist_groups', 'approved_at',      'TEXT');
   addColIfMissing('checklist_groups', 'approval_remarks', 'TEXT');
+
+  // Breakdown enhancements — extra fields captured at report time.
+  addColIfMissing('breakdowns', 'cause',                'TEXT');  // initial cause (separate from root_cause investigation)
+  addColIfMissing('breakdowns', 'proposed_resolution',  'TEXT');
+  addColIfMissing('breakdowns', 'estimated_duration',   'TEXT');  // free-text like "4 hours", "2 days"
+  addColIfMissing('breakdowns', 'replacement_equipment_id', 'TEXT');
+  addColIfMissing('breakdowns', 'replacement_suitable', 'INTEGER'); // 0/1
+  addColIfMissing('breakdowns', 'verified_at',          'TEXT');
+  addColIfMissing('breakdowns', 'verified_by',          'INTEGER');
+  addColIfMissing('breakdowns', 'verification_remarks', 'TEXT');
+  addColIfMissing('breakdowns', 'resolution_approved_at', 'TEXT');
+  addColIfMissing('breakdowns', 'resolution_approved_by', 'INTEGER');
+
+  // Recurring-popup acknowledgments — once a user acknowledges an overdue PM
+  // with a comment, the blocking popup stops appearing for that occurrence.
+  // The next scheduled assignment gets its own fresh popup.
+  addColIfMissing('checklist_assignments', 'acknowledged_at',       'TEXT');
+  addColIfMissing('checklist_assignments', 'acknowledged_by',       'INTEGER');
+  addColIfMissing('checklist_assignments', 'acknowledgment_comment', 'TEXT');
+  // Reschedule loop: reviewer proposes a new date → creator accepts/counter-proposes → reviewer accepts/rejects.
+  addColIfMissing('checklist_assignments', 'proposed_date',         'TEXT');
+  addColIfMissing('checklist_assignments', 'proposed_by',           'INTEGER');
+  addColIfMissing('checklist_assignments', 'proposed_at',           'TEXT');
+  addColIfMissing('checklist_assignments', 'proposed_remarks',      'TEXT');
   addColIfMissing('pm_categories', 'status', "TEXT NOT NULL DEFAULT 'Active'");
   addColIfMissing('pm_categories', 'description', 'TEXT');
+
+  // Seed the standard workflows on an existing DB if they don't already exist.
+  // Safe to run on every boot — INSERT OR IGNORE skips dupes by name UNIQUE.
+  try {
+    const insWf = db.prepare(`INSERT OR IGNORE INTO approval_workflows(name, description, stages_json, status, is_system) VALUES (?, ?, ?, 'Active', 1)`);
+    insWf.run(
+      'Standard 2-Stage (Reviewer → Approver)',
+      'Default workflow. One Reviewer signs, then one Approver signs.',
+      JSON.stringify([
+        { label: 'Reviewer', type: 'review' },
+        { label: 'Approver', type: 'approve' },
+      ])
+    );
+    insWf.run(
+      'GMP 3-Stage (Reviewer → Approver → Final QA)',
+      'GMP-grade workflow. Adds a Final QA sign-off after the Approver.',
+      JSON.stringify([
+        { label: 'Reviewer',          type: 'review' },
+        { label: 'Approver',          type: 'approve' },
+        { label: 'Final QA Sign-off', type: 'approve' },
+      ])
+    );
+  } catch (e) { /* approval_workflows table not yet created on a very old DB */ }
 
   // Master-data review / approve workflow columns — applied uniformly across all 6 masters.
   for (const t of ['plants','blocks','formulations','locations','areas','equipment']) {

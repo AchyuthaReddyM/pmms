@@ -336,10 +336,87 @@ app.get('/api/dashboard/kpis', requireAuth, (req, res) => {
   res.json({ compliance, overdue, pending, completed_mtd: mtd, total_pms: total, open_breakdowns: openBd });
 });
 
-app.get('/api/dashboard/compliance-by-dept', requireAuth, (req, res) => {
-  // Pull rows from BOTH tables. checklist_assignments doesn't carry a department
-  // column directly — derive it from the assignee's department.
+// Why is compliance behind schedule? Breaks down every non-completed
+// assignment by its current reason so the dashboard can show concrete
+// counts instead of one opaque "Overdue" number. Drives the
+// "Why behind schedule" panel + drill-down clicks.
+app.get('/api/dashboard/delay-reasons', requireAuth, (req, res) => {
+  try { markExpiredAssignments(); } catch (e) {}
   const rows = db.prepare(`
+    SELECT ca.status,
+           COUNT(*) AS n
+    FROM checklist_assignments ca
+    WHERE ca.status NOT IN ('Completed','Withdrawn','Rejected')
+    GROUP BY ca.status
+  `).all();
+  // Map raw status into a small set of human-readable reason categories.
+  const reasonOf = (status) => {
+    if (status === 'Expired')                                        return { reason:'Expired (past tolerance)',       tone:'red',   page:'expired' };
+    if (status === 'Overdue')                                        return { reason:'Overdue',                        tone:'red',   page:'expired' };
+    if (status === 'Pending Clearance')                              return { reason:'Awaiting production clearance',  tone:'amber', page:'pending' };
+    if (status === 'Scheduled')                                      return { reason:'Clearance not yet initiated',    tone:'amber', page:'pending' };
+    if (status === 'Awaiting Executor')                              return { reason:'Executor not assigned',          tone:'amber', page:'pending' };
+    if (status === 'Pending')                                        return { reason:'Assigned but not started',       tone:'amber', page:'pending' };
+    if (status === 'In Progress')                                    return { reason:'Execution in progress',          tone:'blue',  page:'tasks' };
+    if (status === 'Pending Review')                                 return { reason:'Awaiting Reviewer sign-off',     tone:'blue',  page:'tasks' };
+    if (status === 'Pending Approval')                               return { reason:'Awaiting Approver sign-off',     tone:'blue',  page:'tasks' };
+    if (status === 'Pending Assignment Review')                      return { reason:'Plan: awaiting Reviewer',        tone:'blue',  page:'assignments' };
+    if (status === 'Pending Assignment Approval')                    return { reason:'Plan: awaiting Approver',        tone:'blue',  page:'assignments' };
+    if (status === 'Clearance Denied')                               return { reason:'Clearance denied',               tone:'red',   page:'tasks' };
+    return { reason: status || 'Unknown', tone:'gray', page:'tasks' };
+  };
+  // Aggregate by reason category so several SQL statuses can collapse together.
+  const byReason = {};
+  for (const r of rows) {
+    const meta = reasonOf(r.status);
+    if (!byReason[meta.reason]) byReason[meta.reason] = { reason: meta.reason, tone: meta.tone, page: meta.page, count: 0 };
+    byReason[meta.reason].count += r.n;
+  }
+  res.json(Object.values(byReason).sort((a, b) => b.count - a.count));
+});
+
+// Breakdown of PMs Completed / Pending / Expired on a specific date.
+// Used by the Dashboard "Equipment by Date" panel for click-through.
+// Query: ?date=YYYY-MM-DD (defaults to today)
+app.get('/api/dashboard/by-date', requireAuth, (req, res) => {
+  try { markExpiredAssignments(); } catch (e) {}
+  const date = (req.query.date || new Date().toISOString().slice(0, 10)).toString();
+  // Anything scheduled for this date OR completed on this date OR expired on this date.
+  const rows = db.prepare(`
+    SELECT ca.assignment_id, ca.target_id AS equipment_id, ca.status,
+           ca.effective_date, ca.due_date, ca.completed_at, ca.expired_at,
+           cl.code AS checklist_code, cl.name AS checklist_name,
+           f.name AS frequency,
+           e.name AS equipment_name,
+           CASE
+             WHEN ca.status='Completed' AND date(ca.completed_at)=date(?) THEN 'completed'
+             WHEN ca.status='Expired'   AND date(ca.expired_at)  =date(?) THEN 'expired'
+             WHEN date(ca.effective_date)=date(?) OR date(ca.due_date)=date(?) THEN 'pending'
+             ELSE 'other'
+           END AS bucket
+    FROM checklist_assignments ca
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    LEFT JOIN equipment e   ON e.equipment_id = ca.target_id
+    WHERE date(ca.effective_date)=date(?)
+       OR date(ca.due_date)=date(?)
+       OR (ca.status='Completed' AND date(ca.completed_at)=date(?))
+       OR (ca.status='Expired'   AND date(ca.expired_at)  =date(?))
+    ORDER BY ca.assignment_id
+  `).all(date, date, date, date, date, date, date, date);
+  const grouped = { completed: [], pending: [], expired: [], other: [] };
+  for (const r of rows) {
+    (grouped[r.bucket] || grouped.other).push(r);
+  }
+  res.json({ date, ...grouped });
+});
+
+app.get('/api/dashboard/compliance-by-dept', requireAuth, (req, res) => {
+  // Pull EVERY department from the master so the dashboard always shows a
+  // complete picture — including departments that have zero PMs yet (so they
+  // don't silently disappear).
+  const depts = db.prepare("SELECT name FROM departments WHERE status='Active' ORDER BY name").all();
+  const counts = db.prepare(`
     SELECT department,
       COUNT(*) AS planned,
       SUM(CASE WHEN status='Completed' THEN 1 ELSE 0 END) AS done
@@ -353,14 +430,28 @@ app.get('/api/dashboard/compliance-by-dept', requireAuth, (req, res) => {
       WHERE ca.status NOT IN ('Withdrawn','Rejected')
     )
     GROUP BY department
-    ORDER BY department
   `).all();
-  res.json(rows.map(r => ({
-    department: r.department || 'Unassigned',
-    planned: r.planned,
-    done: r.done || 0,
-    pct: r.planned ? Math.round((r.done / r.planned) * 1000) / 10 : 0
-  })));
+  const countMap = {};
+  for (const r of counts) countMap[r.department || 'Unassigned'] = r;
+  const result = depts.map(d => {
+    const c = countMap[d.name] || { planned: 0, done: 0 };
+    return {
+      department: d.name,
+      planned: c.planned || 0,
+      done: c.done || 0,
+      pct: c.planned ? Math.round((c.done / c.planned) * 1000) / 10 : 0,
+    };
+  });
+  // Also include any "Unassigned" bucket if PMs aren't tied to a known dept.
+  if (countMap['Unassigned']) {
+    result.push({
+      department: 'Unassigned',
+      planned: countMap['Unassigned'].planned,
+      done: countMap['Unassigned'].done || 0,
+      pct: countMap['Unassigned'].planned ? Math.round((countMap['Unassigned'].done / countMap['Unassigned'].planned) * 1000) / 10 : 0,
+    });
+  }
+  res.json(result);
 });
 
 // =============================================================
@@ -377,10 +468,311 @@ function checkId(label, value) {
   return null;
 }
 
-// Master-data approval helpers — every Plants/Blocks/Locations/Areas/Formulations/Equipment
-// creation now requires a Reviewer and an Approver picked at creation time, and goes through:
-//   Pending Review (reviewer signs)  →  Pending Approval (approver signs)  →  Active
-//   or  →  Rejected (with remarks) at any stage.
+// ============================================================================
+// HYBRID ALERT SYSTEM
+// ----------------------------------------------------------------------------
+// Returns the user's current schedule alerts categorized by urgency:
+//   blocking — Overdue / Expired PMs assigned to (or owned by) the user that
+//              must be acknowledged with a comment before the popup goes away.
+//   upcoming — PMs due in the next 7 days (banner + bell, non-blocking).
+// Recurring frequencies (daily/weekly): each scheduled occurrence is its own
+// assignment row, so the popup persists until that specific occurrence has
+// been acknowledged.
+// ============================================================================
+app.get('/api/alerts', requireAuth, (req, res) => {
+  try { markExpiredAssignments(); } catch (e) {}
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const horizonIso = (() => {
+    const d = new Date(); d.setDate(d.getDate() + 7); return d.toISOString().slice(0, 10);
+  })();
+  // BLOCKING = anything assigned to me that's past its scheduled date
+  // (Overdue / Expired / past-tolerance in active workflow states) AND hasn't
+  // been acknowledged yet.
+  const blocking = db.prepare(`
+    SELECT ca.assignment_id, ca.target_id AS equipment_id, ca.status,
+           ca.effective_date, ca.due_date, ca.expired_at,
+           e.name AS equipment_name,
+           cl.name AS checklist_name, cl.version AS checklist_version,
+           f.name AS frequency, f.tolerance_days
+    FROM checklist_assignments ca
+    LEFT JOIN equipment e   ON e.equipment_id = ca.target_id
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    WHERE ca.target_type='equipment'
+      AND ca.acknowledged_at IS NULL
+      AND (
+        (ca.assignee_id = ? OR ca.reviewer_id = ? OR ca.approver_id = ? OR ca.clearance_user_id = ? OR ca.assigned_by = ?)
+        OR ? = 1
+      )
+      AND (
+        ca.status = 'Expired'
+        OR (
+          ca.status NOT IN ('Completed','Withdrawn','Rejected')
+          AND ca.effective_date IS NOT NULL
+          AND date(ca.effective_date) < date(?)
+        )
+      )
+    ORDER BY date(ca.effective_date) ASC, ca.id ASC
+  `).all(req.user.id, req.user.id, req.user.id, req.user.id, req.user.id, req.user.is_admin ? 1 : 0, todayIso);
+
+  // UPCOMING = scheduled within the next 7 days, assigned to me or in my chain.
+  const upcoming = db.prepare(`
+    SELECT ca.assignment_id, ca.target_id AS equipment_id, ca.status,
+           ca.effective_date, ca.due_date,
+           e.name AS equipment_name,
+           cl.name AS checklist_name, cl.version AS checklist_version,
+           f.name AS frequency
+    FROM checklist_assignments ca
+    LEFT JOIN equipment e   ON e.equipment_id = ca.target_id
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    WHERE ca.target_type='equipment'
+      AND ca.status NOT IN ('Completed','Withdrawn','Rejected','Expired')
+      AND ca.effective_date IS NOT NULL
+      AND date(ca.effective_date) >= date(?)
+      AND date(ca.effective_date) <= date(?)
+      AND (
+        (ca.assignee_id = ? OR ca.reviewer_id = ? OR ca.approver_id = ? OR ca.clearance_user_id = ? OR ca.assigned_by = ?)
+        OR ? = 1
+      )
+    ORDER BY date(ca.effective_date) ASC, ca.id ASC
+  `).all(todayIso, horizonIso, req.user.id, req.user.id, req.user.id, req.user.id, req.user.id, req.user.is_admin ? 1 : 0);
+  res.json({ blocking, upcoming });
+});
+
+// Acknowledge an overdue assignment with a comment — silences the blocking
+// popup until the next scheduled occurrence is generated.
+app.put('/api/assignments/:assignment_id/acknowledge', requireAuth, (req, res) => {
+  const { comment } = req.body || {};
+  if (!comment || !comment.trim()) return res.status(400).json({ error: 'Comment is required to acknowledge an overdue PM' });
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  db.prepare(`UPDATE checklist_assignments
+              SET acknowledged_at=datetime('now'), acknowledged_by=?, acknowledgment_comment=?
+              WHERE assignment_id=?`)
+    .run(req.user.id, comment.trim(), req.params.assignment_id);
+  audit(req.user, 'ACKNOWLEDGE', 'Assignment', req.params.assignment_id, `Acknowledged overdue PM: ${comment.trim()}`);
+  res.json({ ok: true });
+});
+
+// ============================================================================
+// CONFIGURABLE APPROVAL WORKFLOWS
+// ----------------------------------------------------------------------------
+// Workflow = a named template with N stages. Each stage has a label and a
+// type ('review' or 'approve'). When a master record is created, the creator:
+//   1. Picks a workflow.
+//   2. Assigns a user to each stage.
+// The system then creates one record_approval_stages row per stage, walks them
+// in order, and only marks the master record 'Active' when the LAST stage is
+// signed. Any stage can reject, sending the record back to the creator.
+//
+// Workflows themselves are managed in Admin Settings. The "Standard 2-Stage"
+// + "GMP 3-Stage" workflows are seeded at install time and marked is_system=1
+// so they can't be accidentally deleted.
+// ============================================================================
+
+// Parse + validate a stages_json blob. Returns the parsed array or throws.
+function parseStages(stagesJson) {
+  let stages;
+  try { stages = JSON.parse(stagesJson || '[]'); }
+  catch (e) { throw new Error('Workflow stages_json is malformed'); }
+  if (!Array.isArray(stages) || stages.length === 0) throw new Error('Workflow needs at least one stage');
+  if (stages.length > 10) throw new Error('Workflow cannot have more than 10 stages');
+  for (const s of stages) {
+    if (!s || typeof s.label !== 'string' || !s.label.trim()) throw new Error('Every stage needs a label');
+    if (!['review','approve'].includes(s.type)) throw new Error('Stage type must be "review" or "approve"');
+  }
+  return stages;
+}
+
+// CRUD endpoints for workflows ------------------------------------------------
+app.get('/api/approval-workflows', requireAuth, (req, res) => {
+  const rows = db.prepare(`SELECT id, name, description, stages_json, status, is_system, created_at FROM approval_workflows ORDER BY is_system DESC, name`).all();
+  for (const r of rows) {
+    try { r.stages = JSON.parse(r.stages_json || '[]'); } catch (e) { r.stages = []; }
+  }
+  res.json(rows);
+});
+
+app.get('/api/approval-workflows/:id', requireAuth, (req, res) => {
+  const row = db.prepare('SELECT * FROM approval_workflows WHERE id=?').get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  try { row.stages = JSON.parse(row.stages_json || '[]'); } catch (e) { row.stages = []; }
+  res.json(row);
+});
+
+app.post('/api/approval-workflows', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
+  const { name, description, stages } = req.body || {};
+  if (!name || !name.trim()) return res.status(400).json({ error: 'name required' });
+  let validated;
+  try { validated = parseStages(JSON.stringify(stages)); }
+  catch (e) { return res.status(400).json({ error: e.message }); }
+  if (db.prepare('SELECT 1 FROM approval_workflows WHERE name=?').get(name)) {
+    return res.status(409).json({ error: `Workflow "${name}" already exists` });
+  }
+  const r = db.prepare(`INSERT INTO approval_workflows(name, description, stages_json, status, is_system, created_by) VALUES (?, ?, ?, 'Active', 0, ?)`)
+    .run(name.trim(), description || '', JSON.stringify(validated), req.user.id);
+  audit(req.user, 'CREATE', 'ApprovalWorkflow', r.lastInsertRowid,
+    `Created workflow "${name}" with ${validated.length} stage(s): ${validated.map(s => s.label + ' (' + s.type + ')').join(' → ')}`);
+  res.json({ id: r.lastInsertRowid, name, stages: validated });
+});
+
+app.put('/api/approval-workflows/:id', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
+  const wf = db.prepare('SELECT * FROM approval_workflows WHERE id=?').get(req.params.id);
+  if (!wf) return res.status(404).json({ error: 'Not found' });
+  if (wf.is_system) return res.status(403).json({ error: 'System-seeded workflows cannot be edited. Create a new workflow instead.' });
+  const { name, description, stages, status } = req.body || {};
+  let stagesJson = null;
+  if (stages !== undefined) {
+    try { stagesJson = JSON.stringify(parseStages(JSON.stringify(stages))); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+  }
+  db.prepare(`UPDATE approval_workflows SET
+      name=COALESCE(?,name), description=COALESCE(?,description),
+      stages_json=COALESCE(?,stages_json), status=COALESCE(?,status)
+    WHERE id=?`).run(name, description, stagesJson, status, req.params.id);
+  audit(req.user, 'UPDATE', 'ApprovalWorkflow', req.params.id, `Updated workflow "${wf.name}"`);
+  res.json({ ok: true });
+});
+
+app.delete('/api/approval-workflows/:id', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
+  const wf = db.prepare('SELECT * FROM approval_workflows WHERE id=?').get(req.params.id);
+  if (!wf) return res.status(404).json({ error: 'Not found' });
+  if (wf.is_system) return res.status(403).json({ error: 'System-seeded workflows cannot be deleted.' });
+  const inUse = db.prepare('SELECT COUNT(*) n FROM record_approval_stages WHERE workflow_id=?').get(req.params.id).n;
+  if (inUse > 0) return res.status(409).json({ error: `Cannot delete — ${inUse} record(s) are using this workflow. Deactivate it instead.` });
+  db.prepare('DELETE FROM approval_workflows WHERE id=?').run(req.params.id);
+  audit(req.user, 'DELETE', 'ApprovalWorkflow', req.params.id, `Deleted workflow "${wf.name}"`);
+  res.json({ ok: true });
+});
+
+// Create per-record stage rows for a newly-created entity. Called by the
+// master POST handlers right after the INSERT. Returns the array of created
+// stage IDs so the caller can audit / notify.
+function createApprovalStagesForRecord(workflowId, entityType, entityId, assignees) {
+  const wf = db.prepare('SELECT * FROM approval_workflows WHERE id=?').get(workflowId);
+  if (!wf) throw new Error('Unknown workflow_id');
+  if (wf.status !== 'Active') throw new Error(`Workflow "${wf.name}" is not Active`);
+  const stages = parseStages(wf.stages_json);
+  if (!Array.isArray(assignees) || assignees.length !== stages.length) {
+    throw new Error(`Workflow has ${stages.length} stages — you must assign a user to each. Got ${assignees ? assignees.length : 0}.`);
+  }
+  // Validate all assignees: must exist + be Active + not all the same person
+  const seen = new Set();
+  for (let i = 0; i < stages.length; i++) {
+    const uid = Number(assignees[i]);
+    if (!uid) throw new Error(`Stage ${i+1} ("${stages[i].label}") needs an assignee`);
+    if (seen.has(uid)) throw new Error('Each stage must have a different user');
+    seen.add(uid);
+    const u = db.prepare('SELECT id FROM users WHERE id=? AND status="Active"').get(uid);
+    if (!u) throw new Error(`Stage ${i+1} ("${stages[i].label}") — assignee #${uid} is not an active user`);
+  }
+  const ins = db.prepare(`INSERT INTO record_approval_stages
+    (workflow_id, entity_type, entity_id, stage_index, stage_label, stage_type, assignee_id, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending')`);
+  const created = [];
+  for (let i = 0; i < stages.length; i++) {
+    const r = ins.run(workflowId, entityType, String(entityId), i, stages[i].label, stages[i].type, Number(assignees[i]));
+    created.push(r.lastInsertRowid);
+  }
+  return { workflow: wf, stages, stageIds: created };
+}
+
+// Read the current approval-stage progress for a record.
+function getApprovalStages(entityType, entityId) {
+  return db.prepare(`
+    SELECT ras.*,
+           u.name AS assignee_name, u.user_id AS assignee_user_id,
+           sb.name AS signed_by_name
+    FROM record_approval_stages ras
+    LEFT JOIN users u  ON u.id  = ras.assignee_id
+    LEFT JOIN users sb ON sb.id = ras.signed_by_id
+    WHERE ras.entity_type=? AND ras.entity_id=?
+    ORDER BY ras.stage_index ASC
+  `).all(entityType, String(entityId));
+}
+
+// Public endpoint — frontend uses this to render progress in row detail.
+app.get('/api/approval-stages', requireAuth, (req, res) => {
+  const { entity_type, entity_id } = req.query;
+  if (!entity_type || !entity_id) return res.status(400).json({ error: 'entity_type and entity_id required' });
+  res.json(getApprovalStages(entity_type, entity_id));
+});
+
+// Sign a stage. Walks the workflow forward when approve, terminates when reject.
+// Caller must be the assignee or admin. Includes the standard e-signature check.
+app.put('/api/approval-stages/:id/sign', requireAuth, requireESignature, (req, res) => {
+  const { decision, remarks } = req.body || {};
+  if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+  const stage = db.prepare(`SELECT * FROM record_approval_stages WHERE id=?`).get(req.params.id);
+  if (!stage) return res.status(404).json({ error: 'Stage not found' });
+  if (stage.status !== 'Pending') return res.status(409).json({ error: `Stage already ${stage.status}` });
+  if (stage.assignee_id !== req.user.id && !req.user.is_admin) {
+    return res.status(403).json({ error: 'Only the assigned signer (or an admin) can sign this stage.' });
+  }
+  // Earlier stages must be approved before this one (sequential).
+  const earlier = db.prepare(`
+    SELECT * FROM record_approval_stages
+    WHERE entity_type=? AND entity_id=? AND stage_index < ?
+    ORDER BY stage_index DESC LIMIT 1
+  `).get(stage.entity_type, stage.entity_id, stage.stage_index);
+  if (earlier && earlier.status !== 'Approved') {
+    return res.status(409).json({ error: `Stage ${earlier.stage_index + 1} ("${earlier.stage_label}") must be approved first.` });
+  }
+  if (decision === 'reject' && (!remarks || !remarks.trim())) {
+    return res.status(400).json({ error: 'Remarks required for rejection' });
+  }
+  const newStatus = decision === 'approve' ? 'Approved' : 'Rejected';
+  db.prepare(`UPDATE record_approval_stages
+              SET status=?, signed_by_id=?, signed_at=datetime('now'), remarks=?, signature_meaning=?
+              WHERE id=?`)
+    .run(newStatus, req.user.id, remarks || null, req.esig && req.esig.meaning || null, req.params.id);
+
+  // Find the next pending stage. If none, the record is fully Active. If rejected, mark record Rejected.
+  const allStages = getApprovalStages(stage.entity_type, stage.entity_id);
+  const lastApprovedIdx = allStages.filter(s => s.status === 'Approved').length - 1;
+  const anyRejected = allStages.some(s => s.status === 'Rejected');
+  const allApproved = allStages.every(s => s.status === 'Approved');
+
+  // Drive the master record's status field based on the workflow position.
+  // Currently wired for Plants — other masters get retrofitted in follow-up.
+  let newRecordStatus = null;
+  if (anyRejected) newRecordStatus = 'Rejected';
+  else if (allApproved) newRecordStatus = 'Active';
+  else {
+    const nextStage = allStages.find(s => s.status === 'Pending');
+    if (nextStage) {
+      // Display label = e.g. "Pending Reviewer" / "Pending Approver" / "Pending Final QA Sign-off"
+      newRecordStatus = `Pending ${nextStage.stage_label}`;
+    }
+  }
+  if (newRecordStatus) {
+    // We only know the table name for entities we've wired. Map entity_type → table.
+    const entityToTable = {
+      'Plant': { table: 'plants', pk: 'plant_id' },
+      // Others go here as they're migrated.
+    };
+    const map = entityToTable[stage.entity_type];
+    if (map) {
+      db.prepare(`UPDATE ${map.table} SET status=? WHERE ${map.pk}=?`).run(newRecordStatus, stage.entity_id);
+    }
+  }
+
+  // Notify next assignee (or creator if rejected / completed)
+  if (decision === 'approve' && !allApproved) {
+    const next = allStages.find(s => s.status === 'Pending');
+    if (next && next.assignee_id) {
+      notify(next.assignee_id, `${stage.entity_type} awaiting your ${next.stage_label.toLowerCase()}`,
+        `${stage.entity_id} reached stage ${next.stage_index+1}: ${next.stage_label}.`,
+        'workflow_stage', `/masters/${stage.entity_type.toLowerCase()}s/${stage.entity_id}`);
+    }
+  }
+  audit(req.user, decision === 'approve' ? 'WORKFLOW_SIGN' : 'WORKFLOW_REJECT',
+    stage.entity_type, stage.entity_id,
+    `${decision === 'approve' ? 'Signed' : 'Rejected'} stage ${stage.stage_index+1} "${stage.stage_label}"${remarks?': '+remarks:''}`);
+
+  res.json({ ok: true, record_status: newRecordStatus });
+});
 function validateMasterApprovers(creatorId, reviewer_id, approver_id) {
   if (!reviewer_id) return 'Reviewer is required';
   if (!approver_id) return 'Approver is required';
@@ -483,18 +875,42 @@ function addMasterApprovalRoutes(masterName, tableName, pkCol, displayName) {
 }
 
 app.post('/api/plants', requireAuth, requireActivity('manage_plants'), (req, res) => {
-  const { plant_id, name, location, reviewer_id, approver_id } = req.body || {};
+  const { plant_id, name, location, reviewer_id, approver_id, workflow_id, stage_assignees } = req.body || {};
   const idErr = checkId('Plant ID', plant_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!name) return res.status(400).json({ error: 'Plant Name is required' });
-  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
-  if (apErr) return res.status(400).json({ error: apErr });
   if (db.prepare('SELECT 1 FROM plants WHERE plant_id=?').get(plant_id)) {
     return res.status(409).json({ error: `Plant ID "${plant_id}" already exists` });
   }
+  // NEW PATH — configurable workflow (preferred). When the client sends
+  // workflow_id + stage_assignees, we create stage rows and skip the legacy
+  // reviewer_id/approver_id fields.
+  if (workflow_id && Array.isArray(stage_assignees)) {
+    let result;
+    try { result = createApprovalStagesForRecord(workflow_id, 'Plant', plant_id, stage_assignees); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    // Set initial status to "Pending <FirstStageLabel>" so the UI shows the right state.
+    const initialStatus = `Pending ${result.stages[0].label}`;
+    db.prepare(`INSERT INTO plants(plant_id, name, location, status, created_by) VALUES (?, ?, ?, ?, ?)`)
+      .run(plant_id, name, location || '', initialStatus, req.user.id);
+    audit(req.user, 'CREATE', 'Plant', plant_id,
+      `Plant "${name}" at ${location || '-'} — submitted via workflow "${result.workflow.name}" with ${result.stages.length} stage(s)`);
+    // Notify the first stage's assignee
+    const firstAssignee = Number(stage_assignees[0]);
+    if (firstAssignee) {
+      notify(firstAssignee, `Plant awaiting your ${result.stages[0].label.toLowerCase()}`,
+        `${plant_id} — "${name}" submitted by ${req.user.name}. Stage 1 of ${result.stages.length}.`,
+        'workflow_stage', `/masters/plants/${plant_id}`);
+    }
+    return res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(plant_id));
+  }
+  // LEGACY PATH — old reviewer_id + approver_id model. Kept for backward
+  // compatibility while other masters are still on the old flow.
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   db.prepare(`INSERT INTO plants(plant_id,name,location,status,created_by,reviewer_id,approver_id)
               VALUES (?,?,?,'Pending Review',?,?,?)`)
     .run(plant_id, name, location || '', req.user.id, Number(reviewer_id), Number(approver_id));
-  audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}" at ${location || '-'} — submitted for review`);
+  audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}" at ${location || '-'} — submitted for review (legacy 2-stage)`);
   notify(Number(reviewer_id), 'Plant awaiting your review',
     `${plant_id} — "${name}" submitted by ${req.user.name}`, 'master_review', `/masters/plants/${plant_id}`);
   res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(plant_id));
@@ -707,8 +1123,44 @@ app.get('/api/equipment/:equipment_id', requireAuth, (req,res) => {
   if (!row) return res.status(404).json({ error: 'Not found' });
   res.json(row);
 });
+// Suggest the next sequential Checklist code — prefilled in the new-checklist form.
+app.get('/api/checklists/next-code', requireAuth, requireActivity('manage_checklists'), (req, res) => {
+  const prefix = (req.query.prefix || 'CHK-').toString();
+  const rows = db.prepare(`SELECT code FROM checklists WHERE code LIKE ?`).all(prefix + '%');
+  let maxN = 0;
+  for (const r of rows) {
+    const m = String(r.code || '').match(new RegExp('^' + prefix.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&') + '(\\d+)$'));
+    if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
+  }
+  res.json({ suggested: prefix + String(maxN + 1).padStart(3, '0') });
+});
+
+// Suggest the next sequential Equipment ID — used by the Add Equipment form
+// to prefill a default that QA can override before saving.
+app.get('/api/equipment/next-id', requireAuth, requireActivity('manage_equipment'), (req, res) => {
+  const prefix = (req.query.prefix || 'EQ-').toString();
+  const rows = db.prepare(`SELECT equipment_id FROM equipment WHERE equipment_id LIKE ?`).all(prefix + '%');
+  let maxN = 0;
+  for (const r of rows) {
+    const m = String(r.equipment_id).match(new RegExp('^' + prefix.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&') + '(\\d+)$'));
+    if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
+  }
+  res.json({ suggested: prefix + String(maxN + 1).padStart(3, '0') });
+});
+
+// Helper: is the caller QA? (Either role name contains "QA" or they have manage_equipment.)
+// QA-role users are the only ones allowed to edit a saved Equipment ID.
+function isQaUser(user) {
+  if (!user) return false;
+  if (user.is_admin) return true;
+  if (typeof user.role === 'string' && /qa/i.test(user.role)) return true;
+  return false;
+}
+
 app.post('/api/equipment', requireAuth, requireActivity('manage_equipment'), (req, res) => {
-  let { equipment_id, name, make, model, make_model, serial, capacity, area_id, reviewer_id, approver_id } = req.body || {};
+  let { equipment_id, name, make, model, make_model, serial, capacity, area_id,
+        manufacture_date, equipment_type, sub_type, department,
+        reviewer_id, approver_id } = req.body || {};
   const idErr = checkId('Equipment ID', equipment_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!name) return res.status(400).json({ error: 'Equipment Name is required' });
   if (!area_id) return res.status(400).json({ error: 'Area is required' });
@@ -725,11 +1177,16 @@ app.post('/api/equipment', requireAuth, requireActivity('manage_equipment'), (re
   if (db.prepare('SELECT 1 FROM equipment WHERE equipment_id=?').get(equipment_id)) {
     return res.status(409).json({ error: `Equipment ID "${equipment_id}" already exists` });
   }
-  db.prepare(`INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,status,qr_code,created_by,reviewer_id,approver_id)
-              VALUES (?,?,?,?,?,?,?,'Pending Review',?,?,?,?)`)
-    .run(equipment_id, name, make||'', model||'', serial||'', capacity||'', area_id, `QR:${equipment_id}`,
+  db.prepare(`INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,
+                                   manufacture_date,equipment_type,sub_type,department,
+                                   status,qr_code,created_by,reviewer_id,approver_id)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,'Pending Review',?,?,?,?)`)
+    .run(equipment_id, name, make||'', model||'', serial||'', capacity||'', area_id,
+         manufacture_date || null, equipment_type || null, sub_type || null, department || null,
+         `QR:${equipment_id}`,
          req.user.id, Number(reviewer_id), Number(approver_id));
-  audit(req.user, 'CREATE', 'Equipment', equipment_id, `Registered: ${name} — ${make||'—'} ${model||''}${serial?` (SN ${serial})`:''} @ ${area_id} — submitted for review`);
+  audit(req.user, 'CREATE', 'Equipment', equipment_id,
+    `Registered: ${name} — ${make||'—'} ${model||''}${serial?` (SN ${serial})`:''} @ ${area_id} — submitted for review`);
   notify(Number(reviewer_id), 'Equipment awaiting your review',
     `${equipment_id} — "${name}" submitted by ${req.user.name}`, 'master_review', `/masters/equipment/${equipment_id}`);
   res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(equipment_id));
@@ -741,6 +1198,24 @@ app.put('/api/equipment/:equipment_id', requireAuth, requireActivity('manage_equ
     const parts = String(f.make_model).split('/').map(s => s.trim());
     f.make = parts[0] || ''; f.model = parts.slice(1).join(' / ');
   }
+  // Renaming the Equipment ID is a QA-only action. Other fields can be edited
+  // by anyone with manage_equipment.
+  if (f.new_equipment_id && f.new_equipment_id !== req.params.equipment_id) {
+    if (!isQaUser(req.user)) {
+      return res.status(403).json({ error: 'Only QA users can change an Equipment ID after it has been saved.' });
+    }
+    const idErr = checkId('New Equipment ID', f.new_equipment_id);
+    if (idErr) return res.status(400).json({ error: idErr });
+    if (db.prepare('SELECT 1 FROM equipment WHERE equipment_id=?').get(f.new_equipment_id)) {
+      return res.status(409).json({ error: `Equipment ID "${f.new_equipment_id}" already exists` });
+    }
+    db.prepare('UPDATE equipment SET equipment_id=?, qr_code=? WHERE equipment_id=?')
+      .run(f.new_equipment_id, `QR:${f.new_equipment_id}`, req.params.equipment_id);
+    audit(req.user, 'RENAME', 'Equipment', f.new_equipment_id,
+      `Equipment ID renamed from "${req.params.equipment_id}" to "${f.new_equipment_id}" by QA user ${req.user.name}`);
+    // Subsequent UPDATE below targets the new ID.
+    req.params.equipment_id = f.new_equipment_id;
+  }
   const r = db.prepare(`UPDATE equipment SET
       name=COALESCE(?,name),
       make=COALESCE(?,make),
@@ -748,12 +1223,35 @@ app.put('/api/equipment/:equipment_id', requireAuth, requireActivity('manage_equ
       serial=COALESCE(?,serial),
       capacity=COALESCE(?,capacity),
       area_id=COALESCE(?,area_id),
+      manufacture_date=COALESCE(?,manufacture_date),
+      equipment_type=COALESCE(?,equipment_type),
+      sub_type=COALESCE(?,sub_type),
+      department=COALESCE(?,department),
       status=COALESCE(?,status)
     WHERE equipment_id=?`)
-    .run(f.name, f.make, f.model, f.serial, f.capacity, f.area_id, f.status, req.params.equipment_id);
+    .run(f.name, f.make, f.model, f.serial, f.capacity, f.area_id,
+         f.manufacture_date, f.equipment_type, f.sub_type, f.department, f.status,
+         req.params.equipment_id);
   if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
   audit(req.user, 'UPDATE', 'Equipment', req.params.equipment_id, 'Equipment modified');
   res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(req.params.equipment_id));
+});
+
+// Linked checklists — used by the equipment-detail panel to show which
+// approved checklists are assigned to this piece of equipment.
+app.get('/api/equipment/:equipment_id/linked-checklists', requireAuth, (req, res) => {
+  const rows = db.prepare(`
+    SELECT DISTINCT cl.id, cl.code, cl.name, cl.version, cl.status,
+           ca.assignment_id, ca.status AS assignment_status,
+           ca.effective_date, ca.due_date,
+           f.name AS frequency
+    FROM checklist_assignments ca
+    LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+    LEFT JOIN frequencies f ON f.id = ca.frequency_id
+    WHERE ca.target_type='equipment' AND ca.target_id=?
+    ORDER BY ca.id DESC
+  `).all(req.params.equipment_id);
+  res.json(rows);
 });
 
 // Master-data review/approve endpoints (Plants / Blocks / Locations / Areas / Formulations / Equipment).
@@ -890,6 +1388,28 @@ app.get('/api/equipment/:equipment_id/pm-status', requireAuth, (req, res) => {
     }
   }
 
+  // Reviewer / Approver names + signatures from the latest assignment.
+  let reviewer = null, approver = null;
+  if (latest) {
+    const rv = db.prepare('SELECT name FROM users WHERE id=?').get(latest.reviewer_id);
+    const ap = db.prepare('SELECT name FROM users WHERE id=?').get(latest.approver_id);
+    reviewer = rv ? rv.name : null;
+    approver = ap ? ap.name : null;
+  }
+
+  // Build the same compact QR payload used elsewhere — so the PM Status page
+  // can show + reprint the equipment label.
+  const asAscii = (s) => String(s == null ? '' : s)
+    .replace(/[–—]/g, '-').replace(/[‘’]/g, "'").replace(/[“”]/g, '"').replace(/[^\x00-\x7F]/g, '');
+  const qrLines = [`${eq.equipment_id}${eq.name ? ' - ' + asAscii(eq.name) : ''}`];
+  const specLine = [asAscii(eq.make), asAscii(eq.model), eq.serial ? 'SN ' + asAscii(eq.serial) : null].filter(Boolean).join(' / ');
+  if (specLine) qrLines.push(specLine);
+  if (eq.capacity) qrLines.push(asAscii(eq.capacity));
+  const chainLine = [chain.plant_id, chain.block_id, chain.location_id, chain.area_id].filter(Boolean).join(' > ');
+  if (chainLine) qrLines.push(chainLine);
+  qrLines.push(eq.status || 'Active');
+  const qr_payload = qrLines.join('\n');
+
   res.json({
     plant_id: chain.plant_id || null,
     plant_name: chain.plant_name || null,
@@ -900,9 +1420,24 @@ app.get('/api/equipment/:equipment_id/pm-status', requireAuth, (req, res) => {
     equipment_id: eq.equipment_id,
     equipment_name: eq.name,
     equipment_description: [eq.make, eq.model, eq.capacity].filter(Boolean).join(' / ') || eq.name,
+    make: eq.make, model: eq.model, serial: eq.serial, capacity: eq.capacity,
+    manufacture_date: eq.manufacture_date,
+    equipment_type: eq.equipment_type,
+    sub_type: eq.sub_type,
+    qr_payload,
     pm_number: latest ? latest.assignment_id : null,
     frequency: latest ? latest.frequency_name : null,
+    frequency_days: latest ? latest.frequency_days : null,
+    tolerance_days: latest ? latest.tolerance_days : null,
     assignee_name: latest ? latest.assignee_name : null,
+    reviewer_name: reviewer,
+    approver_name: approver,
+    executor_sig: latest ? latest.executor_sig : null,
+    reviewer_sig: latest ? latest.reviewer_sig : null,
+    approver_sig: latest ? latest.approver_sig : null,
+    submitted_at: latest ? latest.submitted_at : null,
+    reviewed_at: latest ? latest.reviewed_at : null,
+    approved_at: latest ? latest.approved_at : null,
     last_execution_date: lastCompleted ? lastCompleted.completed_at : null,
     next_due_date: nextDue,
     current_status: status,
@@ -1002,7 +1537,7 @@ app.put('/api/users/:user_id', requireAuth, requireActivity('manage_users'), (re
   res.json({ ok: true });
 });
 
-app.put('/api/users/:user_id/status', requireAuth, requireActivity('manage_users'), (req, res) => {
+app.put('/api/users/:user_id/status', requireAuth, requireActivity('manage_users'), requireESignature, (req, res) => {
   const { status } = req.body;
   if (!['Active','Locked','Inactive'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
   const before = db.prepare('SELECT status FROM users WHERE user_id=?').get(req.params.user_id);
@@ -1017,7 +1552,7 @@ app.put('/api/users/:user_id/status', requireAuth, requireActivity('manage_users
 });
 
 // Admin-driven password reset
-app.put('/api/users/:user_id/password', requireAuth, requireActivity('manage_users'), (req, res) => {
+app.put('/api/users/:user_id/password', requireAuth, requireActivity('manage_users'), requireESignature, (req, res) => {
   const { password } = req.body || {};
   if (!password || password.length < 6) return res.status(400).json({ error: 'password must be at least 6 characters' });
   const u = db.prepare('SELECT id, name FROM users WHERE user_id=?').get(req.params.user_id);
@@ -1289,13 +1824,67 @@ app.get('/api/breakdowns', requireAuth, (req, res) => {
 });
 
 app.post('/api/breakdowns', requireAuth, (req, res) => {
-  const { equipment_id, severity, description } = req.body;
+  // QA + any logged-in user can report — no activity gate. Status starts as
+  // 'Pending Verification' so it routes to a verifier before going Active.
+  const { equipment_id, severity, description, cause, proposed_resolution,
+          estimated_duration, replacement_equipment_id, replacement_suitable } = req.body;
   if (!equipment_id || !severity) return res.status(400).json({ error: 'equipment_id and severity required' });
+  // Validate that the equipment exists
+  if (!db.prepare('SELECT 1 FROM equipment WHERE equipment_id=?').get(equipment_id)) {
+    return res.status(400).json({ error: 'Unknown equipment_id' });
+  }
+  // Validate replacement equipment if provided
+  if (replacement_equipment_id && !db.prepare('SELECT 1 FROM equipment WHERE equipment_id=?').get(replacement_equipment_id)) {
+    return res.status(400).json({ error: 'Unknown replacement_equipment_id' });
+  }
   const bd_id = nextBdId();
-  db.prepare('INSERT INTO breakdowns(bd_id,equipment_id,reported_by,severity,description,status) VALUES (?,?,?,?,?,?)')
-    .run(bd_id, equipment_id, req.user.id, severity, description || '', 'Active');
-  audit(req.user, 'CREATE', 'Breakdown', bd_id, `${severity} on ${equipment_id}`);
+  db.prepare(`INSERT INTO breakdowns
+      (bd_id, equipment_id, reported_by, severity, description, status,
+       cause, proposed_resolution, estimated_duration,
+       replacement_equipment_id, replacement_suitable)
+      VALUES (?,?,?,?,?,'Pending Verification',?,?,?,?,?)`)
+    .run(bd_id, equipment_id, req.user.id, severity, description || '',
+         cause || null, proposed_resolution || null, estimated_duration || null,
+         replacement_equipment_id || null, replacement_suitable ? 1 : 0);
+  audit(req.user, 'REPORT', 'Breakdown', bd_id,
+    `${severity} on ${equipment_id}${cause?' — Cause: '+cause:''}${estimated_duration?' — ETA: '+estimated_duration:''} — Pending verification`);
   res.json(db.prepare('SELECT * FROM breakdowns WHERE bd_id=?').get(bd_id));
+});
+
+// One-step verification — review the reported breakdown before it becomes
+// an active investigation. QA / Engineering can verify. Requires e-sig.
+app.put('/api/breakdowns/:bd_id/verify', requireAuth, requireESignature, (req, res) => {
+  const { decision, remarks } = req.body || {};
+  if (!['verify','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "verify" or "reject"' });
+  const s = db.prepare('SELECT * FROM breakdowns WHERE bd_id=?').get(req.params.bd_id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  if (s.status !== 'Pending Verification') return res.status(409).json({ error: `Not in Pending Verification (currently ${s.status})` });
+  if (decision === 'reject' && (!remarks || !remarks.trim())) return res.status(400).json({ error: 'Remarks required for rejection' });
+  const newStatus = decision === 'verify' ? 'Investigating' : 'Closed';
+  db.prepare(`UPDATE breakdowns SET status=?, verified_at=datetime('now'), verified_by=?, verification_remarks=? WHERE bd_id=?`)
+    .run(newStatus, req.user.id, remarks || null, req.params.bd_id);
+  audit(req.user, decision === 'verify' ? 'VERIFY' : 'REJECT', 'Breakdown', req.params.bd_id,
+    `${decision === 'verify' ? 'Verified — investigation begins' : 'Rejected at verification'}${remarks?': '+remarks:''}`);
+  res.json({ ok: true });
+});
+
+// Approve a proposed resolution. Requires e-sig.
+app.put('/api/breakdowns/:bd_id/approve-resolution', requireAuth, requireESignature, (req, res) => {
+  const { decision, remarks } = req.body || {};
+  if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+  const s = db.prepare('SELECT * FROM breakdowns WHERE bd_id=?').get(req.params.bd_id);
+  if (!s) return res.status(404).json({ error: 'Not found' });
+  if (decision === 'reject' && (!remarks || !remarks.trim())) return res.status(400).json({ error: 'Remarks required for rejection' });
+  const hrs = s.reported_at ? (Date.now() - new Date(s.reported_at.replace(' ','T') + 'Z').getTime()) / 3600000 : null;
+  const newStatus = decision === 'approve' ? 'Resolved' : 'Investigating';
+  db.prepare(`UPDATE breakdowns SET status=?, resolution_approved_at=datetime('now'), resolution_approved_by=?,
+              closed_at=CASE WHEN ?='Resolved' THEN datetime('now') ELSE closed_at END,
+              mttr_hours=COALESCE(mttr_hours, CASE WHEN ?='Resolved' THEN ? ELSE NULL END)
+              WHERE bd_id=?`)
+    .run(newStatus, req.user.id, newStatus, newStatus, hrs ? Math.round(hrs * 10) / 10 : null, req.params.bd_id);
+  audit(req.user, decision === 'approve' ? 'APPROVE' : 'REJECT', 'Breakdown', req.params.bd_id,
+    `Resolution ${decision === 'approve' ? 'approved — closed' : 'returned for rework'}${remarks?': '+remarks:''}`);
+  res.json({ ok: true });
 });
 
 app.put('/api/breakdowns/:bd_id', requireAuth, (req, res) => {
@@ -1317,10 +1906,18 @@ app.put('/api/breakdowns/:bd_id', requireAuth, (req, res) => {
       status = COALESCE(?, status),
       root_cause = COALESCE(?, root_cause),
       resolution = COALESCE(?, resolution),
-      severity = COALESCE(?, severity)
+      severity = COALESCE(?, severity),
+      cause = COALESCE(?, cause),
+      proposed_resolution = COALESCE(?, proposed_resolution),
+      estimated_duration = COALESCE(?, estimated_duration),
+      replacement_equipment_id = COALESCE(?, replacement_equipment_id),
+      replacement_suitable = COALESCE(?, replacement_suitable)
       ${closedClause}${mttrClause}
     WHERE bd_id=?`)
-    .run(f.status, f.root_cause, f.resolution, f.severity, req.params.bd_id);
+    .run(f.status, f.root_cause, f.resolution, f.severity,
+         f.cause, f.proposed_resolution, f.estimated_duration,
+         f.replacement_equipment_id, (f.replacement_suitable === undefined ? null : (f.replacement_suitable ? 1 : 0)),
+         req.params.bd_id);
   audit(req.user, 'UPDATE', 'Breakdown', req.params.bd_id, `Status: ${f.status || s.status}`);
   res.json(db.prepare('SELECT * FROM breakdowns WHERE bd_id=?').get(req.params.bd_id));
 });
@@ -1329,13 +1926,24 @@ app.put('/api/breakdowns/:bd_id', requireAuth, (req, res) => {
 // AUDIT LOG
 // =============================================================
 app.get('/api/audit', requireAuth, (req, res) => {
-  const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
-  const rows = db.prepare(`
+  const limit = Math.min(parseInt(req.query.limit || '100', 10), 5000);
+  // Optional filters — used by the Audit Trail page's date / user / action filters.
+  const where = [];
+  const args = [];
+  // ts in the DB is stored as 'YYYY-MM-DD HH:MM:SS' UTC. Date comparisons
+  // against bare 'YYYY-MM-DD' work because the prefix sorts correctly.
+  if (req.query.from)   { where.push("date(ts) >= date(?)"); args.push(req.query.from); }
+  if (req.query.to)     { where.push("date(ts) <= date(?)"); args.push(req.query.to); }
+  if (req.query.user)   { where.push("user_name LIKE ?"); args.push('%' + req.query.user + '%'); }
+  if (req.query.action) { where.push("action LIKE ?"); args.push('%' + String(req.query.action).toUpperCase() + '%'); }
+  const sql = `
     SELECT id, ts, user_name, action, entity, entity_id, details
     FROM audit_log
+    ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
     ORDER BY id DESC
     LIMIT ?
-  `).all(limit);
+  `;
+  const rows = db.prepare(sql).all(...args, limit);
   res.json(rows);
 });
 
@@ -1508,7 +2116,7 @@ app.get('/api/departments', requireAuth, (req, res) => {
   res.json(db.prepare('SELECT * FROM departments ORDER BY name').all());
 });
 
-app.post('/api/departments', requireAuth, requireActivity('manage_departments'), (req, res) => {
+app.post('/api/departments', requireAuth, requireActivity('manage_departments'), requireESignature, (req, res) => {
   const { name, description } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
   const exists = db.prepare('SELECT 1 FROM departments WHERE name=?').get(name);
@@ -1518,7 +2126,7 @@ app.post('/api/departments', requireAuth, requireActivity('manage_departments'),
   res.json(db.prepare('SELECT * FROM departments WHERE id=?').get(r.lastInsertRowid));
 });
 
-app.put('/api/departments/:id', requireAuth, requireActivity('manage_departments'), (req, res) => {
+app.put('/api/departments/:id', requireAuth, requireActivity('manage_departments'), requireESignature, (req, res) => {
   const { name, description, status } = req.body || {};
   const r = db.prepare(`UPDATE departments SET
       name = COALESCE(?,name),
@@ -1530,7 +2138,7 @@ app.put('/api/departments/:id', requireAuth, requireActivity('manage_departments
   res.json(db.prepare('SELECT * FROM departments WHERE id=?').get(req.params.id));
 });
 
-app.delete('/api/departments/:id', requireAuth, requireActivity('manage_departments'), (req, res) => {
+app.delete('/api/departments/:id', requireAuth, requireActivity('manage_departments'), requireESignature, (req, res) => {
   const inUse = db.prepare('SELECT COUNT(*) n FROM users WHERE department_id=?').get(req.params.id).n
               + db.prepare('SELECT COUNT(*) n FROM roles WHERE department_id=?').get(req.params.id).n;
   if (inUse > 0) return res.status(409).json({ error: `Cannot delete — ${inUse} user(s)/role(s) still reference this department. Reassign them first.` });
@@ -2157,6 +2765,7 @@ app.get('/api/assignments', requireAuth, (req, res) => {
            ca.rejection_reason,
            ca.clearance_user_id, ca.clearance_status,
            ca.clearance_requested_at, ca.clearance_responded_at, ca.clearance_remarks,
+           ca.proposed_date, ca.proposed_at, ca.proposed_remarks, ca.proposed_by,
            cl.name AS checklist_name, cl.version AS checklist_version,
            u.name  AS assignee_name, u.user_id  AS assignee_user_id,
            rv.name AS reviewer_name, rv.user_id AS reviewer_user_id,
@@ -2226,6 +2835,25 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
   if (cl.status !== 'Approved') {
     return res.status(409).json({ error: `Cannot assign — checklist is "${cl.status}". Only Approved checklists can be assigned.` });
   }
+  // One checklist per equipment — block creation of a second active assignment
+  // for the same piece of equipment. "Active" = anything that's not completed,
+  // withdrawn, rejected, or expired. (Versioned re-assignment must go through
+  // the Withdraw flow first, by design.)
+  if (target_type === 'equipment') {
+    const existing = db.prepare(`
+      SELECT ca.assignment_id, ca.status, cl.code AS checklist_code, cl.name AS checklist_name, cl.version
+      FROM checklist_assignments ca
+      LEFT JOIN checklists cl ON cl.id = ca.checklist_id
+      WHERE ca.target_type='equipment' AND ca.target_id=?
+        AND ca.status NOT IN ('Completed','Withdrawn','Rejected','Expired')
+      ORDER BY ca.id DESC LIMIT 1
+    `).get(target_id);
+    if (existing) {
+      return res.status(409).json({
+        error: `Equipment "${target_id}" already has an active checklist assigned: ${existing.checklist_code || existing.checklist_name || '—'}${existing.version?' '+existing.version:''} (assignment ${existing.assignment_id}, status: ${existing.status}). Withdraw that one first before assigning a different checklist.`
+      });
+    }
+  }
   // Validate target exists
   let targetName = '';
   if (target_type === 'equipment') {
@@ -2280,21 +2908,47 @@ app.post('/api/assignments', requireAuth, requireActivity('assign_checklist'), (
 // request is sent. Reuses the same reviewer_id + approver_id picked at assignment time —
 // in pharma practice the same chain authorises both the plan and the execution.
 app.put('/api/assignments/:assignment_id/assignment-review', requireAuth, requireActivity('review_pm','review_checklist'), requireESignature, (req, res) => {
-  const { decision, reason } = req.body || {};
+  const { decision, reason, proposed_date } = req.body || {};
   const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
   if (!a) return res.status(404).json({ error: 'Not found' });
-  if (a.status !== 'Pending Assignment Review') return res.status(409).json({ error: `Cannot review from status "${a.status}"` });
+  if (!['Pending Assignment Review','Reschedule Counter-Proposed'].includes(a.status)) {
+    return res.status(409).json({ error: `Cannot review from status "${a.status}"` });
+  }
   if (a.reviewer_id !== req.user.id && !req.user.is_admin) return res.status(403).json({ error: 'Only the assigned reviewer can review this assignment plan' });
-  if (!['approve','reject'].includes(decision)) return res.status(400).json({ error: 'decision must be "approve" or "reject"' });
+  if (!['approve','reject','reschedule'].includes(decision)) {
+    return res.status(400).json({ error: 'decision must be "approve", "reject", or "reschedule"' });
+  }
 
   if (decision === 'approve') {
-    db.prepare("UPDATE checklist_assignments SET status='Pending Assignment Approval' WHERE assignment_id=?").run(req.params.assignment_id);
+    // If a counter-proposed date was on the table, lock it in as the effective_date.
+    if (a.status === 'Reschedule Counter-Proposed' && a.proposed_date) {
+      db.prepare(`UPDATE checklist_assignments SET status='Pending Assignment Approval',
+                  effective_date=?, due_date=?, proposed_date=NULL, proposed_by=NULL, proposed_at=NULL, proposed_remarks=NULL
+                  WHERE assignment_id=?`)
+        .run(a.proposed_date, a.proposed_date, req.params.assignment_id);
+    } else {
+      db.prepare("UPDATE checklist_assignments SET status='Pending Assignment Approval' WHERE assignment_id=?").run(req.params.assignment_id);
+    }
     notify(a.approver_id,
       'PM assignment plan awaiting your approval',
       `${req.params.assignment_id} reviewed by ${req.user.name}.`,
       'assignment_plan_approve',
       `/assignments/${req.params.assignment_id}`);
     audit(req.user, 'PLAN_REVIEW', 'Assignment', req.params.assignment_id, `Reviewed assignment plan — passed to approver`);
+  } else if (decision === 'reschedule') {
+    if (!proposed_date) return res.status(400).json({ error: 'proposed_date required when rescheduling' });
+    db.prepare(`UPDATE checklist_assignments
+                SET status='Reschedule Proposed',
+                    proposed_date=?, proposed_by=?, proposed_at=datetime('now'), proposed_remarks=?
+                WHERE assignment_id=?`)
+      .run(proposed_date, req.user.id, reason || null, req.params.assignment_id);
+    if (a.assigned_by) {
+      notify(a.assigned_by, 'Reviewer proposed a new date',
+        `${req.params.assignment_id}: reviewer proposes ${proposed_date}${reason?' — '+reason:''}. Accept or counter-propose.`,
+        'reschedule_proposed', `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'PLAN_RESCHEDULE_PROPOSED', 'Assignment', req.params.assignment_id,
+      `Reviewer proposed new date ${proposed_date}${reason?': '+reason:''}`);
   } else {
     if (!reason || !reason.trim()) return res.status(400).json({ error: 'reason required for rejection' });
     db.prepare("UPDATE checklist_assignments SET status='Assignment Rejected', rejection_reason=? WHERE assignment_id=?").run(reason, req.params.assignment_id);
@@ -2302,6 +2956,51 @@ app.put('/api/assignments/:assignment_id/assignment-review', requireAuth, requir
       notify(a.assigned_by, 'PM assignment plan rejected at review', `${req.params.assignment_id}: ${reason}`, 'assignment_plan_rejected', `/assignments/${req.params.assignment_id}`);
     }
     audit(req.user, 'PLAN_REJECT', 'Assignment', req.params.assignment_id, `Rejected at assignment review: ${reason}`);
+  }
+  res.json({ ok: true });
+});
+
+// Reschedule loop — creator's response to a reviewer-proposed date.
+// 'accept'           → reviewer's date becomes the effective_date, status → Pending Assignment Approval (skips back to review path)
+// 'counter-propose'  → creator counter-proposes a different date, status → Reschedule Counter-Proposed, ball goes back to reviewer
+app.put('/api/assignments/:assignment_id/reschedule-respond', requireAuth, requireActivity('assign_checklist'), requireESignature, (req, res) => {
+  const { decision, proposed_date, reason } = req.body || {};
+  const a = db.prepare('SELECT * FROM checklist_assignments WHERE assignment_id=?').get(req.params.assignment_id);
+  if (!a) return res.status(404).json({ error: 'Not found' });
+  if (a.status !== 'Reschedule Proposed') return res.status(409).json({ error: `Cannot respond from status "${a.status}"` });
+  if (a.assigned_by !== req.user.id && !req.user.is_admin) {
+    return res.status(403).json({ error: 'Only the original requester (or admin) can respond to a proposed reschedule.' });
+  }
+  if (!['accept','counter-propose'].includes(decision)) return res.status(400).json({ error: 'decision must be "accept" or "counter-propose"' });
+
+  if (decision === 'accept') {
+    // Accept reviewer's date — it becomes effective_date, plan flows to approver.
+    db.prepare(`UPDATE checklist_assignments SET
+                  status='Pending Assignment Approval',
+                  effective_date=COALESCE(?, effective_date),
+                  due_date=COALESCE(?, due_date),
+                  proposed_date=NULL, proposed_by=NULL, proposed_at=NULL, proposed_remarks=NULL
+                WHERE assignment_id=?`)
+      .run(a.proposed_date || null, a.proposed_date || null, req.params.assignment_id);
+    notify(a.approver_id, 'PM assignment plan awaiting your approval',
+      `${req.params.assignment_id} reschedule accepted by ${req.user.name}. Scheduled for ${a.proposed_date}.`,
+      'assignment_plan_approve', `/assignments/${req.params.assignment_id}`);
+    audit(req.user, 'RESCHEDULE_ACCEPTED', 'Assignment', req.params.assignment_id,
+      `Accepted reviewer-proposed date ${a.proposed_date}`);
+  } else {
+    if (!proposed_date) return res.status(400).json({ error: 'proposed_date required for counter-propose' });
+    db.prepare(`UPDATE checklist_assignments
+                SET status='Reschedule Counter-Proposed',
+                    proposed_date=?, proposed_by=?, proposed_at=datetime('now'), proposed_remarks=?
+                WHERE assignment_id=?`)
+      .run(proposed_date, req.user.id, reason || null, req.params.assignment_id);
+    if (a.reviewer_id) {
+      notify(a.reviewer_id, 'Requester counter-proposed a new date',
+        `${req.params.assignment_id}: counter-proposal ${proposed_date}${reason?' — '+reason:''}. Accept or reject.`,
+        'reschedule_counter', `/assignments/${req.params.assignment_id}`);
+    }
+    audit(req.user, 'RESCHEDULE_COUNTER', 'Assignment', req.params.assignment_id,
+      `Counter-proposed ${proposed_date}${reason?': '+reason:''}`);
   }
   res.json({ ok: true });
 });
