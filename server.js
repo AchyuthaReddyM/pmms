@@ -701,7 +701,7 @@ function createApprovalStagesForRecord(workflowId, entityType, entityId, assigne
     if (!uid) throw new Error(`Stage ${i+1} ("${stages[i].label}") needs an assignee`);
     if (seen.has(uid)) throw new Error('Each stage must have a different user');
     seen.add(uid);
-    const u = db.prepare('SELECT id FROM users WHERE id=? AND status="Active"').get(uid);
+    const u = db.prepare("SELECT id FROM users WHERE id=? AND status='Active'").get(uid);
     if (!u) throw new Error(`Stage ${i+1} ("${stages[i].label}") — assignee #${uid} is not an active user`);
   }
   const ins = db.prepare(`INSERT INTO record_approval_stages
@@ -926,6 +926,15 @@ app.post('/api/plants', requireAuth, requireActivity('manage_plants'), (req, res
   if (db.prepare('SELECT 1 FROM plants WHERE plant_id=?').get(plant_id)) {
     return res.status(409).json({ error: `Plant ID "${plant_id}" already exists` });
   }
+  // ADMIN BYPASS — admin creates the record directly as Active. No workflow,
+  // no reviewer/approver required. Audit still captures that admin did it.
+  if (req.user.is_admin) {
+    db.prepare(`INSERT INTO plants(plant_id,name,location,status,created_by)
+                VALUES (?,?,?,'Active',?)`)
+      .run(plant_id, name, location || '', req.user.id);
+    audit(req.user, 'CREATE', 'Plant', plant_id, `Plant "${name}" at ${location || '-'} — auto-activated (admin bypass)`);
+    return res.json(db.prepare('SELECT * FROM plants WHERE plant_id=?').get(plant_id));
+  }
   // NEW PATH — configurable workflow (preferred). When the client sends
   // workflow_id + stage_assignees, we create stage rows and skip the legacy
   // reviewer_id/approver_id fields.
@@ -994,14 +1003,21 @@ app.post('/api/blocks', requireAuth, requireActivity('manage_plants'), (req, res
   const idErr = checkId('Block ID', block_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!plant_id) return res.status(400).json({ error: 'Plant is required' });
   if (!name) return res.status(400).json({ error: 'Block Name is required' });
-  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
-  if (apErr) return res.status(400).json({ error: apErr });
   const plant = db.prepare('SELECT name, status FROM plants WHERE plant_id=?').get(plant_id);
   if (!plant) return res.status(400).json({ error: 'Unknown plant_id' });
   if (plant.status !== 'Active') return res.status(400).json({ error: `Parent plant is "${plant.status}" — only Active plants accept blocks` });
   if (db.prepare('SELECT 1 FROM blocks WHERE block_id=?').get(block_id)) {
     return res.status(409).json({ error: `Block ID "${block_id}" already exists` });
   }
+  // ADMIN BYPASS
+  if (req.user.is_admin) {
+    db.prepare(`INSERT INTO blocks(block_id,plant_id,name,status,created_by) VALUES (?,?,?,'Active',?)`)
+      .run(block_id, plant_id, name, req.user.id);
+    audit(req.user, 'CREATE', 'Block', block_id, `Block "${name}" under plant ${plant_id} — auto-activated (admin bypass)`);
+    return res.json(db.prepare('SELECT * FROM blocks WHERE block_id=?').get(block_id));
+  }
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   db.prepare(`INSERT INTO blocks(block_id,plant_id,name,status,created_by,reviewer_id,approver_id)
               VALUES (?,?,?,'Pending Review',?,?,?)`)
     .run(block_id, plant_id, name, req.user.id, Number(reviewer_id), Number(approver_id));
@@ -1016,9 +1032,16 @@ app.get('/api/formulations', requireAuth, (req,res) => res.json(db.prepare('SELE
 app.post('/api/formulations', requireAuth, requireActivity('manage_plants'), (req, res) => {
   const { name, department, reviewer_id, approver_id } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
+  const formulation_id = nextId('FRM-', 'formulations', 'formulation_id');
+  // ADMIN BYPASS
+  if (req.user.is_admin) {
+    db.prepare(`INSERT INTO formulations(formulation_id,name,department,status,created_by) VALUES (?,?,?,'Active',?)`)
+      .run(formulation_id, name, department || '', req.user.id);
+    audit(req.user, 'CREATE', 'Formulation', formulation_id, `"${name}" under "${department || '—'}" — auto-activated (admin bypass)`);
+    return res.json(db.prepare('SELECT * FROM formulations WHERE formulation_id=?').get(formulation_id));
+  }
   const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
   if (apErr) return res.status(400).json({ error: apErr });
-  const formulation_id = nextId('FRM-', 'formulations', 'formulation_id');
   db.prepare(`INSERT INTO formulations(formulation_id,name,department,status,created_by,reviewer_id,approver_id)
               VALUES (?,?,?,'Pending Review',?,?,?)`)
     .run(formulation_id, name, department || '', req.user.id, Number(reviewer_id), Number(approver_id));
@@ -1051,8 +1074,6 @@ app.post('/api/locations', requireAuth, requireActivity('manage_plants'), (req, 
   const idErr = checkId('Location ID', location_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!block_id) return res.status(400).json({ error: 'Block is required' });
   if (!locName) return res.status(400).json({ error: 'Location Name is required' });
-  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
-  if (apErr) return res.status(400).json({ error: apErr });
   const block = db.prepare('SELECT name, status FROM blocks WHERE block_id=?').get(block_id);
   if (!block) return res.status(400).json({ error: 'Unknown block_id' });
   if (block.status !== 'Active') return res.status(400).json({ error: `Parent block is "${block.status}" — only Active blocks accept locations` });
@@ -1066,6 +1087,16 @@ app.post('/api/locations', requireAuth, requireActivity('manage_plants'), (req, 
   if (db.prepare('SELECT 1 FROM locations WHERE location_id=?').get(location_id)) {
     return res.status(409).json({ error: `Location ID "${location_id}" already exists` });
   }
+  // ADMIN BYPASS
+  if (req.user.is_admin) {
+    db.prepare(`INSERT INTO locations(location_id,block_id,description,formulation_id,status,created_by)
+                VALUES (?,?,?,?,'Active',?)`)
+      .run(location_id, block_id, locName, formulation_id || null, req.user.id);
+    audit(req.user, 'CREATE', 'Location', location_id, `"${locName}" under block ${block_id} — auto-activated (admin bypass)`);
+    return res.json(db.prepare('SELECT * FROM locations WHERE location_id=?').get(location_id));
+  }
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   db.prepare(`INSERT INTO locations(location_id,block_id,description,formulation_id,status,created_by,reviewer_id,approver_id)
               VALUES (?,?,?,?,'Pending Review',?,?,?)`)
     .run(location_id, block_id, locName, formulation_id || null, req.user.id, Number(reviewer_id), Number(approver_id));
@@ -1096,14 +1127,21 @@ app.post('/api/areas', requireAuth, requireActivity('manage_plants'), (req, res)
   const idErr = checkId('Area ID', area_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!location_id) return res.status(400).json({ error: 'Location is required' });
   if (!areaName) return res.status(400).json({ error: 'Area Name is required' });
-  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
-  if (apErr) return res.status(400).json({ error: apErr });
   const loc = db.prepare('SELECT description, status FROM locations WHERE location_id=?').get(location_id);
   if (!loc) return res.status(400).json({ error: 'Unknown location_id' });
   if (loc.status !== 'Active') return res.status(400).json({ error: `Parent location is "${loc.status}" — only Active locations accept areas` });
   if (db.prepare('SELECT 1 FROM areas WHERE area_id=?').get(area_id)) {
     return res.status(409).json({ error: `Area ID "${area_id}" already exists` });
   }
+  // ADMIN BYPASS
+  if (req.user.is_admin) {
+    db.prepare(`INSERT INTO areas(area_id,location_id,name,status,created_by) VALUES (?,?,?,'Active',?)`)
+      .run(area_id, location_id, areaName, req.user.id);
+    audit(req.user, 'CREATE', 'Area', area_id, `"${areaName}" under location ${location_id} — auto-activated (admin bypass)`);
+    return res.json(db.prepare('SELECT * FROM areas WHERE area_id=?').get(area_id));
+  }
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   db.prepare(`INSERT INTO areas(area_id,location_id,name,status,created_by,reviewer_id,approver_id)
               VALUES (?,?,?,'Pending Review',?,?,?)`)
     .run(area_id, location_id, areaName, req.user.id, Number(reviewer_id), Number(approver_id));
@@ -1209,8 +1247,6 @@ app.post('/api/equipment', requireAuth, requireActivity('manage_equipment'), (re
   const idErr = checkId('Equipment ID', equipment_id); if (idErr) return res.status(400).json({ error: idErr });
   if (!name) return res.status(400).json({ error: 'Equipment Name is required' });
   if (!area_id) return res.status(400).json({ error: 'Area is required' });
-  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
-  if (apErr) return res.status(400).json({ error: apErr });
   const area = db.prepare('SELECT name, status FROM areas WHERE area_id=?').get(area_id);
   if (!area) return res.status(400).json({ error: 'Unknown area_id' });
   if (area.status !== 'Active') return res.status(400).json({ error: `Parent area is "${area.status}" — only Active areas accept equipment` });
@@ -1222,6 +1258,21 @@ app.post('/api/equipment', requireAuth, requireActivity('manage_equipment'), (re
   if (db.prepare('SELECT 1 FROM equipment WHERE equipment_id=?').get(equipment_id)) {
     return res.status(409).json({ error: `Equipment ID "${equipment_id}" already exists` });
   }
+  // ADMIN BYPASS
+  if (req.user.is_admin) {
+    db.prepare(`INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,
+                                     manufacture_date,equipment_type,sub_type,department,
+                                     status,qr_code,created_by)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,'Active',?,?)`)
+      .run(equipment_id, name, make||'', model||'', serial||'', capacity||'', area_id,
+           manufacture_date || null, equipment_type || null, sub_type || null, department || null,
+           `QR:${equipment_id}`, req.user.id);
+    audit(req.user, 'CREATE', 'Equipment', equipment_id,
+      `Registered: ${name} — auto-activated (admin bypass)`);
+    return res.json(db.prepare('SELECT * FROM equipment WHERE equipment_id=?').get(equipment_id));
+  }
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   db.prepare(`INSERT INTO equipment(equipment_id,name,make,model,serial,capacity,area_id,
                                    manufacture_date,equipment_type,sub_type,department,
                                    status,qr_code,created_by,reviewer_id,approver_id)
@@ -1627,8 +1678,6 @@ app.get('/api/checklist-groups', requireAuth, (req,res) => {
 app.post('/api/checklist-groups', requireAuth, requireActivity('manage_pm_categories','manage_checklists'), (req, res) => {
   const { name, department_id, reviewer_id, approver_id } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
-  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
-  if (apErr) return res.status(400).json({ error: apErr });
   const exists = db.prepare('SELECT 1 FROM checklist_groups WHERE name=?').get(name);
   if (exists) return res.status(409).json({ error: 'group already exists' });
   let dName = null;
@@ -1637,6 +1686,16 @@ app.post('/api/checklist-groups', requireAuth, requireActivity('manage_pm_catego
     if (!d) return res.status(400).json({ error: 'Unknown department_id' });
     dName = d.name;
   }
+  // ADMIN BYPASS
+  if (req.user.is_admin) {
+    const r = db.prepare(`INSERT INTO checklist_groups(name,department_id,department,status,created_by)
+                          VALUES (?,?,?,'Active',?)`)
+      .run(name, department_id || null, dName, req.user.id);
+    audit(req.user, 'CREATE', 'ChecklistGroup', r.lastInsertRowid, `"${name}"${dName ? ' under ' + dName : ''} — auto-activated (admin bypass)`);
+    return res.json({ id: r.lastInsertRowid, name, department_id, department: dName, status: 'Active' });
+  }
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   const r = db.prepare(`INSERT INTO checklist_groups(name,department_id,department,status,created_by,reviewer_id,approver_id)
                         VALUES (?,?,?,'Pending Review',?,?,?)`)
     .run(name, department_id || null, dName, req.user.id, Number(reviewer_id), Number(approver_id));
@@ -2326,10 +2385,18 @@ app.delete('/api/roles/:id', requireAuth, requireActivity('manage_roles'), (req,
 app.post('/api/frequencies', requireAuth, requireActivity('manage_pm_frequencies'), (req, res) => {
   const { name, days, tolerance_days, reviewer_id, approver_id } = req.body || {};
   if (!name || days === undefined) return res.status(400).json({ error: 'name and days required' });
-  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
-  if (apErr) return res.status(400).json({ error: apErr });
   const exists = db.prepare('SELECT 1 FROM frequencies WHERE name=?').get(name);
   if (exists) return res.status(409).json({ error: 'frequency name already exists' });
+  // ADMIN BYPASS
+  if (req.user.is_admin) {
+    const r = db.prepare(`INSERT INTO frequencies(name,days,tolerance_days,status,created_by)
+                          VALUES (?,?,?,'Active',?)`)
+      .run(name, parseInt(days,10), parseInt(tolerance_days || 0,10), req.user.id);
+    audit(req.user, 'CREATE', 'Frequency', r.lastInsertRowid, `"${name}" (${days}d) — auto-activated (admin bypass)`);
+    return res.json(db.prepare('SELECT * FROM frequencies WHERE id=?').get(r.lastInsertRowid));
+  }
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   const r = db.prepare(`INSERT INTO frequencies(name,days,tolerance_days,status,created_by,reviewer_id,approver_id)
                         VALUES (?,?,?,'Pending Review',?,?,?)`)
     .run(name, parseInt(days,10), parseInt(tolerance_days || 0,10),
@@ -2372,10 +2439,17 @@ app.delete('/api/frequencies/:id', requireAuth, requireActivity('manage_pm_frequ
 app.post('/api/pm-categories', requireAuth, requireActivity('manage_pm_categories'), (req, res) => {
   const { name, description, reviewer_id, approver_id } = req.body || {};
   if (!name) return res.status(400).json({ error: 'name required' });
-  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
-  if (apErr) return res.status(400).json({ error: apErr });
   const exists = db.prepare('SELECT 1 FROM pm_categories WHERE name=?').get(name);
   if (exists) return res.status(409).json({ error: 'category already exists' });
+  // ADMIN BYPASS
+  if (req.user.is_admin) {
+    const r = db.prepare(`INSERT INTO pm_categories(name,description,status,created_by) VALUES (?,?,'Active',?)`)
+      .run(name, description || '', req.user.id);
+    audit(req.user, 'CREATE', 'PMCategory', r.lastInsertRowid, `Created "${name}" — auto-activated (admin bypass)`);
+    return res.json(db.prepare('SELECT * FROM pm_categories WHERE id=?').get(r.lastInsertRowid));
+  }
+  const apErr = validateMasterApprovers(req.user.id, reviewer_id, approver_id);
+  if (apErr) return res.status(400).json({ error: apErr });
   const r = db.prepare(`INSERT INTO pm_categories(name,description,status,created_by,reviewer_id,approver_id)
                         VALUES (?,?,'Pending Review',?,?,?)`)
     .run(name, description || '', req.user.id, Number(reviewer_id), Number(approver_id));
@@ -2598,6 +2672,15 @@ app.put('/api/checklists/:id/submit', requireAuth, requireActivity('manage_check
   if (!['Draft','Rejected'].includes(cl.status)) return res.status(409).json({ error: `Cannot submit from status "${cl.status}"` });
   const sectionCount = db.prepare('SELECT COUNT(*) n FROM checklist_sections WHERE checklist_id=?').get(req.params.id).n;
   if (sectionCount === 0) return res.status(409).json({ error: 'Add at least one section + question before submitting' });
+  // ADMIN BYPASS — publish directly as Approved, skipping review/approval.
+  if (req.user.is_admin) {
+    db.prepare(`UPDATE checklists SET status='Approved', submitted_at=datetime('now'),
+                reviewed_at=datetime('now'), approved_at=datetime('now'),
+                rejection_reason=NULL WHERE id=?`).run(req.params.id);
+    audit(req.user, 'SUBMIT', 'Checklist', req.params.id,
+      `Auto-approved "${cl.name}" (${cl.version}) — admin bypass`);
+    return res.json({ ok: true });
+  }
 
   // NEW PATH — configurable workflow. Client sends workflow_id + array of assignees.
   if (workflow_id && Array.isArray(stage_assignees)) {
@@ -3499,7 +3582,7 @@ app.put('/api/assignments/:assignment_id/assign-pending', requireAuth, requireAc
   if (!PENDING_STATUSES.includes(a.status)) {
     return res.status(409).json({ error: `Cannot assign from status "${a.status}". The assignment must be in a pending workflow state.` });
   }
-  const u = db.prepare('SELECT id, name FROM users WHERE id=? AND status="Active"').get(Number(assignee_id));
+  const u = db.prepare("SELECT id, name FROM users WHERE id=? AND status='Active'").get(Number(assignee_id));
   if (!u) return res.status(400).json({ error: 'Unknown or inactive executor' });
   if (a.reviewer_id === u.id || a.approver_id === u.id) {
     return res.status(400).json({ error: 'Executor cannot also be the assigned reviewer or approver.' });

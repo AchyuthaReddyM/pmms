@@ -502,6 +502,15 @@ async function loadActiveUsers() {
   } catch (e) { return []; }
 }
 function masterApproverFields(users) {
+  // ADMIN BYPASS — admin creates records directly as Active, no reviewer/
+  // approver picker shown. Server also short-circuits in this case.
+  if (CURRENT_USER && CURRENT_USER.is_admin) {
+    return `
+      <hr style="margin:14px 0; border:none; border-top:1px solid var(--border);" />
+      <div style="font-size:12px; padding:8px 12px; background:#eaf6ea; border-left:3px solid var(--green); border-radius:6px;">
+        ⚡ <strong>Admin mode</strong> — this record will be created and immediately Activated without going through the review/approval workflow.
+      </div>`;
+  }
   const meId = CURRENT_USER && CURRENT_USER.id;
   const opts = users
     .filter(u => u.id !== meId)
@@ -908,17 +917,46 @@ async function openMasterAddModal() {
 // Other masters still use the legacy 2-stage reviewer/approver helper.
 async function openPlantModal() {
   try {
+    // ADMIN BYPASS — simplified form. No workflow, no stage assignees.
+    if (CURRENT_USER && CURRENT_USER.is_admin) {
+      openModal({
+        title: 'Add Plant (Admin — auto-activate)',
+        width: 520,
+        body: `
+          <div style="background:#eaf6ea; border-left:3px solid var(--green); padding:8px 12px; border-radius:6px; margin-bottom:14px; font-size:12px;">
+            ⚡ <strong>Admin mode</strong> — the Plant will be created and immediately Activated. No workflow required.
+          </div>
+          <div class="form-row"><label>Plant ID *</label><input name="plant_id" required placeholder="e.g., PL-001, Unit-1, U-Hyd" /></div>
+          <div class="form-row"><label>Plant Name *</label><input name="name" required /></div>
+          <div class="form-row"><label>Plant Location</label><input name="location" /></div>
+        `,
+        submitLabel: 'Create Plant',
+        onSubmit: async (data) => {
+          await api('POST', '/api/plants', { plant_id: data.plant_id, name: data.name, location: data.location });
+          toast('Plant created and activated.', 'success');
+          loadMasters('plants');
+        }
+      });
+      return;
+    }
     const [workflows, users] = await Promise.all([
       api('GET','/api/approval-workflows'),
       loadActiveUsers(),
     ]);
     const activeWorkflows = workflows.filter(w => w.status === 'Active');
     if (activeWorkflows.length === 0) {
-      toast('No active approval workflows. Set one up first in Admin Settings → Approval Workflows.', 'error');
+      toast('No active approval workflows. Go to Admin Settings → Approval Workflows tab → click "+ New Workflow" to add one first.', 'error');
       return;
     }
     const meId = CURRENT_USER && CURRENT_USER.id;
-    const userOpts = users.filter(u => u.id !== meId).map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role || '')}</option>`).join('');
+    const availableUsers = users.filter(u => u.id !== meId);
+    // The most-restrictive workflow determines how many users we need.
+    const maxStages = Math.max(...activeWorkflows.map(w => (w.stages || []).length));
+    if (availableUsers.length < maxStages) {
+      toast(`Not enough active users. To use the largest workflow (${maxStages} stages) you need ${maxStages} other active users besides yourself. Currently only ${availableUsers.length} available. Add more users in User Management or pick a shorter workflow.`, 'error');
+      // Continue — user can still pick a shorter workflow if one fits.
+    }
+    const userOpts = availableUsers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role || '')}</option>`).join('');
     // Initial workflow = first one. Render its stage pickers.
     window.__pmsPlantWfMap = Object.fromEntries(activeWorkflows.map(w => [w.id, w]));
     const renderStages = (workflowId) => {
@@ -1115,8 +1153,8 @@ async function openLocationModal() {
       ` + masterApproverFields(users),
       submitLabel: 'Submit for Review',
       onSubmit: async (data) => {
-        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
-        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && (!data.reviewer_id || !data.approver_id)) throw new Error('Reviewer and Approver are required');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
         await api('POST','/api/locations', {
           location_id: data.location_id,
           block_id: data.block_id,
@@ -1192,8 +1230,8 @@ async function openAreaModal() {
       submitLabel: 'Submit for Review',
       onSubmit: async (data) => {
         if (!data.location_id) throw new Error('Please select a Location');
-        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
-        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && (!data.reviewer_id || !data.approver_id)) throw new Error('Reviewer and Approver are required');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
         await api('POST','/api/areas', {
           area_id: data.area_id, location_id: data.location_id, name: data.name,
           reviewer_id: Number(data.reviewer_id), approver_id: Number(data.approver_id),
@@ -1348,8 +1386,8 @@ async function openEquipmentModal(existing) {
           toast('Equipment updated.', 'success');
         } else {
           payload.equipment_id = data.equipment_id;
-          if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
-          if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+          if (!(CURRENT_USER && CURRENT_USER.is_admin) && (!data.reviewer_id || !data.approver_id)) throw new Error('Reviewer and Approver are required');
+          if (!(CURRENT_USER && CURRENT_USER.is_admin) && data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
           payload.reviewer_id = Number(data.reviewer_id);
           payload.approver_id = Number(data.approver_id);
           await api('POST','/api/equipment', payload);
@@ -1585,8 +1623,8 @@ async function openFreqModal(existing) {
         await api('PUT', `/api/frequencies/${existing.id}`, payload);
         toast('Saved.', 'success');
       } else {
-        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
-        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && (!data.reviewer_id || !data.approver_id)) throw new Error('Reviewer and Approver are required');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
         payload.reviewer_id = Number(data.reviewer_id);
         payload.approver_id = Number(data.approver_id);
         await api('POST','/api/frequencies', payload);
@@ -1673,8 +1711,8 @@ async function openCatModal(existing) {
         await api('PUT', `/api/pm-categories/${existing.id}`, payload);
         toast('Saved.', 'success');
       } else {
-        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
-        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && (!data.reviewer_id || !data.approver_id)) throw new Error('Reviewer and Approver are required');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
         payload.reviewer_id = Number(data.reviewer_id);
         payload.approver_id = Number(data.approver_id);
         await api('POST','/api/pm-categories', payload);
@@ -1791,8 +1829,8 @@ async function openGroupModal(existing) {
         await api('PUT', `/api/checklist-groups/${existing.id}`, payload);
         toast('Saved.', 'success');
       } else {
-        if (!data.reviewer_id || !data.approver_id) throw new Error('Reviewer and Approver are required');
-        if (data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && (!data.reviewer_id || !data.approver_id)) throw new Error('Reviewer and Approver are required');
+        if (!(CURRENT_USER && CURRENT_USER.is_admin) && data.reviewer_id === data.approver_id) throw new Error('Reviewer and Approver must be different users');
         payload.reviewer_id = Number(data.reviewer_id);
         payload.approver_id = Number(data.approver_id);
         await api('POST','/api/checklist-groups', payload);
@@ -3969,6 +4007,15 @@ function usersWithActivity(users, roles, ...activityCodes) {
 // ----- Checklist (template) workflow actions -----
 async function openSubmitChecklistModal(checklistId) {
   try {
+    // ADMIN BYPASS — no workflow picker, submit auto-approves.
+    if (CURRENT_USER && CURRENT_USER.is_admin) {
+      if (!confirm('Admin mode: submit and auto-approve this checklist without going through the review/approval workflow?')) return;
+      await api('PUT', `/api/checklists/${checklistId}/submit`, {});
+      toast('Checklist auto-approved (admin bypass).', 'success');
+      previewChecklist(checklistId);
+      loadChecklists();
+      return;
+    }
     const [workflows, users] = await Promise.all([
       api('GET','/api/approval-workflows'),
       loadActiveUsers(),
