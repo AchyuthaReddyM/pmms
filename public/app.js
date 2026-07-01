@@ -650,13 +650,12 @@ const MASTER_DEFS = {
   },
   equipment: {
     api: '/api/equipment', pk: 'equipment_id',
-    head: ['Equipment ID','Equipment Name','Department','Make','Model','Serial','Area','Status','QR','Actions'],
+    head: ['Equipment ID','Equipment Name','Department','Make','Model','Serial','Area','Status','QR'],
     row: r => {
       r.__pk = r.equipment_id;
-      const wfBtn = masterRowActions('equipment', r);
-      const assignBtn = r.status === 'Active'
-        ? `<button class="btn ghost sm" onclick="openAssignChecklistModal(null, '${escapeHtml(r.equipment_id)}')">🎯 Assign</button>`
-        : '';
+      // Stash the row so the click handler can open the detail modal without another fetch.
+      window.__eqRows = window.__eqRows || {};
+      window.__eqRows[r.equipment_id] = r;
       // QR cell — encodes the structured equipment payload. 96 px so each QR
       // module is large enough for an average phone camera to scan it from
       // the screen. Click for a bigger 240 px version to print on a label.
@@ -671,9 +670,10 @@ const MASTER_DEFS = {
       const deptCell = r.department
         ? `<span class="pill brown" style="font-size:10px;">${escapeHtml(r.department)}</span>`
         : '<span style="color:var(--muted); font-size:11px;">—</span>';
-      return [r.equipment_id, r.name, deptCell, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status),
-              qrCell,
-              [wfBtn, assignBtn].filter(Boolean).join(' ')];
+      // Equipment ID cell is the row-open handle. Clicking anywhere on the row opens the detail modal.
+      const eqIdCell = `<span style="cursor:pointer; color:var(--brown-700); font-weight:600; text-decoration:underline dotted;" onclick="openEquipmentDetail('${escapeHtml(r.equipment_id)}')" title="Click to view / edit / assign">${escapeHtml(r.equipment_id)}</span>`;
+      return [eqIdCell, r.name, deptCell, r.make || r.make_model || '—', r.model || '—', r.serial, r.area_id, statusPill(r.status),
+              qrCell];
     },
     canAdd: true,
     customAdd: () => openEquipmentModal(),
@@ -774,6 +774,46 @@ function safeRenderQR(el, text, size) {
   // All correction levels failed — payload is too big for QR Version 40 (max).
   el.innerHTML = '<div style="font-size:10px; color:var(--red); padding:4px; text-align:center;">Data too long for QR — print as label.</div>';
   return false;
+}
+
+// Row-click handler on the Equipment Master table. Opens a compact detail
+// modal with the equipment's key fields + all the actions that used to live in
+// the removed Actions column: Edit, Assign checklist, and (contextually) any
+// workflow Sign button when the row is Pending <Stage>.
+function openEquipmentDetail(equipmentId) {
+  const r = (window.__eqRows || {})[equipmentId];
+  if (!r) { toast('Refresh the page and try again.', 'error'); return; }
+  const isActive = r.status === 'Active';
+  const wfBtnHtml = masterRowActions('equipment', r);   // workflow Review/Approve when I'm the assignee
+  const chainLine = [r.plant_id, r.block_id, r.location_id, r.area_id].filter(Boolean).join(' › ');
+  openModal({
+    title: `${escapeHtml(equipmentId)} — ${escapeHtml(r.name || '')}`,
+    width: 620,
+    hideDefaultSubmit: true,
+    body: `
+      <div class="row-gap" style="margin-bottom:12px;">
+        ${statusPill(r.status)}
+        ${r.department ? `<span class="pill brown" style="font-size:10px;">${escapeHtml(r.department)}</span>` : ''}
+        ${r.equipment_type ? `<span class="pill brown" style="font-size:10px;">${escapeHtml(r.equipment_type)}</span>` : ''}
+        ${chainLine ? `<span class="pill brown" style="font-size:10px;">${escapeHtml(chainLine)}</span>` : ''}
+      </div>
+      <div style="display:grid; grid-template-columns: repeat(2, 1fr); gap:8px; font-size:12px;">
+        ${['make','model','serial','capacity','manufacture_date','sub_type'].map(k => {
+          const label = { make:'Manufacturer', model:'Model', serial:'Serial Number', capacity:'Capacity', manufacture_date:'Manufacture Date', sub_type:'Sub-Type' }[k];
+          return `<div style="padding:6px 10px; background:var(--cream-100); border-radius:6px;">
+            <div style="font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:1px;">${escapeHtml(label)}</div>
+            <div style="font-weight:600; margin-top:2px;">${escapeHtml(r[k] || '—')}</div>
+          </div>`;
+        }).join('')}
+      </div>
+      <div style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap; justify-content:flex-end;">
+        ${wfBtnHtml}
+        ${isActive && can('assign_checklist') ? `<button class="btn primary sm" type="button" onclick="closeModal(); setTimeout(() => openAssignChecklistModal(null, '${escapeHtml(equipmentId)}'), 100);">🎯 Assign Checklist</button>` : ''}
+        ${can('manage_equipment') ? `<button class="btn ghost sm" type="button" onclick="closeModal(); setTimeout(() => openEquipmentModal(window.__eqRows['${escapeHtml(equipmentId)}']), 100);">✎ Edit</button>` : ''}
+        <button class="btn ghost sm" type="button" onclick="openQrModalForEquipment('${escapeHtml(equipmentId)}','${escapeHtml(r.name || '')}')">▣ Show / Print QR</button>
+      </div>
+    `,
+  });
 }
 
 // Convenience: open the enlarged QR modal for a piece of equipment using the
