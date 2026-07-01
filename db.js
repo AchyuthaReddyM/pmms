@@ -183,6 +183,17 @@ function createSchema() {
     );
 
     -- PM frequency master (editable by manage_pm_frequencies)
+    -- Canonical Checklist Name master — QA maintains the approved list of
+    -- names that appear in the Checklist builder dropdown.
+    CREATE TABLE IF NOT EXISTS checklist_name_templates (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT UNIQUE NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'Active',
+      created_by INTEGER REFERENCES users(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
     -- =====================================================================
     -- CONFIGURABLE APPROVAL WORKFLOWS
     -- ---------------------------------------------------------------------

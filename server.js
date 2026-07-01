@@ -556,6 +556,43 @@ app.put('/api/assignments/:assignment_id/acknowledge', requireAuth, (req, res) =
 });
 
 // ============================================================================
+// CHECKLIST NAME TEMPLATES MASTER
+// ----------------------------------------------------------------------------
+// QA maintains a canonical list of approved checklist names. The Checklist
+// builder shows only these names in a dropdown — no free-form typing.
+// Admin-editable via Admin Settings.
+// ============================================================================
+app.get('/api/checklist-name-templates', requireAuth, (req, res) => {
+  res.json(db.prepare('SELECT * FROM checklist_name_templates ORDER BY name').all());
+});
+app.post('/api/checklist-name-templates', requireAuth, requireActivity('manage_checklists','manage_pm_categories'), (req, res) => {
+  const { name, description } = req.body || {};
+  if (!name || !name.trim()) return res.status(400).json({ error: 'name required' });
+  if (db.prepare('SELECT 1 FROM checklist_name_templates WHERE name=?').get(name.trim())) {
+    return res.status(409).json({ error: `Template "${name}" already exists` });
+  }
+  const r = db.prepare(`INSERT INTO checklist_name_templates(name, description, status, created_by)
+                        VALUES (?, ?, 'Active', ?)`).run(name.trim(), description || '', req.user.id);
+  audit(req.user, 'CREATE', 'ChecklistNameTemplate', r.lastInsertRowid, `Added canonical checklist name "${name}"`);
+  res.json({ id: r.lastInsertRowid, name: name.trim(), description });
+});
+app.put('/api/checklist-name-templates/:id', requireAuth, requireActivity('manage_checklists','manage_pm_categories'), (req, res) => {
+  const { name, description, status } = req.body || {};
+  const r = db.prepare(`UPDATE checklist_name_templates SET name=COALESCE(?,name), description=COALESCE(?,description), status=COALESCE(?,status) WHERE id=?`)
+    .run(name, description, status, req.params.id);
+  if (r.changes === 0) return res.status(404).json({ error: 'Not found' });
+  audit(req.user, 'UPDATE', 'ChecklistNameTemplate', req.params.id, `Updated`);
+  res.json({ ok: true });
+});
+app.delete('/api/checklist-name-templates/:id', requireAuth, requireActivity('manage_checklists','manage_pm_categories'), (req, res) => {
+  const t = db.prepare('SELECT name FROM checklist_name_templates WHERE id=?').get(req.params.id);
+  if (!t) return res.status(404).json({ error: 'Not found' });
+  db.prepare('DELETE FROM checklist_name_templates WHERE id=?').run(req.params.id);
+  audit(req.user, 'DELETE', 'ChecklistNameTemplate', req.params.id, `Removed "${t.name}"`);
+  res.json({ ok: true });
+});
+
+// ============================================================================
 // CONFIGURABLE APPROVAL WORKFLOWS
 // ----------------------------------------------------------------------------
 // Workflow = a named template with N stages. Each stage has a label and a
@@ -749,12 +786,20 @@ app.put('/api/approval-stages/:id/sign', requireAuth, requireESignature, (req, r
   if (newRecordStatus) {
     // We only know the table name for entities we've wired. Map entity_type → table.
     const entityToTable = {
-      'Plant': { table: 'plants', pk: 'plant_id' },
+      'Plant':     { table: 'plants',     pk: 'plant_id' },
+      'Checklist': { table: 'checklists', pk: 'id',
+                     // Checklist has a domain-specific "Approved" status distinct from the generic "Active".
+                     approvedStatus: 'Approved' },
       // Others go here as they're migrated.
     };
     const map = entityToTable[stage.entity_type];
     if (map) {
-      db.prepare(`UPDATE ${map.table} SET status=? WHERE ${map.pk}=?`).run(newRecordStatus, stage.entity_id);
+      const finalStatus = (newRecordStatus === 'Active' && map.approvedStatus) ? map.approvedStatus : newRecordStatus;
+      db.prepare(`UPDATE ${map.table} SET status=? WHERE ${map.pk}=?`).run(finalStatus, stage.entity_id);
+      // For Checklist specifically, also stamp approved_at on final approval.
+      if (stage.entity_type === 'Checklist' && finalStatus === 'Approved') {
+        db.prepare("UPDATE checklists SET approved_at=datetime('now') WHERE id=?").run(stage.entity_id);
+      }
     }
   }
 
@@ -2547,29 +2592,47 @@ app.delete('/api/checklists/:id', requireAuth, requireActivity('manage_checklist
 // Draft  ->[submit]-> Pending Review ->[review]-> Pending Approval ->[approve]-> Approved
 //                                                          \-> Rejected (any stage with rejection_reason)
 app.put('/api/checklists/:id/submit', requireAuth, requireActivity('manage_checklists'), (req, res) => {
-  const { reviewer_id, approver_id } = req.body || {};
+  const { reviewer_id, approver_id, workflow_id, stage_assignees } = req.body || {};
   const cl = db.prepare('SELECT * FROM checklists WHERE id=?').get(req.params.id);
   if (!cl) return res.status(404).json({ error: 'Not found' });
   if (!['Draft','Rejected'].includes(cl.status)) return res.status(409).json({ error: `Cannot submit from status "${cl.status}"` });
-  if (!reviewer_id || !approver_id) return res.status(400).json({ error: 'reviewer_id and approver_id required' });
+  const sectionCount = db.prepare('SELECT COUNT(*) n FROM checklist_sections WHERE checklist_id=?').get(req.params.id).n;
+  if (sectionCount === 0) return res.status(409).json({ error: 'Add at least one section + question before submitting' });
+
+  // NEW PATH — configurable workflow. Client sends workflow_id + array of assignees.
+  if (workflow_id && Array.isArray(stage_assignees)) {
+    let result;
+    try { result = createApprovalStagesForRecord(workflow_id, 'Checklist', req.params.id, stage_assignees); }
+    catch (e) { return res.status(400).json({ error: e.message }); }
+    const initialStatus = `Pending ${result.stages[0].label}`;
+    db.prepare(`UPDATE checklists SET status=?, submitted_at=datetime('now'),
+                reviewed_at=NULL, approved_at=NULL, rejection_reason=NULL
+                WHERE id=?`).run(initialStatus, req.params.id);
+    const firstAssignee = Number(stage_assignees[0]);
+    if (firstAssignee) {
+      notify(firstAssignee, `Checklist awaiting your ${result.stages[0].label.toLowerCase()}`,
+        `${cl.name} (${cl.version}) submitted by ${req.user.name}. Stage 1 of ${result.stages.length}.`,
+        'workflow_stage', `/checklists/${req.params.id}`);
+    }
+    audit(req.user, 'SUBMIT', 'Checklist', req.params.id,
+      `Submitted "${cl.name}" via workflow "${result.workflow.name}" (${result.stages.length} stages)`);
+    return res.json({ ok: true });
+  }
+  // LEGACY PATH — 2-stage reviewer + approver.
+  if (!reviewer_id || !approver_id) return res.status(400).json({ error: 'reviewer_id and approver_id required (or pass workflow_id + stage_assignees)' });
   if (reviewer_id === approver_id) return res.status(400).json({ error: 'Reviewer and approver must be different users' });
   const reviewer = db.prepare('SELECT id, name FROM users WHERE id=?').get(reviewer_id);
   const approver = db.prepare('SELECT id, name FROM users WHERE id=?').get(approver_id);
   if (!reviewer || !approver) return res.status(400).json({ error: 'Unknown reviewer or approver' });
-  // Must have at least one section with at least one question to be submittable
-  const sectionCount = db.prepare('SELECT COUNT(*) n FROM checklist_sections WHERE checklist_id=?').get(req.params.id).n;
-  if (sectionCount === 0) return res.status(409).json({ error: 'Add at least one section + question before submitting' });
 
   db.prepare(`UPDATE checklists SET
       status='Pending Review', reviewer_id=?, approver_id=?,
       submitted_at=datetime('now'), reviewed_at=NULL, approved_at=NULL, rejection_reason=NULL
     WHERE id=?`).run(reviewer_id, approver_id, req.params.id);
-  notify(reviewer_id,
-    'Checklist awaiting your review',
+  notify(reviewer_id, 'Checklist awaiting your review',
     `${cl.name} (${cl.version}) submitted by ${req.user.name}.`,
-    'checklist_review',
-    `/checklists/${req.params.id}`);
-  audit(req.user, 'SUBMIT', 'Checklist', req.params.id, `Submitted "${cl.name}" for review (reviewer: ${reviewer.name}, approver: ${approver.name})`);
+    'checklist_review', `/checklists/${req.params.id}`);
+  audit(req.user, 'SUBMIT', 'Checklist', req.params.id, `Submitted "${cl.name}" for review (legacy 2-stage — reviewer: ${reviewer.name}, approver: ${approver.name})`);
   res.json({ ok: true });
 });
 

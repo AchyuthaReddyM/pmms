@@ -1820,13 +1820,17 @@ async function previewChecklist(id) {
     if (can('manage_checklists')) {
       buttons.push(`<button class="btn ghost sm" onclick="openChecklistBuilder(null, ${cl.id})">📋 Copy as new</button>`);
     }
+    // Workflow-managed checklists show a generic "Open / Sign" button that opens
+    // the stage ladder. Legacy 2-stage checklists fall back to the old Pass/Reject.
+    if (cl.status && cl.status.startsWith('Pending ')) {
+      buttons.push(`<button class="btn primary sm" onclick="openWorkflowStageModal('Checklist','${cl.id}')">📝 Open / Sign Workflow</button>`);
+    }
     if (cl.status === 'Pending Review' && (isReviewer || CURRENT_USER.is_admin) && can('review_checklist')) {
-      buttons.push(`<button class="btn primary sm" onclick="reviewChecklistDecision(${cl.id},'approve')">✓ Pass Review</button>`);
-      buttons.push(`<button class="btn ghost sm" onclick="reviewChecklistDecision(${cl.id},'reject')">✗ Reject</button>`);
+      // Legacy fallback buttons — still work for checklists submitted via the old reviewer/approver path.
+      buttons.push(`<button class="btn ghost sm" onclick="reviewChecklistDecision(${cl.id},'approve')">✓ Legacy Pass</button>`);
     }
     if (cl.status === 'Pending Approval' && (isApprover || CURRENT_USER.is_admin) && can('approve_checklist')) {
-      buttons.push(`<button class="btn primary sm" onclick="approveChecklistDecision(${cl.id},'approve')">✓ Final Approve</button>`);
-      buttons.push(`<button class="btn ghost sm" onclick="approveChecklistDecision(${cl.id},'reject')">✗ Reject</button>`);
+      buttons.push(`<button class="btn ghost sm" onclick="approveChecklistDecision(${cl.id},'approve')">✓ Legacy Approve</button>`);
     }
     if (cl.status === 'Approved' && can('assign_checklist')) {
       buttons.push(`<button class="btn primary sm" onclick="openAssignChecklistModal(${cl.id})">Assign…</button>`);
@@ -2671,6 +2675,59 @@ async function loadSettings(tab) {
   if (tab === 'roles')        return renderRolesTab();
   if (tab === 'activities')   return renderActivitiesTab();
   if (tab === 'workflows')    return renderWorkflowsTab();
+  if (tab === 'clnames')      return renderChecklistNamesTab();
+}
+
+// ----- Checklist Name Templates tab -----
+async function renderChecklistNamesTab() {
+  try {
+    const rows = await api('GET', '/api/checklist-name-templates');
+    const canEdit = can('manage_checklists') || can('manage_pm_categories') || (CURRENT_USER && CURRENT_USER.is_admin);
+    $('settingsPanel').innerHTML = `
+      <div class="card">
+        <div class="card-head">
+          <h3>Checklist Name Templates</h3>
+          ${canEdit ? `<button class="btn primary sm" onclick="openClNameModal()">+ Add Template</button>` : ''}
+        </div>
+        <p style="color:var(--muted); font-size:12px; margin:0 0 12px;">QA maintains the approved list of canonical checklist names. When creating a new checklist, users pick from this list — no free-form typing allowed.</p>
+        <table class="tbl">
+          <thead><tr><th>Name</th><th>Description</th><th>Status</th><th style="text-align:right;">Actions</th></tr></thead>
+          <tbody>${rows.length === 0
+            ? '<tr class="empty-row"><td colspan="4">No templates yet. Add one to enable checklist creation.</td></tr>'
+            : rows.map(r => `<tr>
+                <td><strong>${escapeHtml(r.name)}</strong></td>
+                <td>${escapeHtml(r.description || '')}</td>
+                <td>${statusPill(r.status)}</td>
+                <td style="text-align:right;">
+                  ${canEdit ? `<button class="btn ghost sm" onclick='openClNameModal(${escapeHtml(JSON.stringify(r))})'>Edit</button>
+                              <button class="btn ghost sm" onclick="deleteClName(${r.id})">×</button>` : ''}
+                </td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  } catch (e) { toast(e.message, 'error'); }
+}
+function openClNameModal(existing) {
+  const r = existing || { name:'', description:'' };
+  openModal({
+    title: existing ? `Edit — ${escapeHtml(r.name)}` : 'Add Checklist Name Template',
+    body: `
+      <div class="form-row"><label>Name *</label><input name="name" value="${escapeHtml(r.name)}" required placeholder="e.g. Air Handling Unit Preventive Maintenance" /></div>
+      <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description" rows="2">${escapeHtml(r.description || '')}</textarea></div>
+    `,
+    onSubmit: async (data) => {
+      if (existing) await api('PUT', `/api/checklist-name-templates/${existing.id}`, data);
+      else          await api('POST','/api/checklist-name-templates', data);
+      toast('Saved.', 'success');
+      renderChecklistNamesTab();
+    }
+  });
+}
+async function deleteClName(id) {
+  if (!confirm('Delete this template? Existing checklists using this name are unaffected.')) return;
+  try { await api('DELETE', `/api/checklist-name-templates/${id}`); toast('Deleted.', 'success'); renderChecklistNamesTab(); }
+  catch (e) { toast(e.message, 'error'); }
 }
 
 // ----- Approval Workflows tab -----
@@ -3020,10 +3077,11 @@ const REQUIRED_FIELD_DEFS = [
 
 async function openChecklistBuilder(existingId, copyFromId) {
   try {
-    const [groups, cats, freqs] = await Promise.all([
+    const [groups, cats, freqs, nameTemplates] = await Promise.all([
       api('GET','/api/checklist-groups?active=1'),
       api('GET','/api/pm-categories'),
       api('GET','/api/frequencies'),
+      api('GET','/api/checklist-name-templates').catch(() => []),
     ]);
     const activeFreqs  = freqs.filter(f => (f.status || 'Active') === 'Active');
     const activeCats   = cats.filter(c => (c.status || 'Active') === 'Active');
@@ -3075,7 +3133,15 @@ async function openChecklistBuilder(existingId, copyFromId) {
         </div>
       </div>
       <div class="form-row"><label>Checklist Name *</label>
-        <input name="name" value="${escapeHtml(cl?.name || '')}" required minlength="3" maxlength="300" placeholder="3-300 characters" />
+        <div>
+          <select name="name" required>
+            <option value="">— pick from Checklist Name Templates —</option>
+            ${(nameTemplates || []).filter(t => t.status === 'Active').map(t => `<option value="${escapeHtml(t.name)}" ${cl && cl.name === t.name ? 'selected' : ''}>${escapeHtml(t.name)}</option>`).join('')}
+            ${cl && cl.name && !(nameTemplates || []).some(t => t.name === cl.name)
+              ? `<option value="${escapeHtml(cl.name)}" selected>${escapeHtml(cl.name)} (legacy)</option>` : ''}
+          </select>
+          ${(!nameTemplates || nameTemplates.length === 0) ? '<div style="font-size:11px; color:var(--red); margin-top:4px;">No name templates configured. Add some in <strong>Admin Settings → Checklist Name Templates</strong> first.</div>' : ''}
+        </div>
       </div>
       <div class="form-row"><label>Version</label>
         <div style="display:flex; align-items:center; gap:10px;">
@@ -3084,9 +3150,8 @@ async function openChecklistBuilder(existingId, copyFromId) {
           <span style="font-size:11px; color:var(--muted);">Auto-assigned · system controlled</span>
         </div>
       </div>
-      <div class="form-row"><label>Maintenance Category</label>
-        <select name="category_id"><option value="">—</option>${activeCats.map(c => `<option value="${c.id}" ${cl && cl.category_id===c.id?'selected':''}>${escapeHtml(c.name)}</option>`).join('')}</select>
-      </div>
+      <!-- Maintenance Category dropdown intentionally removed per spec. Existing category_id on
+           older checklists is preserved via the backend COALESCE — form just doesn't offer it. -->
       <div class="form-row" style="grid-template-columns:1fr;"><label>Description</label><textarea name="description">${escapeHtml(cl?.description || '')}</textarea></div>
 
       <div class="form-row" style="grid-template-columns:1fr;">
@@ -3864,37 +3929,59 @@ function usersWithActivity(users, roles, ...activityCodes) {
 // ----- Checklist (template) workflow actions -----
 async function openSubmitChecklistModal(checklistId) {
   try {
-    const [users, roles] = await Promise.all([api('GET','/api/users'), api('GET','/api/roles')]);
-    const reviewerSet = usersWithActivity(users, roles, 'review_checklist');
-    const approverSet = usersWithActivity(users, roles, 'approve_checklist');
-    const reviewers   = users.filter(u => reviewerSet.has(u.id));
-    const approvers   = users.filter(u => approverSet.has(u.id));
-    if (reviewers.length === 0 || approvers.length === 0) {
-      toast('No users with review_checklist / approve_checklist permission. Configure a role first.', 'error');
+    const [workflows, users] = await Promise.all([
+      api('GET','/api/approval-workflows'),
+      loadActiveUsers(),
+    ]);
+    const activeWorkflows = workflows.filter(w => w.status === 'Active');
+    if (activeWorkflows.length === 0) {
+      toast('No active approval workflows. Set one up first in Admin Settings → Approval Workflows.', 'error');
       return;
     }
+    const meId = CURRENT_USER && CURRENT_USER.id;
+    const userOpts = users.filter(u => u.id !== meId).map(u =>
+      `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role || '')}${u.department?' / '+escapeHtml(u.department):''}</option>`).join('');
+    window.__clWfMap = Object.fromEntries(activeWorkflows.map(w => [w.id, w]));
+    const renderStages = (workflowId) => {
+      const wf = window.__clWfMap[workflowId];
+      if (!wf || !wf.stages) return '';
+      return wf.stages.map((s, i) => `
+        <div class="form-row">
+          <label>Stage ${i+1}: ${escapeHtml(s.label)} <span class="pill ${s.type==='review'?'blue':'green'}" style="font-size:9px;">${escapeHtml(s.type)}</span></label>
+          <select name="stage_assignee_${i}" required>
+            <option value="">— select assignee —</option>${userOpts}
+          </select>
+        </div>`).join('');
+    };
+    window.__clOnWf = () => {
+      const sel = document.getElementById('clWfSel');
+      document.getElementById('clStagesArea').innerHTML = renderStages(Number(sel.value));
+    };
     openModal({
       title: 'Submit Checklist for Review',
+      width: 560,
       body: `
-        <p style="font-size:12px; color:var(--muted); margin-top:0;">Pick a reviewer (Engineering Manager) and a final approver (QA). Reviewer is notified first; once they pass it, the approver is notified.</p>
-        <div class="form-row"><label>Reviewer (Engineering) *</label>
-          <select name="reviewer_id" required>
-            ${reviewers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
+        <p style="font-size:12px; color:var(--muted); margin-top:0;">Pick an approval workflow and assign a specific user to each stage. Each stage requires an e-signature. The checklist becomes Approved only after every stage signs off.</p>
+        <div class="form-row"><label>Workflow *</label>
+          <select id="clWfSel" required onchange="window.__clOnWf()">
+            ${activeWorkflows.map((w, i) => `<option value="${w.id}" ${i===0?'selected':''}>${escapeHtml(w.name)} (${(w.stages || []).length} stage${(w.stages||[]).length===1?'':'s'})</option>`).join('')}
           </select>
         </div>
-        <div class="form-row"><label>Approver (QA) *</label>
-          <select name="approver_id" required>
-            ${approvers.map(u => `<option value="${u.id}">${escapeHtml(u.name)} — ${escapeHtml(u.role)} / ${escapeHtml(u.department || '')}</option>`).join('')}
-          </select>
-        </div>
+        <div id="clStagesArea">${renderStages(activeWorkflows[0].id)}</div>
       `,
-      submitLabel: 'Submit',
+      submitLabel: 'Submit for Approval',
       onSubmit: async (data) => {
-        await api('PUT', `/api/checklists/${checklistId}/submit`, {
-          reviewer_id: Number(data.reviewer_id),
-          approver_id: Number(data.approver_id),
-        });
-        toast('Submitted for review.', 'success');
+        const workflowId = Number(document.getElementById('clWfSel').value);
+        const wf = window.__clWfMap[workflowId];
+        if (!wf) throw new Error('Pick a workflow');
+        const stage_assignees = [];
+        for (let i = 0; i < wf.stages.length; i++) {
+          const v = (data['stage_assignee_' + i] || '').trim();
+          if (!v) throw new Error(`Stage ${i+1} ("${wf.stages[i].label}") needs an assignee`);
+          stage_assignees.push(Number(v));
+        }
+        await api('PUT', `/api/checklists/${checklistId}/submit`, { workflow_id: workflowId, stage_assignees });
+        toast('Checklist submitted into approval workflow.', 'success');
         previewChecklist(checklistId);
         loadChecklists();
         refreshNotifBadge();
